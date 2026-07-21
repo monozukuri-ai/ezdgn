@@ -3,6 +3,7 @@
 //! This module deliberately does not decode the proprietary DGN V8 streams.
 
 use std::io::Cursor;
+use std::path::{Component, Path};
 
 use crate::{detect_format, DgnError, DgnFormat};
 
@@ -12,6 +13,20 @@ pub const DEFAULT_MAX_CFB_ENTRIES: usize = 100_000;
 const DGN_HEADER_STREAM: &str = "/Dgn~H";
 const DGN_SUMMARY_STREAM: &str = "/Dgn~S";
 const DGN_MODELS_STORAGE: &str = "/Dgn-Md";
+
+fn portable_cfb_path(path: &Path) -> String {
+    let mut portable = String::new();
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            portable.push('/');
+            portable.push_str(name.to_string_lossy().as_ref());
+        }
+    }
+    if portable.is_empty() {
+        portable.push('/');
+    }
+    portable
+}
 
 /// Kind of one directory entry in a CFB container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +51,7 @@ impl V8CfbEntryKind {
 /// Metadata for one non-root CFB directory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V8CfbEntry {
-    /// Absolute path inside the CFB container.
+    /// Absolute path inside the CFB container, using `/` separators on every platform.
     pub path: String,
     /// Whether this entry is a storage or stream.
     pub kind: V8CfbEntryKind,
@@ -89,7 +104,7 @@ pub fn inspect_v8_container(input: &[u8], max_entries: usize) -> Result<V8Contai
             V8CfbEntryKind::Storage
         };
         entries.push(V8CfbEntry {
-            path: entry.path().to_string_lossy().into_owned(),
+            path: portable_cfb_path(entry.path()),
             kind,
             size_bytes: entry.is_stream().then(|| entry.len()),
         });
@@ -154,6 +169,23 @@ mod tests {
             [DGN_HEADER_STREAM, DGN_SUMMARY_STREAM, DGN_MODELS_STORAGE]
         );
         assert!(info.model_storage_paths.is_empty());
+        assert!(info
+            .entries
+            .iter()
+            .any(|entry| { entry.path == "/documents" && entry.kind == V8CfbEntryKind::Storage }));
+        assert!(info.entries.iter().any(|entry| {
+            entry.path == "/documents/readme" && entry.kind == V8CfbEntryKind::Stream
+        }));
+        assert!(info.entries.iter().all(|entry| !entry.path.contains('\\')));
+    }
+
+    #[test]
+    fn renders_cfb_paths_with_portable_separators() {
+        assert_eq!(
+            portable_cfb_path(Path::new("/Dgn-Md/#000000")),
+            "/Dgn-Md/#000000"
+        );
+        assert_eq!(portable_cfb_path(Path::new("/")), "/");
     }
 
     #[test]

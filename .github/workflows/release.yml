@@ -69,6 +69,35 @@ jobs:
               print(f"version={python_version}", file=output)
           PY
 
+      - name: Ensure version is not already published
+        if: github.ref_type == 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.error
+          import urllib.request
+
+          package = os.environ["PACKAGE_NAME"]
+          version = os.environ["VERSION"]
+          url = f"https://pypi.org/pypi/{package}/{version}/json"
+
+          try:
+              with urllib.request.urlopen(url, timeout=30):
+                  pass
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  raise SystemExit(0)
+              raise
+
+          raise SystemExit(
+              f"{package} {version} is already published on PyPI. "
+              "Published files cannot be replaced; bump the package version "
+              "and create a matching new version tag instead."
+          )
+          PY
+
       - name: Create development environment
         run: |
           python -m venv .venv
@@ -317,6 +346,7 @@ jobs:
       - preflight
       - assemble
       - verify-wheel
+      - pypi-publish
     runs-on: ubuntu-latest
     permissions:
       contents: write

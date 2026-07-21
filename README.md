@@ -11,6 +11,12 @@ implemented with a pure Rust core and PyO3 bindings.
 python -m pip install ezdgn
 ```
 
+Install the optional Matplotlib renderer when preview images are needed:
+
+```bash
+python -m pip install "ezdgn[plot]"
+```
+
 Building from source requires Rust 1.83 or newer. The extension uses Python's
 stable ABI (`abi3`) with a Python 3.10 minimum.
 
@@ -94,6 +100,46 @@ layout.
 The high-level `read()`/`readfile()` API deliberately rejects V7 3D files.
 `scan_records()` and `inspect_headers()` still support bounded inspection of
 their shared record framing and metadata.
+
+## Plotting parsed drawings
+
+The optional renderer can display a parsed V7 2D drawing or save it as an
+image without changing the native entity model:
+
+```python
+import ezdgn
+
+drawing = ezdgn.readfile("drawing.dgn")
+
+figure, axes = ezdgn.plot(
+    drawing,
+    text_encoding="cp932",
+    background="#111111",
+)
+figure.savefig("preview.png", dpi=150, bbox_inches="tight")
+
+# Or render and save in one call.
+ezdgn.save_plot(drawing, "preview.png", text_encoding="cp932")
+```
+
+The equivalent CLI command is:
+
+```bash
+ezdgn plot drawing.dgn -o preview.png --encoding cp932
+```
+
+Omit `-o` to open an interactive Matplotlib window. Use `--monochrome` for a
+high-contrast preview, `--hide-text` to suppress text, or
+`--coordinate-space uor` when master-unit coordinates are unavailable. Run
+`ezdgn plot --help` for the complete option list.
+
+Lines, line strings, shapes, ellipses, arcs, text, and drawable components of
+cells and complex elements are rendered. Ellipses and arcs are sampled only
+for display. Native type-11 curves and B-spline curves are previewed from
+their parsed control sequences; the source records and entity parameters are
+never flattened or modified. V7 text does not store its code page, so the
+caller must select the correct encoding for non-ASCII text. Geometry and text
+with compatible display styles are batched to keep large previews practical.
 
 ## Seed-based V7 writer
 
@@ -211,7 +257,7 @@ ezdgn inspect drawing-v8.dgn --json
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install "maturin>=1.13,<2" "pytest>=8"
+python -m pip install "maturin>=1.13,<2" "pytest>=8" "matplotlib>=3.8"
 maturin develop
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings

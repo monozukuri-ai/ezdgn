@@ -26,6 +26,8 @@ def test_python_and_rust_versions_match() -> None:
         "V8ContainerInfo",
         "inspect_v8_container",
         "new",
+        "plot",
+        "save_plot",
     }.issubset(ezdgn.__all__)
 
 

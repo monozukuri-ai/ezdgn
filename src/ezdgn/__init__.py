@@ -47,6 +47,7 @@ from .metadata import (
     inspect_headers,
     read_design_settings,
 )
+from .plotting import CoordinateSpace, plot, save_plot
 from .raw import (
     DEFAULT_MAX_FILE_SIZE_BYTES,
     DEFAULT_MAX_RECORDS,
@@ -103,6 +104,7 @@ __all__ = [
     "ComplexChain",
     "ComplexElement",
     "ComplexShape",
+    "CoordinateSpace",
     "CommonElementHeader",
     "DesignSettings",
     "Drawing",
@@ -135,8 +137,10 @@ __all__ = [
     "inspect_v8_container",
     "main",
     "new",
+    "plot",
     "read",
     "readfile",
     "read_design_settings",
     "scan_records",
+    "save_plot",
 ]

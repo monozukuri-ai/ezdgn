@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           "${VENV_PY}" -m pip install --upgrade pip
-          "${VENV_PY}" -m pip install "maturin>=1.13,<2" "pytest>=8"
+          "${VENV_PY}" -m pip install "maturin>=1.13,<2" "pytest>=8" "matplotlib>=3.8"
 
       - name: Rust formatting
         run: cargo fmt --check
@@ -81,6 +81,8 @@ jobs:
           "${VENV_PY}" -m ezdgn inspect tests/data/dgn/v7/smalltest.dgn --headers --json
           "${VENV_PY}" -m ezdgn inspect tests/data/dgn/v7/smalltest.dgn --entities --json
           "${VENV_PY}" -m ezdgn inspect tests/data/dgn/v8/test_dgnv8.dgn --json
+          MPLBACKEND=Agg "${VENV_PY}" -m ezdgn plot tests/data/dgn/v7/smalltest.dgn -o preview.png --encoding ascii
+          test -s preview.png
 
       - name: Build wheel
         shell: bash
@@ -97,7 +99,7 @@ jobs:
             VERIFY_PY=.wheel-venv/bin/python
           fi
           "${VERIFY_PY}" -m pip install --no-index --find-links dist ezdgn
-          "${VERIFY_PY}" -c "from pathlib import Path; import ezdgn; package = Path(ezdgn.__file__).parent; data = bytearray(1538); data[:4] = bytes.fromhex('08 09 fe 02'); data[1536:] = b'\xff\xff'; scan = ezdgn.scan_records(data); headers = ezdgn.inspect_headers(data); drawing = ezdgn.read(data); v8 = ezdgn.inspect_v8_container('tests/data/dgn/v8/test_dgnv8.dgn'); assert len(scan.records) == 1; assert scan.termination == 'end_marker'; assert headers.design_settings.dimension == 2; assert headers.design_settings.scale is None; assert len(drawing.elements) == 1; assert drawing.entities == (); assert drawing.root_elements == drawing.elements; assert v8.has_dgn_v8_markers; assert v8.model_storage_paths == ('/Dgn-Md/#000000',); assert ezdgn.Cell.KIND == 'CELL'; assert ezdgn.BSplineCurve.KIND == 'BSPLINE_CURVE'; assert ezdgn.AttributeLinkage.__name__ == 'AttributeLinkage'; assert ezdgn.DgnAttributes().level == 1; assert callable(ezdgn.new); assert ezdgn.__version__ == ezdgn._core.core_version(); assert (package / '_core.pyi').is_file(); assert (package / 'entities.py').is_file(); assert (package / 'metadata.py').is_file(); assert (package / 'raw.py').is_file(); assert (package / 'v8.py').is_file(); assert (package / 'writer.py').is_file(); assert (package / 'py.typed').is_file()"
+          "${VERIFY_PY}" -c "from pathlib import Path; import ezdgn; package = Path(ezdgn.__file__).parent; data = bytearray(1538); data[:4] = bytes.fromhex('08 09 fe 02'); data[1536:] = b'\xff\xff'; scan = ezdgn.scan_records(data); headers = ezdgn.inspect_headers(data); drawing = ezdgn.read(data); v8 = ezdgn.inspect_v8_container('tests/data/dgn/v8/test_dgnv8.dgn'); assert len(scan.records) == 1; assert scan.termination == 'end_marker'; assert headers.design_settings.dimension == 2; assert headers.design_settings.scale is None; assert len(drawing.elements) == 1; assert drawing.entities == (); assert drawing.root_elements == drawing.elements; assert v8.has_dgn_v8_markers; assert v8.model_storage_paths == ('/Dgn-Md/#000000',); assert ezdgn.Cell.KIND == 'CELL'; assert ezdgn.BSplineCurve.KIND == 'BSPLINE_CURVE'; assert ezdgn.AttributeLinkage.__name__ == 'AttributeLinkage'; assert ezdgn.DgnAttributes().level == 1; assert callable(ezdgn.new); assert callable(ezdgn.plot); assert callable(ezdgn.save_plot); assert ezdgn.__version__ == ezdgn._core.core_version(); assert (package / '_core.pyi').is_file(); assert (package / 'entities.py').is_file(); assert (package / 'metadata.py').is_file(); assert (package / 'plotting.py').is_file(); assert (package / 'raw.py').is_file(); assert (package / 'v8.py').is_file(); assert (package / 'writer.py').is_file(); assert (package / 'py.typed').is_file()"
 
   msrv:
     name: Rust 1.83 MSRV

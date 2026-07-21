@@ -31,7 +31,11 @@ Repository = "https://github.com/monozukuri-ai/ezdgn"
 Issues = "https://github.com/monozukuri-ai/ezdgn/issues"
 
 [project.optional-dependencies]
+plot = [
+    "matplotlib>=3.8",
+]
 dev = [
+    "matplotlib>=3.8",
     "pytest>=8.0",
 ]
 

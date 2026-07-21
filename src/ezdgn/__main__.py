@@ -41,7 +41,7 @@ from .metadata import CommonElementHeader, DesignSettings
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ezdgn",
-        description="Inspect DGN containers and V7 record streams.",
+        description="Read, inspect, and preview DGN files.",
     )
     parser.add_argument(
         "--version",
@@ -73,7 +73,66 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit machine-readable JSON",
     )
+    plot_parser = commands.add_parser(
+        "plot", help="Render a parsed V7 2D drawing with Matplotlib"
+    )
+    plot_parser.add_argument("path", type=Path)
+    plot_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Write an image such as preview.png (show a window if omitted)",
+    )
+    plot_parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show the preview window after writing --output",
+    )
+    plot_parser.add_argument(
+        "--coordinate-space",
+        choices=("master", "uor"),
+        default="master",
+        help="Plot master-unit or raw UOR coordinates (default: master)",
+    )
+    plot_parser.add_argument(
+        "--encoding",
+        default="cp1252",
+        help="Decode text using this encoding (default: cp1252)",
+    )
+    plot_parser.add_argument(
+        "--background",
+        default="#111111",
+        help="Matplotlib background color (default: #111111)",
+    )
+    plot_parser.add_argument(
+        "--monochrome",
+        action="store_true",
+        help="Use a contrasting monochrome foreground",
+    )
+    plot_parser.add_argument(
+        "--hide-text",
+        action="store_true",
+        help="Do not draw text elements",
+    )
+    plot_parser.add_argument(
+        "--hide-axes",
+        action="store_true",
+        help="Hide axes and unit labels",
+    )
+    plot_parser.add_argument(
+        "--dpi",
+        type=_positive_int,
+        default=150,
+        help="Output resolution in dots per inch (default: 150)",
+    )
     return parser
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def _inspect(
@@ -473,13 +532,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     try:
+        if args.command == "plot":
+            return _plot_command(args)
         result = _inspect(
             args.path,
             include_records=args.records,
             include_headers=args.headers,
             include_entities=args.entities,
         )
-    except (OSError, DgnError) as error:
+    except (ImportError, LookupError, OSError, ValueError, DgnError) as error:
         print(f"ezdgn: {error}", file=sys.stderr)
         return 1
 
@@ -487,6 +548,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     else:
         _print_human(result)
+    return 0
+
+
+def _plot_command(args: argparse.Namespace) -> int:
+    from .plotting import _save_figure, _show, plot, save_plot
+
+    drawing = read(args.path)
+    options = {
+        "coordinate_space": args.coordinate_space,
+        "background": args.background,
+        "monochrome": args.monochrome,
+        "show_text": not args.hide_text,
+        "text_encoding": args.encoding,
+        "show_axes": not args.hide_axes,
+    }
+    if args.output is not None and not args.show:
+        save_plot(drawing, args.output, dpi=args.dpi, **options)
+        print(f"wrote: {args.output}")
+        return 0
+
+    figure, _ = plot(drawing, **options)
+    if args.output is not None:
+        _save_figure(figure, args.output, dpi=args.dpi)
+        print(f"wrote: {args.output}")
+    _show()
     return 0
 
 

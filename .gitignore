@@ -1,0 +1,18 @@
+/target/
+/dist/
+/.venv/
+/.wheel-venv/
+/.py310-venv/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dylib
+*.dll
+*.egg-info/
+
+# Local design and research notes are not part of the public release.
+/docs/

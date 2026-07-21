@@ -1,0 +1,53 @@
+[project]
+name = "ezdgn"
+version = "0.1.0"
+description = "Native V7 DGN reader and seed-based writer for Python powered by Rust"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "neka-nat", email = "nekanat.stock@gmail.com" },
+]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["dgn", "cad", "microstation", "parser", "rust"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/monozukuri-ai/ezdgn"
+Repository = "https://github.com/monozukuri-ai/ezdgn"
+Issues = "https://github.com/monozukuri-ai/ezdgn/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+ezdgn = "ezdgn:main"
+
+[tool.maturin]
+manifest-path = "crates/ezdgn-python/Cargo.toml"
+module-name = "ezdgn._core"
+python-packages = ["ezdgn"]
+python-source = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "-ra"
+
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"

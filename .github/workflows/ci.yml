@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.10"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create development environment
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            echo "VENV_PY=.venv/Scripts/python.exe" >> "${GITHUB_ENV}"
+          else
+            echo "VENV_PY=.venv/bin/python" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Install development tools
+        shell: bash
+        run: |
+          "${VENV_PY}" -m pip install --upgrade pip
+          "${VENV_PY}" -m pip install "maturin>=1.13,<2" "pytest>=8"
+
+      - name: Rust formatting
+        run: cargo fmt --check
+
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Build editable extension
+        shell: bash
+        run: |
+          "${VENV_PY}" -m maturin develop --release
+
+      - name: Python tests
+        shell: bash
+        run: |
+          "${VENV_PY}" -m pytest
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          "${VENV_PY}" -m ezdgn --version
+          "${VENV_PY}" -m ezdgn inspect tests/data/dgn/v7/smalltest.dgn --headers --json
+          "${VENV_PY}" -m ezdgn inspect tests/data/dgn/v7/smalltest.dgn --entities --json
+          "${VENV_PY}" -m ezdgn inspect tests/data/dgn/v8/test_dgnv8.dgn --json
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          "${VENV_PY}" -m maturin build --release --out dist
+
+      - name: Verify installed wheel and typing files
+        shell: bash
+        run: |
+          python -m venv .wheel-venv
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            VERIFY_PY=.wheel-venv/Scripts/python.exe
+          else
+            VERIFY_PY=.wheel-venv/bin/python
+          fi
+          "${VERIFY_PY}" -m pip install --no-index --find-links dist ezdgn
+          "${VERIFY_PY}" -c "from pathlib import Path; import ezdgn; package = Path(ezdgn.__file__).parent; data = bytearray(1538); data[:4] = bytes.fromhex('08 09 fe 02'); data[1536:] = b'\xff\xff'; scan = ezdgn.scan_records(data); headers = ezdgn.inspect_headers(data); drawing = ezdgn.read(data); v8 = ezdgn.inspect_v8_container('tests/data/dgn/v8/test_dgnv8.dgn'); assert len(scan.records) == 1; assert scan.termination == 'end_marker'; assert headers.design_settings.dimension == 2; assert headers.design_settings.scale is None; assert len(drawing.elements) == 1; assert drawing.entities == (); assert drawing.root_elements == drawing.elements; assert v8.has_dgn_v8_markers; assert v8.model_storage_paths == ('/Dgn-Md/#000000',); assert ezdgn.Cell.KIND == 'CELL'; assert ezdgn.BSplineCurve.KIND == 'BSPLINE_CURVE'; assert ezdgn.AttributeLinkage.__name__ == 'AttributeLinkage'; assert ezdgn.DgnAttributes().level == 1; assert callable(ezdgn.new); assert ezdgn.__version__ == ezdgn._core.core_version(); assert (package / '_core.pyi').is_file(); assert (package / 'entities.py').is_file(); assert (package / 'metadata.py').is_file(); assert (package / 'raw.py').is_file(); assert (package / 'v8.py').is_file(); assert (package / 'writer.py').is_file(); assert (package / 'py.typed').is_file()"
+
+  msrv:
+    name: Rust 1.83 MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust 1.83
+        uses: dtolnay/rust-toolchain@1.83.0
+
+      - name: Check locked workspace
+        run: cargo check --workspace --locked

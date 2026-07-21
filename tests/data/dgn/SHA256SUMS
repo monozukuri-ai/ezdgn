@@ -1,0 +1,6 @@
+9d9faddb67216f9d56fc9a1027adc1a927c8c13529dfd3416b771b4dc4e9a284  tests/data/dgn/v7/smalltest.dgn
+dd8465f18569d9289809e9e0962115d365d0a56de021393952a5e7a0a20b527c  tests/data/dgn/v7/seed_2d.dgn
+97c2f00ee6ea96873b7d16e5e898b4850e3d35448299d7d9d37e7d1792b56896  tests/data/dgn/v7/seed_3d.dgn
+bd09d118a595f5afba833c7c61dad83cf02b01f1b224836b8493a164de90da4e  tests/data/dgn/malformed/knot_oob.dgn
+8f32f87ce4b16881aa64f5cb9f75c98851833f96fef37ca0ad31aa6bb18d1df0  tests/data/dgn/v8/test_dgnv8.dgn
+09f765e0aa8dc06bb1d0da4ed86f060dc0a839d480b3dc67e54841ecceec6433  tests/data/dgn/v8/test_dgnv8_ref.csv

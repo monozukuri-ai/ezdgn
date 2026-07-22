@@ -1,6 +1,6 @@
 # ezdgn
 
-`ezdgn` is a native V7 DGN reader and seed-based writer for Python,
+`ezdgn` is a native V7 DGN reader and writer for Python,
 implemented with a pure Rust core and PyO3 bindings.
 
 ## Installation
@@ -25,7 +25,7 @@ stable ABI (`abi3`) with a Python 3.10 minimum.
 | Format and operation | Support |
 | --- | --- |
 | V7/ISFF 2D read | Native entities, hierarchy, metadata, linkages, and raw records |
-| V7/ISFF 2D write | Seed-based creation of common primitive entities |
+| V7/ISFF 2D write | Standalone or custom-seed creation of common primitives |
 | V7/ISFF 3D | Signature, raw record, and common-header inspection only |
 | V8 DGN | CFB container identification and directory inspection only |
 
@@ -38,11 +38,11 @@ and resolves outline/fill colors through the active color table. Every record,
 including unsupported control and application elements, retains its original
 bytes.
 
-The writer creates standalone V7 2D files from a caller-supplied seed while
-preserving its units, origin, and design plane. It writes line, line string,
-shape, curve, ellipse, arc, circle-as-ellipse, and raw-byte text entities with
-basic symbology and shape fill linkage. Coordinates outside the seed's design
-plane are rejected instead of silently clipped.
+The writer creates standalone V7 2D files from a bundled empty seed. A custom
+seed can be supplied to preserve its units, origin, and design plane. It writes
+line, line string, shape, curve, ellipse, arc, circle-as-ellipse, and raw-byte
+text entities with basic symbology and shape fill linkage. Coordinates outside
+the selected seed's design plane are rejected instead of silently clipped.
 
 V8 entity semantics and V7 3D geometry are not supported. The writer does not
 yet create cells, complex elements, B-splines, arbitrary linkages, or perform
@@ -62,7 +62,7 @@ drawing = ezdgn.readfile("drawing.dgn")
 print(len(drawing.elements), len(drawing.entities), len(drawing.all_entities))
 
 for entity in drawing:
-    print(entity.dxftype(), entity.record.level, entity.style)
+    print(entity.dxftype(), entity.level, entity.style)
 
 for line in drawing.query("LINE"):
     print(line.start_uor, line.end_uor)
@@ -70,7 +70,8 @@ for line in drawing.query("LINE"):
 
 for text in drawing.query("TEXT"):
     print(text.text_bytes)
-    print(text.decode_text("cp932"))  # the caller selects the encoding
+    print(text.decode_text())  # ASCII with strict errors by default
+    print(text.decode_text("cp932", errors="replace"))
 
 for cell in drawing.query("CELL"):
     print(cell.name, cell.origin_master, cell.transform)
@@ -82,14 +83,29 @@ for element in drawing.elements:
         print(linkage.kind, linkage.linkage_type_name, linkage.raw_bytes)
 ```
 
+`drawing.entities` contains supported top-level drawable entities only.
+`drawing.all_entities` is a flat tuple in original `drawing.elements` order:
+it includes both `Cell`/`ComplexChain`/`ComplexShape` container headers and
+their supported drawable descendants at every depth. It excludes control
+records, `UnsupportedElement` instances, and non-drawable B-spline support
+records; those remain available through the lossless `drawing.elements`
+sequence. `drawing.unsupported_elements` provides a filtered diagnostic view
+for unknown kinds. Use `parent()`, `children()`, or `descendants()` when a tree
+view is needed.
+
 Ellipse, arc, curve, and B-spline entities retain their native parameters or
 control records; they are not flattened to polylines. `parent_index` and
 `child_indices` refer to the lossless `drawing.elements` sequence, while
 `drawing.parent()`, `children()`, and `descendants()` resolve the objects.
 Stored integer UOR, sub-UOR-corrected floating UOR, and optional master-unit
 coordinates coexist. `drawing.color_table` is the last type-5, level-1 color
-table in file order; `entity.style.rgb` and `fill_rgb` are resolved from it
-when present.
+table in file order. `drawing.resolve_color()`, `entity.style.rgb`, and
+`fill_rgb` use that table when present and otherwise fall back to the standard
+MicroStation V7 256-color palette.
+
+V7 DGN does not record a text code page. `Text.decode_text()` therefore uses
+`encoding="ascii", errors="strict"` as a deterministic default; pass the
+project encoding explicitly for non-ASCII text.
 
 Known DMRS/database, association ID, shape fill, and high-precision linkages
 have typed fields. Unknown user linkages and malformed trailing attribute bytes
@@ -141,12 +157,12 @@ never flattened or modified. V7 text does not store its code page, so the
 caller must select the correct encoding for non-ASCII text. Geometry and text
 with compatible display styles are batched to keep large previews practical.
 
-## Seed-based V7 writer
+## V7 writer and optional custom seeds
 
 ```python
 import ezdgn
 
-doc = ezdgn.new("seed_2d.dgn")
+doc = ezdgn.new()  # uses the bundled empty V7 2D seed
 msp = doc.modelspace()
 
 msp.add_line(
@@ -173,11 +189,13 @@ doc.saveas("drawing.dgn")
 roundtrip = doc.readback()
 ```
 
-By default `new()` copies the mandatory TCB, digitizer setup, level symbology,
-and the last active color table from the seed. Set `copy_seed_elements=True`
-to retain every existing seed record, including any graphics. Text encoding is
-not recorded by V7 DGN, so `add_text()` accepts bytes directly or requires the
-caller-selected encoding for `str` input.
+Pass a custom seed as `ezdgn.new("project_seed.dgn")` to use its units, origin,
+design plane, and active color table. `new()` copies the mandatory TCB,
+digitizer setup, level symbology, and last active color table from the selected
+seed. Set `copy_seed_elements=True` to retain every seed record, including any
+graphics. Text encoding is not recorded by V7 DGN, so `add_text()` accepts
+bytes directly or uses its `encoding="ascii", errors="strict"` defaults for
+`str` input.
 
 ## Raw record API
 
@@ -273,6 +291,7 @@ maturin build --release --out dist
 
 ## License
 
-`ezdgn` is released under the [MIT License](LICENSE). Test fixtures retain the
-separate upstream terms documented in
+`ezdgn` is released under the [MIT License](LICENSE). The bundled empty seed
+and test fixtures retain the separate upstream terms documented in
+[`src/ezdgn/_data/README.md`](src/ezdgn/_data/README.md) and
 [`tests/data/dgn/README.md`](tests/data/dgn/README.md).

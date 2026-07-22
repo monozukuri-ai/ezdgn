@@ -27,6 +27,51 @@ Point2Raw: TypeAlias = tuple[float, float]
 Point2Master: TypeAlias = tuple[float, float]
 RgbColor: TypeAlias = tuple[int, int, int]
 
+
+def _microstation_v7_default_colors() -> tuple[RgbColor, ...]:
+    """Build the default palette used when a V7 file has no color table."""
+
+    colors: list[RgbColor] = [
+        (255, 255, 255),
+        (0, 0, 255),
+        (0, 255, 0),
+        (255, 0, 0),
+        (255, 255, 0),
+        (255, 0, 255),
+        (255, 127, 0),
+        (0, 255, 255),
+        (64, 64, 64),
+        (192, 192, 192),
+        (254, 0, 96),
+        (160, 224, 0),
+        (0, 254, 160),
+        (128, 0, 160),
+        (176, 176, 176),
+    ]
+    for intensity in range(240, 29, -15):
+        band = (
+            (0, intensity, intensity),
+            (intensity, intensity, intensity),
+            (0, 0, intensity),
+            (0, intensity, 0),
+            (intensity, 0, 0),
+            (intensity, intensity, 0),
+            (intensity, 0, intensity),
+            (intensity, intensity // 3 + 42, 0),
+        )
+        colors.extend(band)
+        colors.extend(band)
+
+    # The final two slots are special entries in MicroStation's V7 palette.
+    colors[-1] = (192, 192, 192)
+    colors.append((28, 0, 100))
+    if len(colors) != 256:  # pragma: no cover - guards the table definition
+        raise RuntimeError("invalid built-in V7 color table")
+    return tuple(colors)
+
+
+_DEFAULT_V7_COLORS = _microstation_v7_default_colors()
+
 LineRow: TypeAlias = tuple[
     int,
     Point2Uor,
@@ -239,6 +284,12 @@ class DgnElement:
         return self.kind
 
     @property
+    def level(self) -> int:
+        """Return the V7 level directly, without traversing the raw record."""
+
+        return self.record.level
+
+    @property
     def is_component(self) -> bool:
         return self.parent_index is not None
 
@@ -435,8 +486,10 @@ class Text(DgnElement):
     def text_bytes(self) -> bytes:
         return self._text_view.tobytes()
 
-    def decode_text(self, encoding: str, errors: str = "strict") -> str:
-        """Decode text using an encoding explicitly selected by the caller."""
+    def decode_text(
+        self, encoding: str = "ascii", errors: str = "strict"
+    ) -> str:
+        """Decode text, using ASCII as the safe default V7 code page."""
 
         return self.text_bytes.decode(encoding, errors)
 
@@ -613,7 +666,13 @@ class Drawing:
 
     @property
     def all_entities(self) -> tuple[GraphicElement, ...]:
-        """All drawable records, including components nested in containers."""
+        """Supported drawable records flattened in original file order.
+
+        Container headers such as cells and complex chains/shapes are included,
+        followed by their supported drawable descendants. Control, unsupported,
+        and non-drawable B-spline support records remain outside this tuple and
+        available through ``elements`` or ``unsupported_elements``.
+        """
 
         return tuple(
             cast(GraphicElement, element)
@@ -647,9 +706,15 @@ class Drawing:
             raise RuntimeError("native reader returned an invalid color-table index")
         return element
 
-    def resolve_color(self, index: int) -> RgbColor | None:
+    def resolve_color(self, index: int) -> RgbColor:
+        """Resolve an index through the active or built-in V7 color table."""
+
         table = self.color_table
-        return None if table is None else table.color(index)
+        if table is not None:
+            return table.color(index)
+        if not 0 <= index < 256:
+            raise IndexError("DGN color index must be between 0 and 255")
+        return _DEFAULT_V7_COLORS[index]
 
     def query(self, kind: str) -> tuple[DgnElement, ...]:
         """Return elements matching a stable type name such as ``LINE``."""
@@ -826,7 +891,7 @@ def _drawing_from_core(data: bytes, row: PrimitiveScanRow) -> Drawing:
     if len(semantic_indices) != expected_semantic_count:
         raise RuntimeError("native entity scan returned duplicate element indices")
 
-    active_colors: tuple[RgbColor, ...] | None = None
+    active_colors = _DEFAULT_V7_COLORS
     if active_color_table_index is not None:
         try:
             active_row = rows.color_tables[active_color_table_index]
@@ -912,7 +977,7 @@ def _linkages_from_rows(
 
 def _element_from_rows(
     metadata: ElementMetadata,
-    active_colors: tuple[RgbColor, ...] | None,
+    active_colors: tuple[RgbColor, ...],
     linkages: tuple[AttributeLinkage, ...],
     rows: _SemanticRows,
 ) -> DgnElement:
@@ -1181,13 +1246,13 @@ def _multipoint_entity(
 
 def _basic_style(
     header: CommonElementHeader | None,
-    colors: tuple[RgbColor, ...] | None,
+    colors: tuple[RgbColor, ...],
     linkages: tuple[AttributeLinkage, ...],
 ) -> BasicStyle | None:
     if header is None:
         return None
     symbology = header.symbology
-    rgb = None if colors is None else colors[symbology.color]
+    rgb = colors[symbology.color]
     fill_color_index = next(
         (
             linkage.color_index
@@ -1196,11 +1261,7 @@ def _basic_style(
         ),
         None,
     )
-    fill_rgb = (
-        None
-        if colors is None or fill_color_index is None
-        else colors[fill_color_index]
-    )
+    fill_rgb = None if fill_color_index is None else colors[fill_color_index]
     return BasicStyle(
         color_index=symbology.color,
         line_style=symbology.style,

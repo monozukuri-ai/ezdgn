@@ -1,4 +1,4 @@
-"""Native V7 DGN reader and seed-based writer for Python."""
+"""Native V7 DGN reader and writer for Python."""
 
 from __future__ import annotations
 

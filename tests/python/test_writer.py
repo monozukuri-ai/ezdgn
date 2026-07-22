@@ -12,6 +12,22 @@ SEED_2D = DATA / "v7" / "seed_2d.dgn"
 SEED_3D = DATA / "v7" / "seed_3d.dgn"
 
 
+def test_new_uses_bundled_empty_seed_when_omitted() -> None:
+    document = ezdgn.new()
+
+    assert document.source_path is None
+    assert document.design_settings.dimension == 2
+    assert document.design_settings.uor_per_master == 120
+    document.modelspace().add_line((0, 0), (1, 1))
+
+    drawing = document.readback()
+    assert len(drawing.elements) == 4
+    line = drawing.query("LINE")[0]
+    assert isinstance(line, ezdgn.Line)
+    assert line.start_master == pytest.approx((0, 0))
+    assert line.end_master == pytest.approx((1, 1))
+
+
 def test_seed_writer_round_trips_every_phase_five_entity(tmp_path: Path) -> None:
     document = ezdgn.new(SEED_2D)
     assert document.design_settings.dimension == 2
@@ -84,7 +100,8 @@ def test_seed_writer_round_trips_every_phase_five_entity(tmp_path: Path) -> None
     assert parsed_line.end_master == pytest.approx((4.5, 3.75))
     assert parsed_line.common_header is not None
     assert parsed_line.common_header.graphic_group == 42
-    assert parsed_line.style == ezdgn.BasicStyle(12, 3, 5, None)
+    assert parsed_line.level == 7
+    assert parsed_line.style == ezdgn.BasicStyle(12, 3, 5, (0, 254, 160))
 
     parsed_shape = roundtrip.query("SHAPE")[0]
     assert isinstance(parsed_shape, ezdgn.Shape)
@@ -131,6 +148,8 @@ def test_writer_preserves_raw_text_encoding_and_seed_copy_policy() -> None:
     assert len(minimal_scan.records) == 4
     parsed = minimal.readback().query("TEXT")[0]
     assert isinstance(parsed, ezdgn.Text)
+    with pytest.raises(UnicodeDecodeError):
+        parsed.decode_text()
     assert parsed.decode_text("cp932") == "日本語"
 
     complete = ezdgn.new(SEED_2D, copy_seed_elements=True)

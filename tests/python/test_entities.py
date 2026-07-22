@@ -57,6 +57,9 @@ def test_reads_smalltest_as_ordered_lossless_entities() -> None:
     assert text.origin_master == pytest.approx((0.7365, 4.2198))
     assert text.text_view.readonly
     assert text.text_bytes == b"Demo Text"
+    assert text.level == 1
+    assert text.level == text.record.level
+    assert text.decode_text() == "Demo Text"
     assert text.decode_text("ascii") == "Demo Text"
 
     ellipse = drawing.query("ellipse")[0]
@@ -84,7 +87,12 @@ def test_reads_smalltest_as_ordered_lossless_entities() -> None:
     assert shape.vertices_master is not None
     assert shape.vertices_master[2] == pytest.approx((4.9441, 2.5235))
     assert shape.style == ezdgn.BasicStyle(
-        83, 0, 0, None, fill_color_index=83
+        83,
+        0,
+        0,
+        (180, 0, 0),
+        fill_color_index=83,
+        fill_rgb=(180, 0, 0),
     )
     assert shape.attribute_view is not None
     assert shape.attribute_view.tobytes() == source[10_278 + 78 : 10_278 + 94]
@@ -101,6 +109,27 @@ def test_reads_smalltest_as_ordered_lossless_entities() -> None:
     assert line.start_master == pytest.approx((2.5562, 5.7218))
     assert line.end_master == pytest.approx((2.5242, 6.0709))
     assert drawing.query("line-string") == ()
+
+
+def test_uses_microstation_v7_colors_when_table_is_absent() -> None:
+    drawing = ezdgn.readfile(SMALLTEST)
+
+    assert drawing.color_table is None
+    assert drawing.resolve_color(0) == (255, 255, 255)
+    assert drawing.resolve_color(1) == (0, 0, 255)
+    assert drawing.resolve_color(10) == (254, 0, 96)
+    assert drawing.resolve_color(83) == (180, 0, 0)
+    assert drawing.resolve_color(254) == (192, 192, 192)
+    assert drawing.resolve_color(255) == (28, 0, 100)
+    with pytest.raises(IndexError, match="between 0 and 255"):
+        drawing.resolve_color(-1)
+    with pytest.raises(IndexError, match="between 0 and 255"):
+        drawing.resolve_color(256)
+
+    line = drawing.query("LINE")[0]
+    assert isinstance(line, ezdgn.Line)
+    assert line.style is not None
+    assert line.style.rgb == drawing.resolve_color(line.style.color_index)
 
 
 def test_decodes_line_string_arc_color_table_and_resolves_style() -> None:
@@ -239,7 +268,18 @@ def test_cli_emits_phase_three_entities_without_decoding_text() -> None:
     ]
 
 
-def test_restores_nested_cell_and_complex_hierarchy_without_flattening() -> None:
+@pytest.mark.parametrize(
+    ("complex_type", "complex_kind", "complex_class"),
+    [
+        (12, "COMPLEX CHAIN", ezdgn.ComplexChain),
+        (14, "COMPLEX SHAPE", ezdgn.ComplexShape),
+    ],
+)
+def test_restores_nested_cell_and_complex_hierarchy_without_flattening(
+    complex_type: int,
+    complex_kind: str,
+    complex_class: type[ezdgn.ComplexElement],
+) -> None:
     line = _record(3, 2, _middle_i32(1) * 2 + _middle_i32(2) * 2, complex=True)
     curve_body = _multipoint_body(((0, 0), (10, 10), (20, 5)))
     curve = _record(11, 2, curve_body, complex=True)
@@ -249,7 +289,7 @@ def test_restores_nested_cell_and_complex_hierarchy_without_flattening() -> None
     complex_body[0:2] = ((complex_size - 38) // 2).to_bytes(2, "little")
     complex_body[2:4] = (2).to_bytes(2, "little")
     complex_header = _record(
-        14,
+        complex_type,
         2,
         complex_body,
         complex=True,
@@ -277,31 +317,32 @@ def test_restores_nested_cell_and_complex_hierarchy_without_flattening() -> None
         _with_phase_three_records(cell, complex_header, line, curve)
     )
     parsed_cell = drawing.query("CELL")[0]
-    complex_shape = drawing.query("COMPLEX SHAPE")[0]
+    complex_element = drawing.query(complex_kind)[0]
     parsed_line = drawing.query("LINE")[0]
     parsed_curve = drawing.query("CURVE")[0]
     assert isinstance(parsed_cell, ezdgn.Cell)
-    assert isinstance(complex_shape, ezdgn.ComplexShape)
+    assert isinstance(complex_element, complex_class)
     assert isinstance(parsed_curve, ezdgn.Curve)
     assert parsed_cell.name == "ABC123"
     assert parsed_cell.cell_class == 7
     assert parsed_cell.levels == (1, 2, 4, 8)
     assert parsed_cell.origin_uor == (100, 200)
     assert parsed_cell.transform[0][0] == pytest.approx(0.999_998_301_3)
-    assert drawing.children(parsed_cell) == (complex_shape,)
-    assert drawing.parent(complex_shape) is parsed_cell
-    assert drawing.children(complex_shape) == (parsed_line, parsed_curve)
+    assert drawing.children(parsed_cell) == (complex_element,)
+    assert drawing.parent(complex_element) is parsed_cell
+    assert drawing.children(complex_element) == (parsed_line, parsed_curve)
     assert drawing.descendants(parsed_cell) == (
-        complex_shape,
+        complex_element,
         parsed_line,
         parsed_curve,
     )
-    assert parsed_line.parent_index == complex_shape.record.index
+    assert parsed_line.parent_index == complex_element.record.index
+    assert parsed_line.level == 2
     assert parsed_curve.vertices_uor == ((0, 0), (10, 10), (20, 5))
     assert drawing.entities == (parsed_cell,)
     assert drawing.all_entities == (
         parsed_cell,
-        complex_shape,
+        complex_element,
         parsed_line,
         parsed_curve,
     )

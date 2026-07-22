@@ -1,4 +1,4 @@
-"""Seed-based V7 2D document creation."""
+"""V7 2D document creation with bundled or custom seed controls."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from functools import cache
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Literal, TypeAlias, cast
 
@@ -308,7 +310,7 @@ class Modelspace:
 
 @dataclass(slots=True)
 class V7Document:
-    """Mutable seed-backed V7 2D document ready to serialize."""
+    """Mutable V7 2D document backed by bundled or caller-supplied controls."""
 
     _seed_bytes: bytes = field(repr=False)
     design_settings: DesignSettings
@@ -364,16 +366,22 @@ class V7Document:
 
 
 def new(
-    seed: DgnSource,
+    seed: DgnSource | None = None,
     *,
     copy_color_table: bool = True,
     copy_seed_elements: bool = False,
     max_file_size: int = DEFAULT_MAX_FILE_SIZE_BYTES,
 ) -> V7Document:
-    """Create a mutable V7 2D document using *seed* as its design settings."""
+    """Create a mutable V7 2D document.
+
+    When *seed* is omitted, the bundled empty 2D seed supplies the design
+    settings. Pass a V7 2D path or bytes to preserve project-specific units,
+    origin, design plane, and optionally its color table or other records.
+    """
 
     source_path = os.fspath(seed) if isinstance(seed, (str, os.PathLike)) else None
-    data = _read_all(seed, max_file_size=max_file_size)
+    source = _bundled_seed_bytes() if seed is None else seed
+    data = _read_all(source, max_file_size=max_file_size)
     scan = scan_records(data, max_file_size=max_file_size)
     if scan.format.dimension != 2:
         raise UnsupportedDgnError("V7 3D seeds are not supported by the 2D writer")
@@ -395,6 +403,17 @@ def new(
         bool(copy_seed_elements),
         source_path,
     )
+
+
+@cache
+def _bundled_seed_bytes() -> bytes:
+    """Load the empty V7 2D seed from the installed package."""
+
+    resource = files("ezdgn").joinpath("_data").joinpath("seed_2d.dgn")
+    try:
+        return resource.read_bytes()
+    except FileNotFoundError as error:  # pragma: no cover - broken distribution
+        raise RuntimeError("ezdgn's bundled V7 seed is missing") from error
 
 
 def _attributes(

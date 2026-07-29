@@ -1,0 +1,8 @@
+# Test fixtures and their provenance records must be reproducible byte-for-byte
+# on every checkout, including Windows configurations with core.autocrlf=true.
+tests/data/dgn/**/*.dgn binary
+tests/data/dgn/**/*.csv text eol=lf
+tests/data/dgn/**/*.json text eol=lf
+tests/data/dgn/**/*.md text eol=lf
+tests/data/dgn/**/*.txt text eol=lf
+tests/data/dgn/SHA256SUMS text eol=lf

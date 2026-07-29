@@ -1,7 +1,7 @@
 [project]
 name = "ezdgn"
 version = "0.1.2"
-description = "Native V7 DGN reader and writer for Python powered by Rust"
+description = "Native V8 DGN reader and V7 DGN reader/writer for Python powered by Rust"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
@@ -47,6 +47,7 @@ manifest-path = "crates/ezdgn-python/Cargo.toml"
 module-name = "ezdgn._core"
 python-packages = ["ezdgn"]
 python-source = "src"
+include = [{ path = "docs/v8/*.md", format = "sdist" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

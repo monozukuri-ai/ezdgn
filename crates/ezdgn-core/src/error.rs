@@ -17,7 +17,7 @@ pub enum DgnError {
 
     /// The format was recognized but the requested reader does not support it.
     #[error(
-        "{format} is not supported by the native V7 reader; V8 semantic access requires an explicitly licensed external converter"
+        "{format} is not supported by this V7 record reader; use the native V8 APIs for V8/CFB input"
     )]
     UnsupportedFormat { format: DgnFormat },
 
@@ -32,6 +32,108 @@ pub enum DgnError {
     /// The CFB directory contains more entries than the configured limit.
     #[error("CFB entry count exceeds configured limit {limit}")]
     CfbEntryLimitExceeded { limit: usize },
+
+    /// A CFB candidate is missing one or more required DGN V8 root markers.
+    #[error("CFB container is missing required DGN V8 markers: {missing:?}")]
+    MissingV8Markers { missing: Vec<String> },
+
+    /// A requested V8 CFB stream is absent, is not a stream, or cannot be read.
+    #[error("invalid V8 stream {path}: {context}")]
+    InvalidV8Stream { path: String, context: String },
+
+    /// One CFB stream exceeds its configured extraction limit.
+    #[error("CFB stream {path} has {size} bytes, exceeding configured limit {limit} bytes")]
+    CfbStreamSizeLimitExceeded {
+        path: String,
+        size: u64,
+        limit: usize,
+    },
+
+    /// The combined logical size of CFB streams exceeds its configured limit.
+    #[error("CFB streams total {size} bytes, exceeding configured limit {limit} bytes")]
+    CfbTotalStreamSizeLimitExceeded { size: u64, limit: usize },
+
+    /// A compressed V8 payload could not be inflated as a complete zlib stream.
+    #[error("invalid compressed V8 stream {path}: {context}")]
+    InvalidV8CompressedStream { path: String, context: String },
+
+    /// One inflated V8 payload exceeds its configured output limit.
+    #[error("inflated V8 stream {path} exceeds configured limit {limit} bytes")]
+    V8InflatedSizeLimitExceeded { path: String, limit: usize },
+
+    /// The accumulated inflated V8 payloads exceed their configured limit.
+    #[error("inflated V8 streams exceed configured total limit {limit} bytes")]
+    V8TotalInflatedSizeLimitExceeded { limit: usize },
+
+    /// More object or auxiliary pages exist than the caller permits.
+    #[error("V8 page count exceeds configured limit {limit}")]
+    V8PageLimitExceeded { limit: usize },
+
+    /// More raw objects exist than the caller permits.
+    #[error("V8 object count exceeds configured limit {limit}")]
+    V8ObjectLimitExceeded { limit: usize },
+
+    /// A raw V8 object exceeds its configured size limit.
+    #[error(
+        "V8 object type {element_type} in {path} at inflated offset {offset} declares {declared} bytes, exceeding configured limit {limit} bytes"
+    )]
+    V8ObjectSizeLimitExceeded {
+        path: String,
+        offset: usize,
+        element_type: u16,
+        declared: usize,
+        limit: usize,
+    },
+
+    /// A V8 object or auxiliary page violates its bounded framing contract.
+    #[error("invalid V8 page {path} at inflated offset {offset}: {context}")]
+    InvalidV8Page {
+        path: String,
+        offset: usize,
+        context: String,
+    },
+
+    /// The model-index stream is structurally inconsistent.
+    #[error("invalid V8 model index at byte offset {offset}: {context}")]
+    InvalidV8ModelIndex { offset: usize, context: String },
+
+    /// A model header is absent or structurally inconsistent.
+    #[error("invalid V8 model header {path}: {context}")]
+    InvalidV8ModelHeader { path: String, context: String },
+
+    /// A variable V8 geometry array violates its configured limit or byte shape.
+    #[error("invalid V8 geometry for object {element_id} type {element_type}: {context}")]
+    InvalidV8Geometry {
+        element_id: u64,
+        element_type: u16,
+        context: String,
+    },
+
+    /// A decoded V8 string is larger than the caller permits.
+    #[error("V8 string in {context} has {actual} bytes, exceeding configured limit {limit}")]
+    V8StringLimitExceeded {
+        context: String,
+        actual: usize,
+        limit: usize,
+    },
+
+    /// A variable-size V8 geometry array has more vertices than configured.
+    #[error(
+        "V8 object {element_id} declares {actual} vertices, exceeding configured limit {limit}"
+    )]
+    V8VertexLimitExceeded {
+        element_id: u64,
+        actual: usize,
+        limit: usize,
+    },
+
+    /// A nested complex-element tree is deeper than configured.
+    #[error("V8 hierarchy exceeds configured depth {limit} at object index {index}")]
+    V8HierarchyDepthLimitExceeded { index: usize, limit: usize },
+
+    /// A complex-element relationship is malformed or too deeply nested.
+    #[error("invalid V8 hierarchy at object index {index}: {context}")]
+    InvalidV8Hierarchy { index: usize, context: String },
 
     /// The format is V7, but this semantic reader currently handles only 2D.
     #[error("V7 {dimension} geometry is not supported by the 2D entity reader")]
@@ -247,6 +349,16 @@ impl DgnError {
                 | Self::RecordLimitExceeded { .. }
                 | Self::RecordSizeLimitExceeded { .. }
                 | Self::CfbEntryLimitExceeded { .. }
+                | Self::CfbStreamSizeLimitExceeded { .. }
+                | Self::CfbTotalStreamSizeLimitExceeded { .. }
+                | Self::V8InflatedSizeLimitExceeded { .. }
+                | Self::V8TotalInflatedSizeLimitExceeded { .. }
+                | Self::V8PageLimitExceeded { .. }
+                | Self::V8ObjectLimitExceeded { .. }
+                | Self::V8ObjectSizeLimitExceeded { .. }
+                | Self::V8StringLimitExceeded { .. }
+                | Self::V8VertexLimitExceeded { .. }
+                | Self::V8HierarchyDepthLimitExceeded { .. }
         )
     }
 

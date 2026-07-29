@@ -1,7 +1,3 @@
-//! Bounded inspection of the CFB container around a possible V8 DGN file.
-//!
-//! This module deliberately does not decode the proprietary DGN V8 streams.
-
 use std::io::Cursor;
 use std::path::{Component, Path};
 
@@ -10,11 +6,11 @@ use crate::{detect_format, DgnError, DgnFormat};
 /// Default maximum number of non-root CFB directory entries to inspect.
 pub const DEFAULT_MAX_CFB_ENTRIES: usize = 100_000;
 
-const DGN_HEADER_STREAM: &str = "/Dgn~H";
-const DGN_SUMMARY_STREAM: &str = "/Dgn~S";
-const DGN_MODELS_STORAGE: &str = "/Dgn-Md";
+pub(super) const DGN_HEADER_STREAM: &str = "/Dgn~H";
+pub(super) const DGN_SUMMARY_STREAM: &str = "/Dgn~S";
+pub(super) const DGN_MODELS_STORAGE: &str = "/Dgn-Md";
 
-fn portable_cfb_path(path: &Path) -> String {
+pub(super) fn portable_cfb_path(path: &Path) -> String {
     let mut portable = String::new();
     for component in path.components() {
         if let Component::Normal(name) = component {
@@ -76,23 +72,23 @@ pub struct V8ContainerInfo {
     pub entries: Vec<V8CfbEntry>,
 }
 
-/// Inspects the CFB directory of a possible V8 DGN without decoding DGN data.
-///
-/// A successful marker check only establishes that the container has the
-/// expected DGN-specific root entries. It does not validate or parse their
-/// proprietary contents.
-pub fn inspect_v8_container(input: &[u8], max_entries: usize) -> Result<V8ContainerInfo, DgnError> {
+pub(super) type V8Compound<'a> = cfb::CompoundFile<Cursor<&'a [u8]>>;
+
+pub(super) fn open_v8_compound(input: &[u8]) -> Result<V8Compound<'_>, DgnError> {
     let format = detect_format(input)?;
     if format != DgnFormat::V8Cfb {
         return Err(DgnError::ExpectedV8Container { format });
     }
 
-    let compound = cfb::CompoundFile::open(Cursor::new(input)).map_err(|error| {
-        DgnError::InvalidV8Container {
-            context: error.to_string(),
-        }
-    })?;
+    cfb::CompoundFile::open(Cursor::new(input)).map_err(|error| DgnError::InvalidV8Container {
+        context: error.to_string(),
+    })
+}
 
+pub(super) fn inspect_compound<F>(
+    compound: &cfb::CompoundFile<F>,
+    max_entries: usize,
+) -> Result<V8ContainerInfo, DgnError> {
     let mut entries = Vec::new();
     for entry in compound.walk().skip(1) {
         if entries.len() == max_entries {
@@ -141,6 +137,16 @@ pub fn inspect_v8_container(input: &[u8], max_entries: usize) -> Result<V8Contai
         model_storage_paths,
         entries,
     })
+}
+
+/// Inspects the CFB directory of a possible V8 DGN without decoding DGN data.
+///
+/// A successful marker check only establishes that the container has the
+/// expected DGN-specific root entries. It does not validate or parse their
+/// proprietary contents.
+pub fn inspect_v8_container(input: &[u8], max_entries: usize) -> Result<V8ContainerInfo, DgnError> {
+    let compound = open_v8_compound(input)?;
+    inspect_compound(&compound, max_entries)
 }
 
 #[cfg(test)]

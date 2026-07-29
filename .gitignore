@@ -14,5 +14,10 @@ __pycache__/
 *.dll
 *.egg-info/
 
-# Local design and research notes are not part of the public release.
-/docs/
+# Local design and research notes are not part of the public release, except
+# for the reviewed V8 clean-room scope and provenance records.
+/docs/*
+!/docs/v8/
+!/docs/v8/SCOPE.md
+!/docs/v8/FORMAT_NOTES.md
+!/docs/v8/PROVENANCE.md

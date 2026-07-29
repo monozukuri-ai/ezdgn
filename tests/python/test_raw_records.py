@@ -108,7 +108,7 @@ def test_semantically_malformed_record_remains_bounded_raw_data() -> None:
 def test_rejects_v8_scan_with_specific_exception() -> None:
     with pytest.raises(
         ezdgn.UnsupportedDgnError,
-        match="V8/CFB candidate.*external converter",
+        match="V8/CFB candidate.*native V8 APIs",
     ):
         ezdgn.scan_records(V8)
 
@@ -145,7 +145,7 @@ def test_cli_inspect_json() -> None:
     assert payload["termination"] == "end_marker"
 
 
-def test_cli_identifies_v8_without_claiming_reader_support() -> None:
+def test_cli_reports_native_v8_model_summary() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "ezdgn", "inspect", str(V8), "--json"],
         check=True,
@@ -155,9 +155,15 @@ def test_cli_identifies_v8_without_claiming_reader_support() -> None:
     payload = json.loads(result.stdout)
     assert payload["path"] == str(V8)
     assert payload["format"] == "V8_CFB"
-    assert payload["dimension"] is None
-    assert payload["record_scan_supported"] is False
-    assert payload["v8_read_policy"] == "external_conversion_required"
+    assert payload["dimension"] == 3
+    assert payload["record_scan_supported"] is True
+    assert payload["v8_read_policy"] == "native"
+    assert payload["model_count"] == 1
+    assert payload["graphical_object_count"] == 58
+    assert payload["total_object_count"] == 83
+    assert payload["v8_models"][0]["name"] == "my_model"
+    assert payload["v8_models"][0]["element_count"] == 58
+    assert payload["v8_models"][0]["entity_count"] == 34
     assert payload["v8_container"] == {
         "cfb_version": 3,
         "has_dgn_v8_markers": True,

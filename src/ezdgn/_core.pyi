@@ -3,6 +3,18 @@ from typing import Final, TypeAlias
 DEFAULT_MAX_FILE_SIZE_BYTES: Final[int]
 DEFAULT_MAX_RECORDS: Final[int]
 MAX_V7_RECORD_SIZE_BYTES: Final[int]
+DEFAULT_MAX_CFB_ENTRIES: Final[int]
+DEFAULT_MAX_CFB_STREAM_SIZE_BYTES: Final[int]
+DEFAULT_MAX_CFB_TOTAL_STREAM_BYTES: Final[int]
+DEFAULT_MAX_V8_PAGES: Final[int]
+DEFAULT_MAX_V8_OBJECTS: Final[int]
+DEFAULT_MAX_V8_OBJECT_SIZE_BYTES: Final[int]
+DEFAULT_MAX_V8_INFLATED_STREAM_BYTES: Final[int]
+DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES: Final[int]
+DEFAULT_MAX_V8_MODELS: Final[int]
+DEFAULT_MAX_V8_STRING_BYTES: Final[int]
+DEFAULT_MAX_V8_VERTICES: Final[int]
+DEFAULT_MAX_V8_HIERARCHY_DEPTH: Final[int]
 
 class DgnError(Exception): ...
 class InvalidDgnError(DgnError): ...
@@ -201,12 +213,15 @@ V8ContainerRow: TypeAlias = tuple[
     list[str],
     list[V8CfbEntryRow],
 ]
-
-DEFAULT_MAX_CFB_ENTRIES: int
+V8LimitsRow: TypeAlias = list[int]
 
 def core_version() -> str: ...
 def detect_format_bytes(data: bytes) -> FormatRow: ...
 def inspect_v8_cfb(data: bytes, max_entries: int) -> V8ContainerRow: ...
+def scan_v8_object_records(
+    data: bytes, limits: V8LimitsRow
+) -> dict[str, object]: ...
+def read_v8_document(data: bytes, limits: V8LimitsRow) -> dict[str, object]: ...
 def scan_v7_records(
     data: bytes,
     max_file_size: int,

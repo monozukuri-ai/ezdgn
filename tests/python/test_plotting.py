@@ -17,6 +17,7 @@ import ezdgn  # noqa: E402
 DATA = Path(__file__).parents[1] / "data" / "dgn"
 SMALLTEST = DATA / "v7" / "smalltest.dgn"
 SEED_2D = DATA / "v7" / "seed_2d.dgn"
+V8 = DATA / "v8" / "test_dgnv8.dgn"
 
 
 def test_plot_renders_smalltest_without_flattening_entities() -> None:
@@ -136,6 +137,24 @@ def test_plot_validates_options() -> None:
         ezdgn.plot(drawing, curve_steps=7)
     with pytest.raises(ValueError, match="greater than zero"):
         ezdgn.save_plot(drawing, "unused.png", dpi=0)
+
+
+def test_plot_renders_native_v8_document() -> None:
+    document = ezdgn.read_v8(V8)
+
+    figure, axes = ezdgn.plot(document, show_text=True, curve_steps=32)
+
+    line_collections = [
+        item for item in axes.collections if isinstance(item, LineCollection)
+    ]
+    polygon_collections = [
+        item for item in axes.collections if isinstance(item, PolyCollection)
+    ]
+    assert sum(len(item.get_segments()) for item in line_collections) > 20
+    assert sum(len(item.get_paths()) for item in polygon_collections) >= 1
+    assert len(axes.patches) >= 1
+    assert axes.get_xlabel() == "x [m]"
+    plt.close(figure)
 
 
 def test_cli_plot_writes_png(tmp_path: Path) -> None:

@@ -29,11 +29,14 @@ from . import (
     Shape,
     Text,
     TextNode,
+    V8Document,
+    V8Element,
     __version__,
     detect_format,
     inspect_headers,
-    inspect_v8_container,
+    open_document,
     read,
+    read_v8,
 )
 from .metadata import CommonElementHeader, DesignSettings
 
@@ -66,7 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument(
         "--entities",
         action="store_true",
-        help="Include decoded V7 2D entities and hierarchy (implies --headers)",
+        help="Include decoded entities and hierarchy (implies --headers)",
     )
     inspect_parser.add_argument(
         "--json",
@@ -74,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable JSON",
     )
     plot_parser = commands.add_parser(
-        "plot", help="Render a parsed V7 2D drawing with Matplotlib"
+        "plot", help="Render a parsed V7 2D or V8 model with Matplotlib"
     )
     plot_parser.add_argument("path", type=Path)
     plot_parser.add_argument(
@@ -149,19 +152,13 @@ def _inspect(
         "dimension": format_info.dimension,
     }
     if not format_info.is_v7:
-        container = inspect_v8_container(path)
-        result["record_scan_supported"] = False
-        result["v8_read_policy"] = "external_conversion_required"
-        result["v8_container"] = {
-            "cfb_version": container.cfb_version,
-            "has_dgn_v8_markers": container.has_dgn_v8_markers,
-            "missing_markers": container.missing_markers,
-            "model_storage_paths": container.model_storage_paths,
-            "entry_count": len(container.entries),
-            "storage_count": container.storage_count,
-            "stream_count": container.stream_count,
-        }
-        return result
+        return _inspect_v8(
+            path,
+            result,
+            include_records=include_records,
+            include_headers=include_headers,
+            include_entities=include_entities,
+        )
 
     if include_entities:
         drawing = read(path)
@@ -218,6 +215,178 @@ def _inspect(
             records.append(record_payload)
         result["records"] = records
     return result
+
+
+def _inspect_v8(
+    path: Path,
+    result: dict[str, Any],
+    *,
+    include_records: bool,
+    include_headers: bool,
+    include_entities: bool,
+) -> dict[str, Any]:
+    document = read_v8(path)
+    container = document.raw.container
+    result.update(
+        {
+            "record_scan_supported": True,
+            "v8_read_policy": "native",
+            "v8_container": {
+                "cfb_version": container.cfb_version,
+                "has_dgn_v8_markers": container.has_dgn_v8_markers,
+                "missing_markers": container.missing_markers,
+                "model_storage_paths": container.model_storage_paths,
+                "entry_count": len(container.entries),
+                "storage_count": container.storage_count,
+                "stream_count": container.stream_count,
+            },
+            "model_count": len(document.models),
+            "graphical_object_count": document.raw.graphical_object_count,
+            "total_object_count": document.raw.total_object_count,
+            "total_inflated_bytes": document.raw.total_inflated_bytes,
+        }
+    )
+    dimensions = {model.metadata.dimension for model in document.models}
+    if len(dimensions) == 1:
+        result["dimension"] = dimensions.pop()
+
+    models = []
+    for model in document.models:
+        metadata = model.metadata
+        payload: dict[str, Any] = {
+            "index": metadata.index,
+            "storage_path": metadata.storage_path,
+            "name": metadata.name,
+            "description": metadata.description,
+            "dimension": metadata.dimension,
+            "model_id": metadata.model_id,
+            "index_model_id": metadata.index_model_id,
+            "uor_per_master": metadata.uor_per_master,
+            "master_unit": metadata.master_unit,
+            "sub_unit": metadata.sub_unit,
+            "global_origin_uor": metadata.global_origin_uor,
+            "extents_uor": metadata.extents_uor,
+            "extents_master": metadata.extents_master,
+            "element_count": len(model.elements),
+            "entity_count": len(model.entities),
+            "unknown_element_count": len(model.unknown_elements),
+        }
+        if include_records or include_headers or include_entities:
+            records = []
+            for element in model.elements:
+                raw = element.raw
+                record: dict[str, Any] = {
+                    "index": element.index,
+                    "raw_object_index": raw.index,
+                    "stream_path": raw.stream_path,
+                    "inflated_offset": raw.inflated_offset,
+                    "element_type": raw.element_type,
+                    "type_and_flags": raw.type_and_flags,
+                    "role": raw.role,
+                    "words": raw.words,
+                    "attribute_words": raw.attribute_words,
+                    "size_bytes": raw.size_bytes,
+                }
+                if include_headers or include_entities:
+                    record["common_header"] = _v8_common_payload(element)
+                if include_entities:
+                    record["entity"] = _v8_entity_payload(element)
+                    record["parent_index"] = element.parent_index
+                    record["child_indices"] = element.child_indices
+                    record["linkages"] = [
+                        {
+                            "offset": linkage.offset,
+                            "kind_code": linkage.kind_code,
+                            "property_id": linkage.property_id,
+                            "property_text": linkage.property_text,
+                            "complete": linkage.complete,
+                            "raw_hex": linkage.raw_bytes.hex(),
+                        }
+                        for linkage in element.linkages
+                    ]
+                    record["auxiliary_records"] = [
+                        {
+                            "index": auxiliary.index,
+                            "kind": auxiliary.kind,
+                            "flags": auxiliary.flags,
+                            "payload_hex": auxiliary.payload.hex(),
+                        }
+                        for auxiliary in element.auxiliary_records
+                    ]
+                records.append(record)
+            payload["records"] = records
+        models.append(payload)
+    result["v8_models"] = models
+    return result
+
+
+def _v8_common_payload(element: V8Element) -> dict[str, Any]:
+    common = element.common
+    return {
+        "level": common.level,
+        "element_id": common.element_id,
+        "model_id": common.model_id,
+        "graphic_group": common.graphic_group,
+        "properties": common.properties,
+        "geometry_flags": common.geometry_flags,
+        "line_style": common.line_style,
+        "line_weight": common.line_weight,
+        "color_index": common.color_index,
+        "stored_dimension": common.stored_dimension,
+        "dimension": common.dimension,
+        "range_uor": common.range_uor,
+        "range_master": common.range_master,
+        "attribute_offset": common.attribute_offset,
+        "attribute_length": common.attribute_length,
+    }
+
+
+def _v8_entity_payload(element: V8Element) -> dict[str, Any]:
+    data = element.data
+    payload: dict[str, Any] = {"kind": data.kind}
+    if data.vertices:
+        payload["vertices_uor"] = [point.uor for point in data.vertices]
+        payload["vertices_master"] = [point.master for point in data.vertices]
+    for name in ("origin", "center", "anchor"):
+        point = getattr(data, name)
+        if point is not None:
+            payload[f"{name}_uor"] = point.uor
+            payload[f"{name}_master"] = point.master
+    for name in (
+        "font_id",
+        "justification",
+        "width_uor",
+        "height_uor",
+        "width_master",
+        "height_master",
+        "rotation_radians",
+        "primary_axis_uor",
+        "secondary_axis_uor",
+        "primary_axis_master",
+        "secondary_axis_master",
+        "start_angle_radians",
+        "sweep_angle_radians",
+        "child_count",
+        "node_number",
+        "boundary_count",
+        "name",
+        "properties_raw",
+        "declared_poles",
+        "encoding",
+        "text",
+    ):
+        value = getattr(data, name)
+        if value is not None:
+            payload[name] = value
+    if data.orientation:
+        payload["orientation"] = data.orientation
+    if data.orientations:
+        payload["orientations"] = data.orientations
+    if data.transform:
+        payload["transform"] = data.transform
+    if data.text_bytes is not None:
+        payload["text_hex"] = data.text_bytes.hex()
+    return payload
 
 
 def _settings_payload(settings: DesignSettings) -> dict[str, Any]:
@@ -489,7 +658,30 @@ def _print_human(result: dict[str, Any]) -> None:
             f"{container['stream_count']} streams)"
         )
         print(f"model storages: {container['model_storage_paths']}")
-        print("V8 read policy: external conversion required")
+        print(
+            "V8 read policy: "
+            f"{result['v8_read_policy'].replace('_', ' ')}"
+        )
+        print(f"models: {result['model_count']}")
+        print(f"graphical objects: {result['graphical_object_count']}")
+        print(f"all scanned objects: {result['total_object_count']}")
+        print(f"inflated bytes: {result['total_inflated_bytes']}")
+        for model in result["v8_models"]:
+            print(
+                f"model {model['index']}: {model['name']!r} "
+                f"{model['dimension']}D, {model['element_count']} elements, "
+                f"{model['entity_count']} top-level entities"
+            )
+            for record in model.get("records", []):
+                entity = record.get("entity")
+                kind = "" if entity is None else f" entity={entity['kind']}"
+                print(
+                    "object "
+                    f"{record['index']}: type={record['element_type']} "
+                    f"role={record['role']} size={record['size_bytes']}"
+                    f"{kind}"
+                )
+        return
     if result["record_scan_supported"]:
         print(f"records: {result['record_count']}")
         print(f"termination: {result['termination']}")
@@ -554,7 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _plot_command(args: argparse.Namespace) -> int:
     from .plotting import _save_figure, _show, plot, save_plot
 
-    drawing = read(args.path)
+    drawing = open_document(args.path)
     options = {
         "coordinate_space": args.coordinate_space,
         "background": args.background,

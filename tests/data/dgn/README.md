@@ -18,7 +18,7 @@ GDAL distribution の一般 license は MIT style であり、取得時点の全
 | `v7/seed_2d.dgn` | `ogr/ogrsf_frmts/dgn/data/seed_2d.dgn` | 9,216 | `dd8465f18569d9289809e9e0962115d365d0a56de021393952a5e7a0a20b527c` | V7 2D empty seed |
 | `v7/seed_3d.dgn` | `ogr/ogrsf_frmts/dgn/data/seed_3d.dgn` | 2,048 | `97c2f00ee6ea96873b7d16e5e898b4850e3d35448299d7d9d37e7d1792b56896` | V7 3D 識別・座標分岐用 empty seed |
 | `malformed/knot_oob.dgn` | `autotest/ogr/data/dgn/knot_oob.dgn` | 1,578 | `bd09d118a595f5afba833c7c61dad83cf02b01f1b224836b8493a164de90da4e` | V7 type 26 B-spline knot の malformed input |
-| `v8/test_dgnv8.dgn` | `autotest/ogr/data/dgnv8/test_dgnv8.dgn` | 27,648 | `8f32f87ce4b16881aa64f5cb9f75c98851833f96fef37ca0ad31aa6bb18d1df0` | V8/CFB 識別と将来の V8 backend 用 |
+| `v8/test_dgnv8.dgn` | `autotest/ogr/data/dgnv8/test_dgnv8.dgn` | 27,648 | `8f32f87ce4b16881aa64f5cb9f75c98851833f96fef37ca0ad31aa6bb18d1df0` | native V8 raw/semantic reader の回帰試験 |
 | `v8/test_dgnv8_ref.csv` | `autotest/ogr/data/dgnv8/test_dgnv8_ref.csv` | 25,507 | `09f765e0aa8dc06bb1d0da4ed86f060dc0a839d480b3dc67e54841ecceec6433` | GDAL/ODA が出力した V8 sample の期待値 |
 | `LICENSE.GDAL.txt` | `LICENSE.TXT` | 21,841 | `1dae3468e81d00da56e2936f74d33b8b3ad09d726437f19ce209a5dabea41f77` | upstream license |
 
@@ -83,9 +83,12 @@ crash、out-of-bounds、無限loopがないことを回帰テストにする。
 - reference CSV は 34 features（2D 19、3D 15）を持つ
 - type は 2, 3, 4, 6, 11, 12, 14, 15, 16, 17, 22, 27, 35, 36 を含む
 - geometry は point、line string、polygon、multi-point、complex/curve geometry を含み、Unicode text `myTéxt` も含む
-- Phase 6 の native CFB inspector では CFB version 3、root を除く storage 9、stream 15、計24 entry、model storage `/Dgn-Md/#000000` と判定する
+- native CFB inspector では CFB version 3、root を除く storage 9、stream 15、計24 entry、model storage `/Dgn-Md/#000000` と判定する
+- native raw scanner は graphical object 58件、全object 83件、inflated payload 合計31,942 bytesを復元する
+- native semantic reader は model名 `my_model`、3D、10,000 UOR/master、master/sub unit `m`/`mm` を復元する
+- feature-oriented view はCSVと一致する34 entities（2D 19、3D 15）と同じtype集合を返し、text `myTéxt`、階層、linkage、未知objectのraw bytesを保持する
 
-ローカル GDAL build には ODA dependency がないため、V8 sample が V7 driver では開けないことも確認した。CSV は将来 licensed backend または外部変換の fidelity を検証するときの oracle であり、CFB inspector や V7 parser の期待値ではない。
+ローカル GDAL build には ODA dependency がないため、V8 sample が V7 driver では開けないことも確認した。CSV は native V8 reader の black-box semantic regression oracle であり、on-disk schema の情報源ではない。また、CFB inspector や V7 parser の期待値でもない。
 
 ## Integrity check
 

@@ -1,4 +1,4 @@
-"""Optional Matplotlib preview rendering for parsed V7 2D drawings.
+"""Optional Matplotlib preview rendering for parsed V7 and V8 drawings.
 
 The renderer deliberately lives outside the parser model.  Native curve and
 B-spline records therefore remain lossless even where this module draws their
@@ -23,7 +23,9 @@ from .entities import (
     LineString,
     Shape,
     Text,
+    _DEFAULT_V7_COLORS,
 )
+from .v8 import V8Document, V8Element, V8Model
 
 CoordinateSpace: TypeAlias = Literal["master", "uor"]
 Point2: TypeAlias = tuple[float, float]
@@ -45,7 +47,7 @@ _LINE_STYLES: dict[int, Any] = {
 
 
 def plot(
-    drawing: Drawing,
+    drawing: Drawing | V8Document,
     *,
     ax: Any | None = None,
     coordinate_space: CoordinateSpace = "master",
@@ -68,11 +70,15 @@ def plot(
     the preview and never mutates or flattens the source entities.
     """
 
-    if not isinstance(drawing, Drawing):
-        raise TypeError("plot() requires an ezdgn.Drawing")
+    if not isinstance(drawing, (Drawing, V8Document)):
+        raise TypeError("plot() requires an ezdgn.Drawing or ezdgn.V8Document")
     if coordinate_space not in ("master", "uor"):
         raise ValueError("coordinate_space must be 'master' or 'uor'")
-    if coordinate_space == "master" and drawing.design_settings.scale is None:
+    if (
+        isinstance(drawing, Drawing)
+        and coordinate_space == "master"
+        and drawing.design_settings.scale is None
+    ):
         raise ValueError(
             "master-unit coordinates are unavailable; use "
             "coordinate_space='uor'"
@@ -93,8 +99,9 @@ def plot(
     figure.patch.set_facecolor(background_rgba)
     ax.set_facecolor(background_rgba)
 
-    renderer = _Renderer(
-        drawing=drawing,
+    renderer_type = _Renderer if isinstance(drawing, Drawing) else _V8Renderer
+    renderer = renderer_type(
+        drawing=drawing,  # type: ignore[arg-type]
         ax=ax,
         coordinate_space=coordinate_space,
         monochrome=monochrome,
@@ -114,7 +121,7 @@ def plot(
 
 
 def save_plot(
-    drawing: Drawing,
+    drawing: Drawing | V8Document,
     output: str | Path,
     *,
     dpi: int = 150,
@@ -448,6 +455,166 @@ class _Renderer:
         return 0.75 + min(max(weight, 0), 31) * 0.12
 
 
+class _V8Renderer(_Renderer):
+    """XY preview adapter over the native V8 semantic model."""
+
+    def __init__(self, *, drawing: V8Document, **options: Any) -> None:
+        super().__init__(drawing=drawing, **options)  # type: ignore[arg-type]
+        self.drawing = drawing  # type: ignore[assignment]
+
+    def render(self) -> None:
+        for model in self.drawing.models:
+            for element in model.elements:
+                self._element(model, element)
+        self._flush_collections()
+
+    def _element(self, model: V8Model, element: V8Element) -> None:
+        data = element.data
+        style = self._style(element)
+        if data.kind in {
+            "LINE",
+            "LINE_STRING",
+            "CURVE",
+            "POINT_STRING",
+            "BSPLINE_POLE",
+        }:
+            if data.kind != "BSPLINE_POLE" or element.parent_index is None:
+                self._polyline(self._points(data.vertices), style)
+        elif data.kind == "SHAPE":
+            points = self._points(data.vertices)
+            if len(points) >= 3:
+                color = self._color(style.rgb)
+                self._polygon(
+                    points,
+                    style,
+                    edge_color=color,
+                    face_color=(0.0, 0.0, 0.0, 0.0),
+                )
+        elif data.kind == "ELLIPSE":
+            self._ellipse_v8(element, style)
+        elif data.kind == "ARC":
+            self._arc_v8(element, style)
+        elif data.kind == "TEXT" and self.show_text:
+            self._text_v8(element, style)
+        elif data.kind == "BSPLINE_CURVE":
+            points: list[Point2] = []
+            for child in model.descendants(element):
+                if child.kind == "BSPLINE_POLE":
+                    points.extend(self._points(child.data.vertices))
+            self._polyline(points, style)
+
+    def _points(self, points: tuple[Any, ...]) -> tuple[Point2, ...]:
+        return tuple(
+            (point.master if self.coordinate_space == "master" else point.uor)[:2]
+            for point in points
+        )
+
+    def _ellipse_v8(self, element: V8Element, style: BasicStyle) -> None:
+        data = element.data
+        if data.center is None:
+            return
+        center = (
+            data.center.master
+            if self.coordinate_space == "master"
+            else data.center.uor
+        )[:2]
+        if self.coordinate_space == "master":
+            primary = data.primary_axis_master
+            secondary = data.secondary_axis_master
+        else:
+            primary = data.primary_axis_uor
+            secondary = data.secondary_axis_uor
+        if primary is None or secondary is None:
+            return
+        points = _sample_ellipse(
+            center,
+            primary,
+            secondary,
+            data.rotation_degrees or 0.0,
+            0.0,
+            360.0,
+            self.curve_steps + 1,
+        )
+        self._polyline(points, style)
+
+    def _arc_v8(self, element: V8Element, style: BasicStyle) -> None:
+        data = element.data
+        if data.center is None:
+            return
+        center = (
+            data.center.master
+            if self.coordinate_space == "master"
+            else data.center.uor
+        )[:2]
+        if self.coordinate_space == "master":
+            primary = data.primary_axis_master
+            secondary = data.secondary_axis_master
+        else:
+            primary = data.primary_axis_uor
+            secondary = data.secondary_axis_uor
+        start = data.start_angle_degrees
+        sweep = data.sweep_angle_degrees
+        if primary is None or secondary is None or start is None or sweep is None:
+            return
+        point_count = max(2, math.ceil(abs(sweep) / 360 * self.curve_steps) + 1)
+        points = _sample_ellipse(
+            center,
+            primary,
+            secondary,
+            data.rotation_degrees or 0.0,
+            start,
+            sweep,
+            point_count,
+        )
+        self._polyline(points, style)
+
+    def _text_v8(self, element: V8Element, style: BasicStyle) -> None:
+        data = element.data
+        if data.origin is None or not data.text:
+            return
+        if self.coordinate_space == "master":
+            origin = data.origin.master[:2]
+            height = data.height_master
+            width = data.width_master
+        else:
+            origin = data.origin.uor[:2]
+            height = data.height_uor
+            width = data.width_uor
+        if height is None or height <= 0:
+            return
+        path = self._text_path_cache.get(data.text)
+        if path is None:
+            path = self.TextPath((0.0, 0.0), data.text, size=1.0)
+            self._text_path_cache[data.text] = path
+        if len(path.vertices) == 0:
+            return
+        bounds = path.get_extents()
+        reference_height = bounds.height if bounds.height > 0 else 1.0
+        y_scale = height / reference_height
+        x_scale = y_scale if width is None or width <= 0 else width / reference_height
+        transform = (
+            self.Affine2D()
+            .scale(x_scale, y_scale)
+            .rotate_deg(data.rotation_degrees or 0.0)
+            .translate(*origin)
+        )
+        color = self._color(style.rgb)
+        self._text_batches.setdefault(color, []).append(
+            transform.transform_path(path)
+        )
+
+    @staticmethod
+    def _style(element: V8Element) -> BasicStyle:
+        color_index = element.common.color_index
+        rgb = _DEFAULT_V7_COLORS[color_index] if color_index < 256 else None
+        return BasicStyle(
+            color_index=color_index,
+            line_style=element.common.line_style,
+            line_weight=element.common.line_weight,
+            rgb=rgb,
+        )
+
+
 def _sample_ellipse(
     center: Point2,
     primary_axis: float,
@@ -489,7 +656,7 @@ def _contrasting_color(background: tuple[float, float, float]) -> RgbFloat:
 def _style_axes(
     ax: Any,
     foreground: RgbFloat,
-    drawing: Drawing,
+    drawing: Drawing | V8Document,
     coordinate_space: CoordinateSpace,
     show_axes: bool,
 ) -> None:
@@ -497,7 +664,15 @@ def _style_axes(
         ax.set_axis_off()
         return
     if coordinate_space == "master":
-        unit = drawing.design_settings.master_unit_name
+        if isinstance(drawing, Drawing):
+            unit = drawing.design_settings.master_unit_name
+        else:
+            units = {
+                model.metadata.master_unit
+                for model in drawing.models
+                if model.metadata.master_unit
+            }
+            unit = units.pop() if len(units) == 1 else None
         suffix = f" [{unit}]" if unit else " [master units]"
     else:
         suffix = " [UOR]"

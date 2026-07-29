@@ -2,14 +2,17 @@
 
 use ezdgn_core::{
     decode_common_header, decode_design_settings, detect_format, inspect_v8_container, read_v7_2d,
-    scan_records, write_v7_2d, CommonElementHeader, DesignSettings, DgnError as CoreDgnError,
-    ElementData2D, LinkageData, MasterPoint, Point2, RawPoint, RecordScan, ScanOptions,
-    V7Document2D, V7ElementStyle, V7WriteOptions, WritableElement2D,
+    read_v8, scan_records, scan_v8_objects as core_scan_v8_objects, write_v7_2d,
+    CommonElementHeader, DesignSettings, DgnError as CoreDgnError, ElementData2D, LinkageData,
+    MasterPoint, Point2, RawPoint, RecordScan, ScanOptions, V7Document2D, V7ElementStyle,
+    V7WriteOptions, V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element,
+    V8ElementData, V8Linkage, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point, V8Range3,
+    V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions, WritableElement2D,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 create_exception!(
     _core,
@@ -206,6 +209,7 @@ type WriteEntityRow = (
 );
 type V8CfbEntryRow = (String, String, Option<u64>);
 type V8ContainerRow = (u16, bool, Vec<String>, Vec<String>, Vec<V8CfbEntryRow>);
+type V8LimitsRow = Vec<usize>;
 
 #[pyfunction]
 fn core_version() -> String {
@@ -234,6 +238,25 @@ fn inspect_v8_cfb(data: &[u8], max_entries: usize) -> PyResult<V8ContainerRow> {
         info.model_storage_paths,
         entries,
     ))
+}
+
+/// Return the lossless bounded V8 page/object scan as a Python-native mapping.
+#[pyfunction]
+fn scan_v8_object_records(
+    py: Python<'_>,
+    data: &[u8],
+    limits: V8LimitsRow,
+) -> PyResult<Py<PyDict>> {
+    let document =
+        core_scan_v8_objects(data, v8_scan_options(&limits)?).map_err(core_error_to_python)?;
+    Ok(v8_raw_document_dict(py, &document)?.unbind())
+}
+
+/// Return the native semantic V8 model while retaining the complete raw scan.
+#[pyfunction]
+fn read_v8_document(py: Python<'_>, data: &[u8], limits: V8LimitsRow) -> PyResult<Py<PyDict>> {
+    let document = read_v8(data, v8_scan_options(&limits)?).map_err(core_error_to_python)?;
+    Ok(v8_document_dict(py, &document)?.unbind())
 }
 
 #[pyfunction]
@@ -446,6 +469,505 @@ fn require_writer_row(kind: &str, condition: bool, context: &str) -> PyResult<()
             "invalid {kind} writer row: {context}"
         )))
     }
+}
+
+fn v8_scan_options(limits: &[usize]) -> PyResult<V8ScanOptions> {
+    let [max_file_size, max_cfb_entries, max_stream_size, max_total_stream_bytes, max_pages, max_objects, max_object_size, max_inflated_stream_size, max_total_inflated_bytes, max_models, max_string_bytes, max_vertices, max_hierarchy_depth] =
+        limits
+    else {
+        return Err(InvalidDgnError::new_err(format!(
+            "V8 limits row requires 13 values, got {}",
+            limits.len()
+        )));
+    };
+    Ok(V8ScanOptions {
+        read: V8ReadOptions {
+            max_file_size: *max_file_size,
+            max_cfb_entries: *max_cfb_entries,
+            max_stream_size: *max_stream_size,
+            max_total_stream_bytes: *max_total_stream_bytes,
+        },
+        max_pages: *max_pages,
+        max_objects: *max_objects,
+        max_object_size: *max_object_size,
+        max_inflated_stream_size: *max_inflated_stream_size,
+        max_total_inflated_bytes: *max_total_inflated_bytes,
+        max_models: *max_models,
+        max_string_bytes: *max_string_bytes,
+        max_vertices: *max_vertices,
+        max_hierarchy_depth: *max_hierarchy_depth,
+    })
+}
+
+fn v8_document_dict<'py>(py: Python<'py>, document: &V8Document) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("raw", v8_raw_document_dict(py, &document.raw)?)?;
+    let models = PyList::empty(py);
+    for model in &document.models {
+        let value = PyDict::new(py);
+        value.set_item("metadata", v8_model_metadata_dict(py, &model.metadata)?)?;
+        let elements = PyList::empty(py);
+        for element in &model.elements {
+            elements.append(v8_element_dict(py, element)?)?;
+        }
+        value.set_item("elements", elements)?;
+        models.append(value)?;
+    }
+    result.set_item("models", models)?;
+    Ok(result)
+}
+
+fn v8_raw_document_dict<'py>(
+    py: Python<'py>,
+    document: &V8RawDocument,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("container", v8_container_dict(py, &document.container)?)?;
+    result.set_item("total_inflated_bytes", document.total_inflated_bytes)?;
+    result.set_item("graphical_object_count", document.graphical_object_count())?;
+    result.set_item("total_object_count", document.total_object_count())?;
+
+    let models = PyList::empty(py);
+    for model in &document.models {
+        let value = PyDict::new(py);
+        value.set_item("index", v8_model_index_dict(py, &model.index)?)?;
+        value.set_item("storage_path", &model.storage_path)?;
+        value.set_item("model_header_stream_path", &model.model_header_stream.path)?;
+        value.set_item(
+            "model_header_stream_bytes",
+            PyBytes::new(py, model.model_header_stream.as_bytes()),
+        )?;
+        value.set_item(
+            "model_header_bytes",
+            PyBytes::new(py, model.model_header_bytes.as_ref()),
+        )?;
+        value.set_item(
+            "graphical_pages",
+            v8_object_pages_list(py, &model.graphical_pages)?,
+        )?;
+        value.set_item(
+            "graphical_auxiliary_pages",
+            v8_auxiliary_pages_list(py, &model.graphical_auxiliary_pages)?,
+        )?;
+        value.set_item(
+            "control_pages",
+            v8_object_pages_list(py, &model.control_pages)?,
+        )?;
+        value.set_item(
+            "control_auxiliary_pages",
+            v8_auxiliary_pages_list(py, &model.control_auxiliary_pages)?,
+        )?;
+        models.append(value)?;
+    }
+    result.set_item("models", models)?;
+    result.set_item(
+        "named_pages",
+        v8_object_pages_list(py, &document.named_pages)?,
+    )?;
+    result.set_item(
+        "named_auxiliary_pages",
+        v8_auxiliary_pages_list(py, &document.named_auxiliary_pages)?,
+    )?;
+    Ok(result)
+}
+
+fn v8_container_dict<'py>(
+    py: Python<'py>,
+    container: &ezdgn_core::V8ContainerInfo,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("cfb_version", container.cfb_version)?;
+    result.set_item("has_dgn_v8_markers", container.has_dgn_v8_markers)?;
+    result.set_item("missing_markers", &container.missing_markers)?;
+    result.set_item("model_storage_paths", &container.model_storage_paths)?;
+    let entries = PyList::empty(py);
+    for entry in &container.entries {
+        entries.append((&entry.path, entry.kind.as_str(), entry.size_bytes))?;
+    }
+    result.set_item("entries", entries)?;
+    Ok(result)
+}
+
+fn v8_model_index_dict<'py>(
+    py: Python<'py>,
+    entry: &ezdgn_core::V8ModelIndexEntry,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("index", entry.index)?;
+    result.set_item("raw_number", entry.raw_number)?;
+    result.set_item("storage_index", entry.storage_index)?;
+    result.set_item("model_number", entry.model_number)?;
+    result.set_item("flags", entry.flags)?;
+    result.set_item("model_id", entry.model_id)?;
+    result.set_item("name", &entry.name)?;
+    result.set_item("description", &entry.description)?;
+    result.set_item("raw_bytes", PyBytes::new(py, entry.raw_bytes.as_ref()))?;
+    Ok(result)
+}
+
+fn v8_page_header_dict<'py>(
+    py: Python<'py>,
+    header: ezdgn_core::V8PageHeader,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("record_count", header.record_count)?;
+    result.set_item("format_version", header.format_version)?;
+    result.set_item("page_number", header.page_number)?;
+    result.set_item("population", header.population)?;
+    Ok(result)
+}
+
+fn v8_object_pages_list<'py>(
+    py: Python<'py>,
+    pages: &[V8ObjectPage],
+) -> PyResult<Bound<'py, PyList>> {
+    let result = PyList::empty(py);
+    for page in pages {
+        let value = PyDict::new(py);
+        value.set_item("stream_path", &page.stream_path)?;
+        value.set_item("family", page.family.as_str())?;
+        value.set_item("header", v8_page_header_dict(py, page.header)?)?;
+        value.set_item("inflated_size", page.inflated_size)?;
+        let objects = PyList::empty(py);
+        for object in &page.objects {
+            objects.append(v8_raw_object_dict(py, object)?)?;
+        }
+        value.set_item("objects", objects)?;
+        result.append(value)?;
+    }
+    Ok(result)
+}
+
+fn v8_raw_object_dict<'py>(py: Python<'py>, object: &V8RawObject) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("index", object.index)?;
+    result.set_item("page_index", object.page_index)?;
+    result.set_item("family", object.family.as_str())?;
+    result.set_item("stream_path", &object.stream_path)?;
+    result.set_item("inflated_offset", object.inflated_offset)?;
+    result.set_item("framing_prefix", object.framing_prefix)?;
+    result.set_item("type_and_flags", object.type_and_flags)?;
+    result.set_item("element_type", object.element_type)?;
+    result.set_item("role", v8_role_name(object.role))?;
+    result.set_item("words", object.words)?;
+    result.set_item("attribute_words", object.attribute_words)?;
+    result.set_item("level", object.level)?;
+    result.set_item("element_id", object.element_id)?;
+    result.set_item("model_id", object.model_id)?;
+    result.set_item("raw_bytes", PyBytes::new(py, object.as_bytes()))?;
+    Ok(result)
+}
+
+const fn v8_role_name(role: V8ObjectRole) -> &'static str {
+    match role {
+        V8ObjectRole::Standalone => "standalone",
+        V8ObjectRole::Header => "header",
+        V8ObjectRole::Component => "component",
+        V8ObjectRole::HeaderComponent => "header_component",
+    }
+}
+
+fn v8_auxiliary_pages_list<'py>(
+    py: Python<'py>,
+    pages: &[V8AuxiliaryPage],
+) -> PyResult<Bound<'py, PyList>> {
+    let result = PyList::empty(py);
+    for page in pages {
+        let value = PyDict::new(py);
+        value.set_item("stream_path", &page.stream_path)?;
+        value.set_item("header", v8_page_header_dict(py, page.header)?)?;
+        value.set_item("inflated_size", page.inflated_size)?;
+        let records = PyList::empty(py);
+        for record in &page.records {
+            records.append(v8_auxiliary_record_dict(py, record)?)?;
+        }
+        value.set_item("records", records)?;
+        result.append(value)?;
+    }
+    Ok(result)
+}
+
+fn v8_auxiliary_record_dict<'py>(
+    py: Python<'py>,
+    record: &V8AuxiliaryRecord,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("index", record.index)?;
+    result.set_item("stream_path", &record.stream_path)?;
+    result.set_item("inflated_offset", record.inflated_offset)?;
+    result.set_item("magic", record.magic)?;
+    result.set_item("kind", record.kind)?;
+    result.set_item("reserved", record.reserved)?;
+    result.set_item("element_id", record.element_id)?;
+    result.set_item("flags", record.flags)?;
+    result.set_item("raw_bytes", PyBytes::new(py, record.as_bytes()))?;
+    result.set_item("payload", PyBytes::new(py, record.payload()))?;
+    Ok(result)
+}
+
+fn v8_model_metadata_dict<'py>(
+    py: Python<'py>,
+    metadata: &V8ModelMetadata,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("index", metadata.index)?;
+    result.set_item("storage_path", &metadata.storage_path)?;
+    result.set_item("storage_index", metadata.storage_index)?;
+    result.set_item("model_number", metadata.model_number)?;
+    result.set_item("model_id", metadata.model_id)?;
+    result.set_item("index_model_id", metadata.index_model_id)?;
+    result.set_item("name", &metadata.name)?;
+    result.set_item("description", &metadata.description)?;
+    result.set_item("dimension", metadata.dimension.value())?;
+    result.set_item("type_and_flags", metadata.type_and_flags)?;
+    result.set_item("model_flags", metadata.model_flags)?;
+    result.set_item("uor_per_master", metadata.uor_per_master)?;
+    result.set_item("scale", metadata.scale)?;
+    result.set_item(
+        "global_origin_uor",
+        v8_point3_row(metadata.global_origin_uor),
+    )?;
+    result.set_item("extents_uor", v8_range_i64_row(metadata.extents_uor))?;
+    result.set_item("extents_master", v8_range_row(metadata.extents_master))?;
+    result.set_item("master_unit", &metadata.master_unit)?;
+    result.set_item("sub_unit", &metadata.sub_unit)?;
+    result.set_item("linkages", v8_linkages_list(py, &metadata.linkages)?)?;
+    result.set_item("raw_header", PyBytes::new(py, metadata.raw_header.as_ref()))?;
+    Ok(result)
+}
+
+fn v8_element_dict<'py>(py: Python<'py>, element: &V8Element) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("index", element.index)?;
+    result.set_item("raw_object_index", element.raw.index)?;
+    result.set_item("common", v8_common_header_dict(py, &element.common)?)?;
+    result.set_item("data", v8_element_data_dict(py, &element.data)?)?;
+    result.set_item("parent_index", element.parent_index)?;
+    result.set_item("child_indices", &element.child_indices)?;
+    result.set_item("linkages", v8_linkages_list(py, &element.linkages)?)?;
+    result.set_item(
+        "auxiliary_indices",
+        element
+            .auxiliary_records
+            .iter()
+            .map(|record| record.index)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(result)
+}
+
+fn v8_common_header_dict<'py>(
+    py: Python<'py>,
+    common: &V8CommonHeader,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("level", common.level)?;
+    result.set_item("element_id", common.element_id)?;
+    result.set_item("model_id", common.model_id)?;
+    result.set_item("graphic_group", common.graphic_group)?;
+    result.set_item("properties", common.properties)?;
+    result.set_item("geometry_flags", common.geometry_flags)?;
+    result.set_item("line_style", common.line_style)?;
+    result.set_item("line_weight", common.line_weight)?;
+    result.set_item("color_index", common.color_index)?;
+    result.set_item("stored_dimension", common.stored_dimension.value())?;
+    result.set_item("dimension", common.dimension.value())?;
+    result.set_item("range_uor", v8_range_i64_row(common.range_uor))?;
+    result.set_item("range_master", v8_range_row(common.range_master))?;
+    result.set_item("attribute_offset", common.attribute_offset)?;
+    result.set_item("attribute_length", common.attribute_length)?;
+    Ok(result)
+}
+
+fn v8_element_data_dict<'py>(
+    py: Python<'py>,
+    data: &V8ElementData,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("kind", data.kind_name())?;
+    match data {
+        V8ElementData::Line { start, end } => {
+            result.set_item("vertices", [v8_point_row(*start), v8_point_row(*end)])?;
+        }
+        V8ElementData::LineString { vertices }
+        | V8ElementData::Shape { vertices }
+        | V8ElementData::Curve { vertices }
+        | V8ElementData::BSplinePole { vertices } => {
+            result.set_item("vertices", v8_point_rows(vertices))?;
+        }
+        V8ElementData::PointString {
+            vertices,
+            orientations,
+        } => {
+            result.set_item("vertices", v8_point_rows(vertices))?;
+            result.set_item(
+                "orientations",
+                orientations
+                    .iter()
+                    .map(|orientation| orientation.values)
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        V8ElementData::Text {
+            font_id,
+            justification,
+            width_uor,
+            height_uor,
+            width_master,
+            height_master,
+            rotation_radians,
+            orientation,
+            origin,
+            editable_fields,
+            encoding,
+            text_bytes,
+            text,
+        } => {
+            result.set_item("font_id", *font_id)?;
+            result.set_item("justification", *justification)?;
+            result.set_item("width_uor", *width_uor)?;
+            result.set_item("height_uor", *height_uor)?;
+            result.set_item("width_master", *width_master)?;
+            result.set_item("height_master", *height_master)?;
+            result.set_item("rotation_radians", *rotation_radians)?;
+            result.set_item("orientation", orientation)?;
+            result.set_item("origin", v8_point_row(*origin))?;
+            result.set_item("editable_fields", *editable_fields)?;
+            result.set_item("encoding", encoding.as_str())?;
+            result.set_item("text_bytes", PyBytes::new(py, text_bytes.as_ref()))?;
+            result.set_item("text", text)?;
+        }
+        V8ElementData::Ellipse {
+            primary_axis_uor,
+            secondary_axis_uor,
+            primary_axis_master,
+            secondary_axis_master,
+            rotation_radians,
+            orientation,
+            center,
+        } => {
+            result.set_item("primary_axis_uor", *primary_axis_uor)?;
+            result.set_item("secondary_axis_uor", *secondary_axis_uor)?;
+            result.set_item("primary_axis_master", *primary_axis_master)?;
+            result.set_item("secondary_axis_master", *secondary_axis_master)?;
+            result.set_item("rotation_radians", *rotation_radians)?;
+            result.set_item("orientation", orientation)?;
+            result.set_item("center", v8_point_row(*center))?;
+        }
+        V8ElementData::Arc {
+            start_angle_radians,
+            sweep_angle_radians,
+            primary_axis_uor,
+            secondary_axis_uor,
+            primary_axis_master,
+            secondary_axis_master,
+            rotation_radians,
+            orientation,
+            center,
+        } => {
+            result.set_item("start_angle_radians", *start_angle_radians)?;
+            result.set_item("sweep_angle_radians", *sweep_angle_radians)?;
+            result.set_item("primary_axis_uor", *primary_axis_uor)?;
+            result.set_item("secondary_axis_uor", *secondary_axis_uor)?;
+            result.set_item("primary_axis_master", *primary_axis_master)?;
+            result.set_item("secondary_axis_master", *secondary_axis_master)?;
+            result.set_item("rotation_radians", *rotation_radians)?;
+            result.set_item("orientation", orientation)?;
+            result.set_item("center", v8_point_row(*center))?;
+        }
+        V8ElementData::TextNode {
+            child_count,
+            node_number,
+            origin,
+        } => {
+            result.set_item("child_count", *child_count)?;
+            result.set_item("node_number", *node_number)?;
+            result.set_item("origin", v8_point_row(*origin))?;
+        }
+        V8ElementData::ComplexChain { child_count }
+        | V8ElementData::ComplexShape { child_count }
+        | V8ElementData::UnknownComplex { child_count } => {
+            result.set_item("child_count", *child_count)?;
+        }
+        V8ElementData::Cell {
+            child_count,
+            boundary_count,
+            origin,
+            transform,
+        } => {
+            result.set_item("child_count", *child_count)?;
+            result.set_item("boundary_count", *boundary_count)?;
+            result.set_item("origin", v8_point_row(*origin))?;
+            result.set_item("transform", transform)?;
+        }
+        V8ElementData::SharedCellInstance {
+            name,
+            origin,
+            transform,
+        } => {
+            result.set_item("name", name)?;
+            result.set_item("origin", v8_point_row(*origin))?;
+            result.set_item("transform", transform)?;
+        }
+        V8ElementData::BSplineCurve {
+            child_count,
+            properties_raw,
+            declared_poles,
+        } => {
+            result.set_item("child_count", *child_count)?;
+            result.set_item("properties_raw", *properties_raw)?;
+            result.set_item("declared_poles", *declared_poles)?;
+        }
+        V8ElementData::Dimension { anchor } => match anchor {
+            Some(point) => result.set_item("anchor", v8_point_row(*point))?,
+            None => result.set_item("anchor", py.None())?,
+        },
+        V8ElementData::Unknown => {}
+    }
+    Ok(result)
+}
+
+fn v8_linkages_list<'py>(py: Python<'py>, linkages: &[V8Linkage]) -> PyResult<Bound<'py, PyList>> {
+    let result = PyList::empty(py);
+    for linkage in linkages {
+        let value = PyDict::new(py);
+        value.set_item("offset", linkage.offset)?;
+        value.set_item("words_to_follow", linkage.words_to_follow)?;
+        value.set_item("kind_code", linkage.kind_code)?;
+        value.set_item("property_id", linkage.property_id)?;
+        match &linkage.property_bytes {
+            Some(bytes) => value.set_item("property_bytes", PyBytes::new(py, bytes.as_ref()))?,
+            None => value.set_item("property_bytes", py.None())?,
+        }
+        value.set_item("property_text", &linkage.property_text)?;
+        value.set_item("complete", linkage.complete)?;
+        value.set_item("raw_bytes", PyBytes::new(py, linkage.raw_bytes.as_ref()))?;
+        result.append(value)?;
+    }
+    Ok(result)
+}
+
+type V8Point3Row = (f64, f64, f64);
+type V8PointRow = (V8Point3Row, V8Point3Row);
+
+fn v8_point3_row(point: ezdgn_core::V8Point3) -> V8Point3Row {
+    (point.x, point.y, point.z)
+}
+
+fn v8_point_row(point: V8Point) -> V8PointRow {
+    (v8_point3_row(point.uor), v8_point3_row(point.master))
+}
+
+fn v8_point_rows(points: &[V8Point]) -> Vec<V8PointRow> {
+    points.iter().copied().map(v8_point_row).collect()
+}
+
+fn v8_range_i64_row(range: V8Range3I64) -> ([i64; 3], [i64; 3]) {
+    (range.low, range.high)
+}
+
+fn v8_range_row(range: V8Range3) -> (V8Point3Row, V8Point3Row) {
+    (v8_point3_row(range.low), v8_point3_row(range.high))
 }
 
 fn scan_with_options(
@@ -936,6 +1458,41 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "DEFAULT_MAX_CFB_ENTRIES",
         ezdgn_core::DEFAULT_MAX_CFB_ENTRIES,
     )?;
+    module.add(
+        "DEFAULT_MAX_CFB_STREAM_SIZE_BYTES",
+        ezdgn_core::DEFAULT_MAX_CFB_STREAM_SIZE_BYTES,
+    )?;
+    module.add(
+        "DEFAULT_MAX_CFB_TOTAL_STREAM_BYTES",
+        ezdgn_core::DEFAULT_MAX_CFB_TOTAL_STREAM_BYTES,
+    )?;
+    module.add("DEFAULT_MAX_V8_PAGES", ezdgn_core::DEFAULT_MAX_V8_PAGES)?;
+    module.add("DEFAULT_MAX_V8_OBJECTS", ezdgn_core::DEFAULT_MAX_V8_OBJECTS)?;
+    module.add(
+        "DEFAULT_MAX_V8_OBJECT_SIZE_BYTES",
+        ezdgn_core::DEFAULT_MAX_V8_OBJECT_SIZE_BYTES,
+    )?;
+    module.add(
+        "DEFAULT_MAX_V8_INFLATED_STREAM_BYTES",
+        ezdgn_core::DEFAULT_MAX_V8_INFLATED_STREAM_BYTES,
+    )?;
+    module.add(
+        "DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES",
+        ezdgn_core::DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES,
+    )?;
+    module.add("DEFAULT_MAX_V8_MODELS", ezdgn_core::DEFAULT_MAX_V8_MODELS)?;
+    module.add(
+        "DEFAULT_MAX_V8_STRING_BYTES",
+        ezdgn_core::DEFAULT_MAX_V8_STRING_BYTES,
+    )?;
+    module.add(
+        "DEFAULT_MAX_V8_VERTICES",
+        ezdgn_core::DEFAULT_MAX_V8_VERTICES,
+    )?;
+    module.add(
+        "DEFAULT_MAX_V8_HIERARCHY_DEPTH",
+        ezdgn_core::DEFAULT_MAX_V8_HIERARCHY_DEPTH,
+    )?;
     module.add("DgnError", py.get_type::<DgnError>())?;
     module.add("InvalidDgnError", py.get_type::<InvalidDgnError>())?;
     module.add("UnsupportedDgnError", py.get_type::<UnsupportedDgnError>())?;
@@ -943,6 +1500,8 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(core_version, module)?)?;
     module.add_function(wrap_pyfunction!(detect_format_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_v8_cfb, module)?)?;
+    module.add_function(wrap_pyfunction!(scan_v8_object_records, module)?)?;
+    module.add_function(wrap_pyfunction!(read_v8_document, module)?)?;
     module.add_function(wrap_pyfunction!(scan_v7_records, module)?)?;
     module.add_function(wrap_pyfunction!(read_v7_design_settings, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_v7_headers, module)?)?;

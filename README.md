@@ -1,7 +1,8 @@
 # ezdgn
 
-`ezdgn` is a native V7 DGN reader and writer for Python,
-implemented with a pure Rust core and PyO3 bindings.
+`ezdgn` is a native, read-only V8 and read/write V7 DGN toolkit for Python,
+implemented with an independently written Rust core and PyO3 bindings. It has
+no ODA SDK, binary, or runtime dependency.
 
 ## Installation
 
@@ -27,7 +28,8 @@ stable ABI (`abi3`) with a Python 3.10 minimum.
 | V7/ISFF 2D read | Native entities, hierarchy, metadata, linkages, and raw records |
 | V7/ISFF 2D write | Standalone or custom-seed creation of common primitives |
 | V7/ISFF 3D | Signature, raw record, and common-header inspection only |
-| V8 DGN | CFB container identification and directory inspection only |
+| V8 DGN read | Native 2D/3D models, common geometry, hierarchy, linkages, auxiliary data, and lossless raw objects |
+| V8 DGN write/edit | Not supported |
 
 The V7 reader decodes line, line string, shape, curve, ellipse, arc, text,
 cell, text node, complex chain/shape, and B-spline records as native entities.
@@ -44,11 +46,18 @@ line, line string, shape, curve, ellipse, arc, circle-as-ellipse, and raw-byte
 text entities with basic symbology and shape fill linkage. Coordinates outside
 the selected seed's design plane are rejected instead of silently clipped.
 
-V8 entity semantics and V7 3D geometry are not supported. The writer does not
-yet create cells, complex elements, B-splines, arbitrary linkages, or perform
-in-place editing. The raw V7 record framing is shared by 2D and 3D files, so
-`scan_records()` can inspect a 3D stream safely without implying 3D entity
-support.
+The native V8 reader decodes model metadata, line, line string, shape, curve,
+point string, text, ellipse, arc, text node, complex chain/shape, cell,
+shared-cell instance, B-spline curve/poles, and a bounded dimension anchor.
+Unknown graphical, control, name-table, linkage, and auxiliary records remain
+addressable with exact bytes. Product-specific custom-object semantics, full
+dimension annotation semantics, V8 writing/editing, and 3D screen projection
+for plotting remain outside the supported scope.
+
+V7 3D geometry is not supported. The V7 writer does not yet create cells,
+complex elements, B-splines, arbitrary linkages, or perform in-place editing.
+The raw V7 record framing is shared by 2D and 3D files, so `scan_records()` can
+inspect a 3D stream safely without implying V7 3D entity support.
 
 ## 2D entity API
 
@@ -117,10 +126,78 @@ The high-level `read()`/`readfile()` API deliberately rejects V7 3D files.
 `scan_records()` and `inspect_headers()` still support bounded inspection of
 their shared record framing and metadata.
 
+## Native V8 API
+
+Use `open_document()` when a caller may receive either format. The existing
+`read()` and `readfile()` names remain V7-specific for compatibility.
+
+```python
+import ezdgn
+
+document = ezdgn.open_document("drawing.dgn")
+if isinstance(document, ezdgn.V8Document):
+    for model in document.models:
+        print(
+            model.metadata.name,
+            model.metadata.dimension,
+            model.metadata.master_unit,
+        )
+        for entity in model.entities:
+            print(entity.dxftype(), entity.level, entity.common.color_index)
+
+        for text in model.query("TEXT"):
+            print(text.data.text, text.data.text_bytes)
+
+        for cell in model.query("CELL"):
+            for component in model.children(cell):
+                print("  ", component.dxftype())
+```
+
+`V8Model.elements` is the complete graphical-object sequence.
+`V8Model.entities` is the feature-oriented view: complex/cell headers remain
+native aggregate entities, while TextNode headers yield their text children.
+`parent()`, `children()`, and `descendants()` navigate the original hierarchy.
+2D and 3D coordinates coexist as `(x, y, z)` tuples; no Z coordinate is dropped.
+For complex headers, `common.stored_dimension` retains the header bit and
+`common.dimension` reports the effective dimension inherited from children.
+
+The raw scanner is available independently of semantic decoding:
+
+```python
+raw = ezdgn.scan_v8_objects("drawing.dgn")
+for model in raw.models:
+    for obj in model.graphical_objects:
+        print(
+            obj.stream_path,
+            obj.inflated_offset,
+            obj.element_type,
+            obj.role,
+            obj.raw_bytes,
+        )
+```
+
+Every extraction and decode stage is bounded. Override the defaults as one
+immutable policy object when processing untrusted files:
+
+```python
+limits = ezdgn.V8ScanLimits(
+    max_file_size=256 * 1024 * 1024,
+    max_objects=250_000,
+    max_total_inflated_bytes=512 * 1024 * 1024,
+)
+document = ezdgn.read_v8("drawing-v8.dgn", limits=limits)
+```
+
+Malformed structure raises `InvalidDgnError`; configured resource ceilings
+raise `DgnLimitError`. The complete clean-room boundary, evidence ledger, and
+known limitations are recorded in [docs/v8/SCOPE.md](docs/v8/SCOPE.md),
+[docs/v8/FORMAT_NOTES.md](docs/v8/FORMAT_NOTES.md), and
+[docs/v8/PROVENANCE.md](docs/v8/PROVENANCE.md).
+
 ## Plotting parsed drawings
 
-The optional renderer can display a parsed V7 2D drawing or save it as an
-image without changing the native entity model:
+The optional renderer can display a parsed V7 2D drawing or a V8 document and
+save it as an image without changing the native entity model:
 
 ```python
 import ezdgn
@@ -136,6 +213,10 @@ figure.savefig("preview.png", dpi=150, bbox_inches="tight")
 
 # Or render and save in one call.
 ezdgn.save_plot(drawing, "preview.png", text_encoding="cp932")
+
+# V8 uses already decoded native text and preserves Z in the object model;
+# the preview is an explicit XY projection.
+ezdgn.save_plot(ezdgn.read_v8("drawing-v8.dgn"), "preview-v8.png")
 ```
 
 The equivalent CLI command is:
@@ -151,11 +232,13 @@ high-contrast preview, `--hide-text` to suppress text, or
 
 Lines, line strings, shapes, ellipses, arcs, text, and drawable components of
 cells and complex elements are rendered. Ellipses and arcs are sampled only
-for display. Native type-11 curves and B-spline curves are previewed from
-their parsed control sequences; the source records and entity parameters are
-never flattened or modified. V7 text does not store its code page, so the
-caller must select the correct encoding for non-ASCII text. Geometry and text
-with compatible display styles are batched to keep large previews practical.
+for display. Native type-11 curves and B-spline curves are previewed from their
+parsed control sequences; the source records and entity parameters are never
+flattened or modified. V8 3D geometry uses an XY preview projection, and
+orientation matrices are retained but not applied by the 2D renderer. V7 text
+does not store its code page, so the caller must select the correct encoding
+for non-ASCII text. Geometry and text with compatible display styles are
+batched to keep large previews practical.
 
 ## V7 writer and optional custom seeds
 
@@ -216,8 +299,8 @@ The `V8_CFB` result means that the input has the generic CFB signature used by
 V8 DGN files. It is intentionally described as a candidate because the outer
 signature alone does not prove that DGN-specific streams are present.
 
-The bounded container inspector verifies the known DGN root markers without
-decoding proprietary V8 stream contents:
+The bounded container inspector is the structural-only entry point. It verifies
+the known DGN root markers without decoding DGN stream contents:
 
 ```python
 container = ezdgn.inspect_v8_container("drawing-v8.dgn")
@@ -227,11 +310,12 @@ for entry in container.entries:
     print(entry.path, entry.kind, entry.size_bytes)
 ```
 
-This is structural identification, not V8 entity support or a fidelity
-guarantee. `ezdgn.read()`, `readfile()`, and `scan_records()` reject V8 input
-instead of silently flattening or converting it. If a workflow converts V8 to
-V7 outside `ezdgn`, validate the resulting geometry, text, levels, styles, and
-complex/cell relationships before treating it as equivalent to the source.
+`inspect_v8_container()` alone is structural identification, not an entity or
+fidelity claim. Use `scan_v8_objects()` for bounded, exact raw objects and
+`read_v8()` or `open_document()` for native semantic decoding. The legacy
+`read()`, `readfile()`, and `scan_records()` contracts remain V7-specific and
+therefore reject V8 input. No V8 path silently converts to V7 or flattens native
+objects.
 
 ## Design settings and common headers
 
@@ -279,8 +363,17 @@ python -m pip install "maturin>=1.13,<2" "pytest>=8" "matplotlib>=3.8"
 maturin develop
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo test --workspace --all-features
 python -m pytest
+sha256sum -c tests/data/dgn/SHA256SUMS
+uv lock --check
+```
+
+Run the bounded V8 fuzz target and parser microbenchmark separately:
+
+```bash
+cargo +nightly fuzz run v8_read -- -max_len=16777216
+EZDGN_BENCH_ITERATIONS=100 cargo bench -p ezdgn-core --bench v8_read
 ```
 
 Build a distributable wheel with:

@@ -10,7 +10,7 @@ version = "0.1.2"
 edition = "2021"
 rust-version = "1.83"
 authors = ["neka-nat <nekanat.stock@gmail.com>"]
-description = "Native V7 DGN reader/writer core and Python bindings"
+description = "Native V8 DGN reader and V7 DGN reader/writer core and Python bindings"
 repository = "https://github.com/monozukuri-ai/ezdgn"
 license = "MIT"
 

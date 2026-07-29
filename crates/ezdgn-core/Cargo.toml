@@ -7,14 +7,22 @@ authors.workspace = true
 description.workspace = true
 repository.workspace = true
 license.workspace = true
-exclude = ["tests/**"]
+exclude = ["tests/**", "benches/**"]
 
 [lib]
 name = "ezdgn_core"
 
 [dependencies]
 cfb = "0.14"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 thiserror = "2.0"
 # cfb accepts every uuid 1.x release; uuid 1.21 raised its MSRV to 1.85.
 # Keep this workspace's declared Rust 1.83 floor effective.
 uuid = ">=1, <1.21"
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[[bench]]
+name = "v8_read"
+harness = false

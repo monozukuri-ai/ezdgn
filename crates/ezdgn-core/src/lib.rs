@@ -1,8 +1,8 @@
 //! Pure Rust core for the `ezdgn` package.
 //!
-//! The initial reader targets the sequential record stream used by V7/ISFF
-//! DGN files. V8 compound files are detected explicitly but are not parsed by
-//! this crate.
+//! The semantic reader targets the sequential record stream used by V7/ISFF
+//! DGN files. V8 compound files use an independently implemented bounded
+//! container, object-page, and semantic reader.
 
 #![forbid(unsafe_code)]
 
@@ -44,7 +44,17 @@ pub use record::{
 };
 pub use settings::{decode_design_settings, DesignSettings, MasterPoint, RawPoint};
 pub use v8::{
-    inspect_v8_container, V8CfbEntry, V8CfbEntryKind, V8ContainerInfo, DEFAULT_MAX_CFB_ENTRIES,
+    decode_v8_linkages, inspect_v8_container, read_v8, read_v8_stream, read_v8_streams,
+    scan_v8_objects, V8AuxiliaryPage, V8AuxiliaryRecord, V8CfbEntry, V8CfbEntryKind,
+    V8CommonHeader, V8ContainerInfo, V8Dimension, V8Document, V8Element, V8ElementData, V8Linkage,
+    V8Model, V8ModelIndexEntry, V8ModelMetadata, V8ObjectFamily, V8ObjectPage, V8ObjectRole,
+    V8PageHeader, V8Point, V8Point3, V8PointOrientation, V8Range3, V8Range3I64, V8RawDocument,
+    V8RawModel, V8RawObject, V8ReadOptions, V8ScanOptions, V8Stream, V8StreamSet, V8TextEncoding,
+    DEFAULT_MAX_CFB_ENTRIES, DEFAULT_MAX_CFB_STREAM_SIZE_BYTES, DEFAULT_MAX_CFB_TOTAL_STREAM_BYTES,
+    DEFAULT_MAX_V8_HIERARCHY_DEPTH, DEFAULT_MAX_V8_INFLATED_STREAM_BYTES, DEFAULT_MAX_V8_MODELS,
+    DEFAULT_MAX_V8_OBJECTS, DEFAULT_MAX_V8_OBJECT_SIZE_BYTES, DEFAULT_MAX_V8_PAGES,
+    DEFAULT_MAX_V8_STRING_BYTES, DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES, DEFAULT_MAX_V8_VERTICES,
+    V8_PROPERTY_LINKAGE_KIND,
 };
 pub use writer::{write_v7_2d, V7ElementStyle, V7WriteOptions, WritableElement2D};
 

@@ -92,6 +92,12 @@ def test_reads_v8_metadata_geometry_text_hierarchy_and_unknowns() -> None:
     assert text.data.text_bytes == b"\xff\xfe\x01\0myT\xe9xt"
     assert text.data.origin is not None
     assert text.data.origin.master == (0.0, 1.0, 0.0)
+    assert text.data.width_multiplier_raw == pytest.approx(1_666_666.6666666665)
+    assert text.data.height_multiplier_raw == pytest.approx(1_666_666.6666666665)
+    assert text.data.width_uor == pytest.approx(10_000)
+    assert text.data.height_uor == pytest.approx(10_000)
+    assert text.data.width_master == pytest.approx(1)
+    assert text.data.height_master == pytest.approx(1)
 
     header = model.elements[27]
     assert model.children(header) == (model.elements[28], model.elements[29])
@@ -137,5 +143,15 @@ def test_cli_v8_entities_include_native_text_and_hierarchy() -> None:
     assert len(records) == 58
     assert records[0]["entity"]["kind"] == "LINE"
     assert records[4]["entity"]["text"] == "myTéxt"
+    assert records[4]["entity"]["width_multiplier_raw"] == pytest.approx(
+        1_666_666.6666666665
+    )
+    assert records[4]["entity"]["height_multiplier_raw"] == pytest.approx(
+        1_666_666.6666666665
+    )
+    assert records[4]["entity"]["width_uor"] == pytest.approx(10_000)
+    assert records[4]["entity"]["height_uor"] == pytest.approx(10_000)
+    assert records[4]["entity"]["width_master"] == pytest.approx(1)
+    assert records[4]["entity"]["height_master"] == pytest.approx(1)
     assert records[27]["child_indices"] == [28, 29]
     assert records[28]["parent_index"] == 27

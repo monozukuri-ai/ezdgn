@@ -355,6 +355,8 @@ def _v8_entity_payload(element: V8Element) -> dict[str, Any]:
     for name in (
         "font_id",
         "justification",
+        "width_multiplier_raw",
+        "height_multiplier_raw",
         "width_uor",
         "height_uor",
         "width_master",

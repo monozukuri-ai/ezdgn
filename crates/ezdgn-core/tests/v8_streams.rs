@@ -215,6 +215,12 @@ fn decodes_real_model_metadata_primitives_text_and_hierarchy() {
         text,
         text_bytes,
         origin,
+        width_multiplier_raw,
+        height_multiplier_raw,
+        width_uor,
+        height_uor,
+        width_master,
+        height_master,
         ..
     } = &model.elements[4].data
     else {
@@ -223,6 +229,12 @@ fn decodes_real_model_metadata_primitives_text_and_hierarchy() {
     assert_eq!(text, "myTéxt");
     assert_eq!(text_bytes.as_ref(), b"\xff\xfe\x01\0myT\xe9xt");
     assert_eq!(origin.master.as_array(), [0.0, 1.0, 0.0]);
+    assert!((*width_multiplier_raw - 1_666_666.666_666_666_5).abs() < 1e-9);
+    assert!((*height_multiplier_raw - 1_666_666.666_666_666_5).abs() < 1e-9);
+    assert!((*width_uor - 10_000.0).abs() < 1e-9);
+    assert!((*height_uor - 10_000.0).abs() < 1e-9);
+    assert!((*width_master - 1.0).abs() < 1e-12);
+    assert!((*height_master - 1.0).abs() < 1e-12);
 
     assert_eq!(model.elements[6].child_indices, [7]);
     assert_eq!(model.elements[7].parent_index, Some(6));

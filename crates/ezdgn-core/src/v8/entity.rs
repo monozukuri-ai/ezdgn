@@ -13,6 +13,7 @@ use super::{scan_v8_objects, V8AuxiliaryRecord, V8RawDocument, V8RawObject, V8Sc
 
 const COMMON_HEADER_BYTES: usize = 0x68;
 const ELEMENT_3D_FLAG: u32 = 0x0000_0800;
+const TEXT_MULTIPLIER_TO_UOR: f64 = 6.0 / 1000.0;
 
 /// Display and identity fields shared by standard V8 graphical objects.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +93,8 @@ pub enum V8ElementData {
     Text {
         font_id: u32,
         justification: u16,
+        width_multiplier_raw: f64,
+        height_multiplier_raw: f64,
         width_uor: f64,
         height_uor: f64,
         width_master: f64,
@@ -603,8 +606,10 @@ fn decode_text(
     } else {
         decode_windows_1252(decoded_bytes)
     };
-    let width_uor = finite_f64(primary, 0x70, raw, "text width")?;
-    let height_uor = finite_f64(primary, 0x78, raw, "text height")?;
+    let width_multiplier_raw = finite_f64(primary, 0x70, raw, "text width multiplier")?;
+    let height_multiplier_raw = finite_f64(primary, 0x78, raw, "text height multiplier")?;
+    let width_uor = width_multiplier_raw * TEXT_MULTIPLIER_TO_UOR;
+    let height_uor = height_multiplier_raw * TEXT_MULTIPLIER_TO_UOR;
     let (rotation_radians, orientation, origin_offset) = match common.dimension {
         V8Dimension::Two => (
             Some(finite_f64(primary, 0x90, raw, "text rotation")?),
@@ -621,6 +626,8 @@ fn decode_text(
     Ok(V8ElementData::Text {
         font_id: read_u32(primary, 0x68).unwrap_or_default(),
         justification: read_u16(primary, 0x6c).unwrap_or_default(),
+        width_multiplier_raw,
+        height_multiplier_raw,
         width_uor,
         height_uor,
         width_master: width_uor * metadata.scale,

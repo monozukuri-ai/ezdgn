@@ -811,6 +811,8 @@ fn v8_element_data_dict<'py>(
         V8ElementData::Text {
             font_id,
             justification,
+            width_multiplier_raw,
+            height_multiplier_raw,
             width_uor,
             height_uor,
             width_master,
@@ -825,6 +827,8 @@ fn v8_element_data_dict<'py>(
         } => {
             result.set_item("font_id", *font_id)?;
             result.set_item("justification", *justification)?;
+            result.set_item("width_multiplier_raw", *width_multiplier_raw)?;
+            result.set_item("height_multiplier_raw", *height_multiplier_raw)?;
             result.set_item("width_uor", *width_uor)?;
             result.set_item("height_uor", *height_uor)?;
             result.set_item("width_master", *width_master)?;

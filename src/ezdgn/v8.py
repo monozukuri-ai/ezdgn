@@ -274,6 +274,8 @@ class V8ElementData:
     anchor: V8Point | None = None
     font_id: int | None = None
     justification: int | None = None
+    width_multiplier_raw: float | None = None
+    height_multiplier_raw: float | None = None
     width_uor: float | None = None
     height_uor: float | None = None
     width_master: float | None = None
@@ -688,6 +690,8 @@ def _element_data_from_core(row: dict[str, Any]) -> V8ElementData:
         ),
         font_id=row.get("font_id"),
         justification=row.get("justification"),
+        width_multiplier_raw=row.get("width_multiplier_raw"),
+        height_multiplier_raw=row.get("height_multiplier_raw"),
         width_uor=row.get("width_uor"),
         height_uor=row.get("height_uor"),
         width_master=row.get("width_master"),

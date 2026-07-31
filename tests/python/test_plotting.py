@@ -154,6 +154,8 @@ def test_plot_renders_native_v8_document() -> None:
     assert sum(len(item.get_paths()) for item in polygon_collections) >= 1
     assert len(axes.patches) >= 1
     assert axes.get_xlabel() == "x [m]"
+    assert max(map(abs, axes.get_xlim())) < 10
+    assert max(map(abs, axes.get_ylim())) < 10
     plt.close(figure)
 
 

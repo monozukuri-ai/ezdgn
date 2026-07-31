@@ -182,6 +182,13 @@ An unrecognized object carrying a header role becomes `UnknownComplex` with a
 bounded child count; any other unrecognized object becomes `Unknown`. Both
 retain the full raw object.
 
+For type-17 text, the finite `f64` values at `0x70` and `0x78` are the raw
+width and height multipliers. Their UOR distances are
+`raw_multiplier * 6 / 1000`; master-unit distances apply the model scale once
+more. The semantic model retains both raw multipliers and both converted
+distances. This conversion reproduces the checked-in GDAL oracle's
+`s:1.000000g` labels and the independently observed public text-node fixture.
+
 Text type 17 supports valid UTF-8, Windows-1252 fallback, and the observed
 `ff fe 01 00` escaped Windows-1252 marker. The baseline value `myTéxt` is
 decoded while its original bytes `ff fe 01 00 6d 79 54 e9 78 74` remain

@@ -160,6 +160,9 @@ native aggregate entities, while TextNode headers yield their text children.
 2D and 3D coordinates coexist as `(x, y, z)` tuples; no Z coordinate is dropped.
 For complex headers, `common.stored_dimension` retains the header bit and
 `common.dimension` reports the effective dimension inherited from children.
+V8 text exposes its stored `width_multiplier_raw` and `height_multiplier_raw`
+alongside corrected `width_uor`, `height_uor`, `width_master`, and
+`height_master` distances.
 
 The raw scanner is available independently of semantic decoding:
 

@@ -1,6 +1,6 @@
 [project]
 name = "ezdgn"
-version = "0.2.1"
+version = "0.2.2"
 description = "Native V8 DGN reader and V7 DGN reader/writer for Python powered by Rust"
 readme = "README.md"
 license = { file = "LICENSE" }

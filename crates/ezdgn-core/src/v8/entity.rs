@@ -566,25 +566,24 @@ fn decode_text(
             limit: options.max_string_bytes,
         });
     }
-    let padded_text_length = text_length
-        .checked_add(text_length % 2)
-        .ok_or_else(|| geometry_error(raw, "padded text length overflows"))?;
-    let text_start = primary
-        .len()
-        .checked_sub(padded_text_length)
-        .ok_or_else(|| geometry_error(raw, "text length exceeds primary object bytes"))?;
-    let editable_offset = text_start
-        .checked_sub(2)
-        .ok_or_else(|| geometry_error(raw, "text editable-field prefix is missing"))?;
-    let expected_editable = match common.dimension {
+    // The text payload follows the fixed-size header (editable-field word at
+    // 0xa8 / 0xc8). Objects are usually padded to an even length, but some
+    // writers pad to a 4-byte boundary, so the payload position is anchored on
+    // the header layout rather than derived from the object length.
+    let editable_offset: usize = match common.dimension {
         V8Dimension::Two => 0xa8,
         V8Dimension::Three => 0xc8,
     };
-    if editable_offset != expected_editable {
+    let text_start = editable_offset + 2;
+    let text_end = text_start
+        .checked_add(text_length)
+        .ok_or_else(|| geometry_error(raw, "padded text length overflows"))?;
+    if text_end > primary.len() {
         return Err(geometry_error(
             raw,
             format!(
-                "text payload begins at 0x{text_start:x}; expected editable-field offset 0x{expected_editable:x}"
+                "text payload of {text_length} bytes at 0x{text_start:x} exceeds the object ({} bytes)",
+                primary.len()
             ),
         ));
     }
@@ -846,24 +845,19 @@ fn build_hierarchy(elements: &mut [V8Element], max_depth: usize) -> Result<(), D
         }
         let is_component = elements[index].raw.role.is_component();
         if is_component {
-            let parent = stack
-                .last_mut()
-                .ok_or_else(|| DgnError::InvalidV8Hierarchy {
-                    index,
-                    context: "component has no open complex header".to_owned(),
-                })?;
-            parent.remaining -= 1;
-            let parent_index = parent.index;
-            elements[index].parent_index = Some(parent_index);
-            elements[parent_index].child_indices.push(index);
-        } else if let Some(parent) = stack.last() {
-            return Err(DgnError::InvalidV8Hierarchy {
-                index,
-                context: format!(
-                    "standalone object appears while header {} still expects {} direct children",
-                    parent.index, parent.remaining
-                ),
-            });
+            // A component without an open header (writer inconsistency) is kept
+            // as a standalone element instead of rejecting the model.
+            if let Some(parent) = stack.last_mut() {
+                parent.remaining -= 1;
+                let parent_index = parent.index;
+                elements[index].parent_index = Some(parent_index);
+                elements[parent_index].child_indices.push(index);
+            }
+        } else if !stack.is_empty() {
+            // Some writers declare more direct children than they emit; a
+            // standalone object simply closes the pending headers (best effort)
+            // so the rest of the model stays readable.
+            stack.clear();
         }
 
         if elements[index].raw.role.is_header() {
@@ -887,18 +881,8 @@ fn build_hierarchy(elements: &mut [V8Element], max_depth: usize) -> Result<(), D
             }
         }
     }
-    while stack.last().is_some_and(|header| header.remaining == 0) {
-        stack.pop();
-    }
-    if let Some(header) = stack.last() {
-        return Err(DgnError::InvalidV8Hierarchy {
-            index: header.index,
-            context: format!(
-                "complex header is missing {} direct children at end of model",
-                header.remaining
-            ),
-        });
-    }
+    // Headers still open at the end of the model (declared children never
+    // written) are accepted with the children that were actually seen.
     Ok(())
 }
 

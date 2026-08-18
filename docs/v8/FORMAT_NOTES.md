@@ -189,6 +189,17 @@ more. The semantic model retains both raw multipliers and both converted
 distances. This conversion reproduces the checked-in GDAL oracle's
 `s:1.000000g` labels and the independently observed public text-node fixture.
 
+The type-17 text payload starts right after the fixed header (editable-field
+word at `0xa8` for 2D, `0xc8` for 3D; payload at `0xaa` / `0xca`), its byte
+length being the `u16` at `0x6e`. The object may be padded to an even or a
+4-byte length after the payload, so the payload position is anchored on the
+header layout, not derived from the object length (a real-world file padded
+some texts to 4 bytes and previously failed with "text payload begins at
+0xac"). Complex-header child counts are treated as best effort: a standalone
+object closes still-open headers, a component without an open header is kept
+standalone, and headers still open at the end of a model keep the children
+actually seen.
+
 Text type 17 supports valid UTF-8, Windows-1252 fallback, and the observed
 `ff fe 01 00` escaped Windows-1252 marker. The baseline value `myTéxt` is
 decoded while its original bytes `ff fe 01 00 6d 79 54 e9 78 74` remain

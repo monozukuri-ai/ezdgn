@@ -125,6 +125,22 @@ CellRow: TypeAlias = tuple[
     Point2Uor,
     Point2Master | None,
 ]
+SharedCellDefinitionRow: TypeAlias = tuple[
+    int,
+    tuple[int, str],
+    tuple[Point2Uor, Point2Uor],
+    tuple[Point2Master, Point2Master] | None,
+    tuple[tuple[float, float], tuple[float, float]],
+    Point2Uor,
+    Point2Master | None,
+]
+SharedCellInstanceRow: TypeAlias = tuple[
+    int,
+    str,
+    tuple[tuple[float, float], tuple[float, float]],
+    Point2Uor,
+    Point2Master | None,
+]
 TextNodeRow: TypeAlias = tuple[
     int,
     tuple[int, int, int],
@@ -333,6 +349,35 @@ class Cell(DgnElement):
     origin_master: Point2Master | None
 
     KIND: ClassVar[str] = "CELL"
+
+
+@dataclass(frozen=True, slots=True)
+class SharedCellDefinition(DgnElement):
+    """Type-34 共有セル定義。構成要素は子要素として連なる。"""
+
+    total_length_words: int
+    name: str
+    range_low_uor: Point2Uor
+    range_high_uor: Point2Uor
+    range_low_master: Point2Master | None
+    range_high_master: Point2Master | None
+    transform: tuple[tuple[float, float], tuple[float, float]]
+    origin_uor: Point2Uor
+    origin_master: Point2Master | None
+
+    KIND: ClassVar[str] = "SHARED_CELL_DEFINITION"
+
+
+@dataclass(frozen=True, slots=True)
+class SharedCellInstance(DgnElement):
+    """Type-35 共有セル配置。同名の定義を transform/origin で置く。"""
+
+    name: str
+    transform: tuple[tuple[float, float], tuple[float, float]]
+    origin_uor: Point2Uor
+    origin_master: Point2Master | None
+
+    KIND: ClassVar[str] = "SHARED_CELL_INSTANCE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +674,8 @@ GraphicElement: TypeAlias = (
 
 _GRAPHIC_TYPES = (
     Cell,
+    SharedCellDefinition,
+    SharedCellInstance,
     Line,
     LineString,
     Shape,
@@ -822,6 +869,8 @@ class _SemanticRows:
     bspline_curves: dict[int, BSplineCurveRow]
     bspline_weights: dict[int, BSplineScalarRow]
     color_tables: dict[int, ColorTableRow]
+    shared_cell_definitions: dict[int, SharedCellDefinitionRow]
+    shared_cell_instances: dict[int, SharedCellInstanceRow]
 
     def dictionaries(self) -> tuple[dict[int, object], ...]:
         return cast(
@@ -852,7 +901,9 @@ def _drawing_from_core(data: bytes, row: PrimitiveScanRow) -> Drawing:
         bspline_rows,
         hierarchy_rows,
         linkage_rows,
+        shared_cell_rows,
     ) = phase4
+    shared_cell_definition_rows, shared_cell_instance_rows = shared_cell_rows
     (
         bspline_pole_rows,
         bspline_surface_rows,
@@ -882,6 +933,8 @@ def _drawing_from_core(data: bytes, row: PrimitiveScanRow) -> Drawing:
         bspline_curves={item[0]: item for item in bspline_curve_rows},
         bspline_weights={item[0]: item for item in bspline_weight_rows},
         color_tables={item[0]: item for item in color_table_rows},
+        shared_cell_definitions={item[0]: item for item in shared_cell_definition_rows},
+        shared_cell_instances={item[0]: item for item in shared_cell_instance_rows},
     )
     semantic_indices: set[int] = set()
     expected_semantic_count = 0
@@ -1013,6 +1066,40 @@ def _element_from_rows(
             low_master,
             high_master,
             transform_raw,
+            transform,
+            origin_uor,
+            origin_master,
+        )
+    if index in rows.shared_cell_definitions:
+        (
+            _,
+            description,
+            range_uor,
+            range_master,
+            transform,
+            origin_uor,
+            origin_master,
+        ) = rows.shared_cell_definitions[index]
+        low_master, high_master = (None, None) if range_master is None else range_master
+        return SharedCellDefinition(
+            *base,
+            style,
+            description[0],
+            description[1],
+            range_uor[0],
+            range_uor[1],
+            low_master,
+            high_master,
+            transform,
+            origin_uor,
+            origin_master,
+        )
+    if index in rows.shared_cell_instances:
+        _, name, transform, origin_uor, origin_master = rows.shared_cell_instances[index]
+        return SharedCellInstance(
+            *base,
+            style,
+            name,
             transform,
             origin_uor,
             origin_master,

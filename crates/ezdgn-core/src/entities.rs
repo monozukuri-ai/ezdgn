@@ -99,6 +99,35 @@ pub struct CellHeader2D {
     pub origin_master: Option<Point2<f64>>,
 }
 
+/// Type-34 shared cell definition header. Component records follow inside the
+/// span declared by `total_length_words` (the same container convention as
+/// cells); instances reference the definition by `name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedCellDefinition2D {
+    pub total_length_words: u16,
+    pub name: String,
+    pub range_low_uor: Point2<i32>,
+    pub range_high_uor: Point2<i32>,
+    pub range_low_master: Option<Point2<f64>>,
+    pub range_high_master: Option<Point2<f64>>,
+    /// 2x2 placement basis stored as VAX doubles (identity on definitions).
+    pub transform: [[f64; 2]; 2],
+    /// The definition's local origin (always UOR 0,0) in both spaces, so
+    /// consumers can anchor instance placements without design settings.
+    pub origin_uor: Point2<i32>,
+    pub origin_master: Option<Point2<f64>>,
+}
+
+/// Type-35 shared cell instance: places the same-named definition through a
+/// 2x2 transform (VAX doubles) at `origin`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedCellInstance2D {
+    pub name: String,
+    pub transform: [[f64; 2]; 2],
+    pub origin_uor: Point2<i32>,
+    pub origin_master: Option<Point2<f64>>,
+}
+
 /// Type-7 text-node header. Direct children are text records and are linked
 /// through the enclosing [`Element2D`] indices.
 #[derive(Debug, Clone, PartialEq)]
@@ -306,6 +335,8 @@ pub enum ElementData2D<'a> {
     BSplineKnot(BSplineKnot2D),
     BSplineCurve(BSplineCurve2D),
     BSplineWeight(BSplineWeight2D),
+    SharedCellDefinition(SharedCellDefinition2D),
+    SharedCellInstance(SharedCellInstance2D),
     ColorTable(Box<ColorTable>),
     /// Control, application, and not-yet-supported element types retain their
     /// complete [`RawElementRef`] on the enclosing element.
@@ -333,6 +364,8 @@ impl ElementData2D<'_> {
             Self::BSplineSurfaceBoundary(_) => "BSPLINE_SURFACE_BOUNDARY",
             Self::BSplineKnot(_) => "BSPLINE_KNOT",
             Self::BSplineCurve(_) => "BSPLINE_CURVE",
+            Self::SharedCellDefinition(_) => "SHARED_CELL_DEFINITION",
+            Self::SharedCellInstance(_) => "SHARED_CELL_INSTANCE",
             Self::BSplineWeight(_) => "BSPLINE_WEIGHT",
             Self::ColorTable(_) => "COLOR_TABLE",
             Self::Unsupported => "UNSUPPORTED",
@@ -452,6 +485,17 @@ fn decode_element_data<'a>(
 ) -> Result<ElementData2D<'a>, DgnError> {
     match (record.header.element_type, record.header.level) {
         (CELL_HEADER, _) => decode_cell(record, common_header, settings).map(ElementData2D::Cell),
+        // 共有セルはレイアウト不一致の書き手も想定し、読めない場合は
+        // Unsupportedへ降格してファイル全体は生かす
+        (SHARED_CELL_DEFINITION_TYPE, _) => Ok(decode_shared_cell_definition(record, settings)
+            .map_or(
+                ElementData2D::Unsupported,
+                ElementData2D::SharedCellDefinition,
+            )),
+        (SHARED_CELL_INSTANCE_TYPE, _) => Ok(decode_shared_cell_instance(record, settings).map_or(
+            ElementData2D::Unsupported,
+            ElementData2D::SharedCellInstance,
+        )),
         (LINE, _) => {
             decode_line(record, common_header, linkages, settings).map(ElementData2D::Line)
         }
@@ -563,6 +607,102 @@ fn decode_cell(
         range_high_master: transform_integer_point(settings, range_high_uor),
         transform_raw,
         transform: transform_raw.map(|row| row.map(|value| f64::from(value) * CELL_MATRIX_UNIT)),
+        origin_uor,
+        origin_master: transform_integer_point(settings, origin_uor),
+    })
+}
+
+const SHARED_CELL_INSTANCE_TYPE: u8 = 35;
+/// Fixed byte layout observed on 180-byte type-34/35 records (MicroStation
+/// V7): 3D range triplets at 52, four VAX-double transform terms at 76,
+/// origin at 148, and a NUL-padded name at 164.
+const SHARED_CELL_RANGE_OFFSET: usize = 52;
+const SHARED_CELL_TRANSFORM_OFFSET: usize = 76;
+const SHARED_CELL_ORIGIN_OFFSET: usize = 148;
+const SHARED_CELL_NAME_OFFSET: usize = 164;
+const SHARED_CELL_NAME_BYTES: usize = 16;
+
+/// Shared-cell records store range and origin as plain little-endian i32
+/// (unlike the word-swapped coordinates of the classic element types).
+fn read_point_le_i32(bytes: &[u8], offset: usize) -> Point2<i32> {
+    let word =
+        |at: usize| i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    Point2 {
+        x: word(offset),
+        y: word(offset + 4),
+    }
+}
+
+fn read_vax_f64(bytes: &[u8], offset: usize) -> Option<f64> {
+    let slice = bytes.get(offset..offset + 8)?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(slice);
+    Some(crate::numbers::decode_vax_d_f64(raw))
+}
+
+fn shared_cell_name(bytes: &[u8]) -> Option<String> {
+    let raw = bytes.get(SHARED_CELL_NAME_OFFSET..)?;
+    let raw = &raw[..raw.len().min(SHARED_CELL_NAME_BYTES)];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Some(String::from_utf8_lossy(&raw[..end]).into_owned())
+}
+
+fn shared_cell_transform(bytes: &[u8]) -> Option<[[f64; 2]; 2]> {
+    let t00 = read_vax_f64(bytes, SHARED_CELL_TRANSFORM_OFFSET)?;
+    let t01 = read_vax_f64(bytes, SHARED_CELL_TRANSFORM_OFFSET + 8)?;
+    let t10 = read_vax_f64(bytes, SHARED_CELL_TRANSFORM_OFFSET + 16)?;
+    let t11 = read_vax_f64(bytes, SHARED_CELL_TRANSFORM_OFFSET + 24)?;
+    let transform = [[t00, t01], [t10, t11]];
+    if transform
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite() || value.abs() > 1.0e12)
+    {
+        return None;
+    }
+    Some(transform)
+}
+
+fn decode_shared_cell_definition(
+    record: RawElementRef<'_>,
+    settings: DesignSettings,
+) -> Option<SharedCellDefinition2D> {
+    let bytes = record.bytes;
+    if bytes.len() < SHARED_CELL_NAME_OFFSET {
+        return None;
+    }
+    // 範囲はセル原点まわりの3次元トリプレット(2Dファイルでもz=0が入る)
+    let range_low_uor = read_point_le_i32(bytes, SHARED_CELL_RANGE_OFFSET);
+    let range_high_uor = read_point_le_i32(bytes, SHARED_CELL_RANGE_OFFSET + 12);
+    Some(SharedCellDefinition2D {
+        total_length_words: read_u16(bytes, 36),
+        name: shared_cell_name(bytes)?,
+        range_low_uor,
+        range_high_uor,
+        range_low_master: transform_integer_point(settings, range_low_uor),
+        range_high_master: transform_integer_point(settings, range_high_uor),
+        transform: shared_cell_transform(bytes)?,
+        origin_uor: Point2 { x: 0, y: 0 },
+        origin_master: transform_integer_point(settings, Point2 { x: 0, y: 0 }),
+    })
+}
+
+fn decode_shared_cell_instance(
+    record: RawElementRef<'_>,
+    settings: DesignSettings,
+) -> Option<SharedCellInstance2D> {
+    let bytes = record.bytes;
+    if bytes.len() < SHARED_CELL_NAME_OFFSET {
+        return None;
+    }
+    let name = shared_cell_name(bytes)?;
+    if name.is_empty() {
+        return None;
+    }
+    let origin_uor = read_point_le_i32(bytes, SHARED_CELL_ORIGIN_OFFSET);
+    Some(SharedCellInstance2D {
+        name,
+        transform: shared_cell_transform(bytes)?,
         origin_uor,
         origin_master: transform_integer_point(settings, origin_uor),
     })
@@ -1571,5 +1711,108 @@ mod tests {
             decode_element_data(record(&scalar, BSPLINE_KNOT, 2), None, &[], settings()),
             Err(DgnError::InvalidScalarArrayLength { data_bytes: 6, .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod shared_cell_tests {
+    use super::*;
+    use crate::numbers::encode_vax_d_f64;
+    use crate::RawElementHeader;
+
+    fn settings() -> DesignSettings {
+        DesignSettings {
+            dimension: V7Dimension::Two,
+            subunits_per_master: 10,
+            uor_per_subunit: 10,
+            master_unit_label: *b"mu",
+            sub_unit_label: *b"su",
+            global_origin_uor: [0.0; 3],
+        }
+    }
+
+    fn record(bytes: &[u8], element_type: u8) -> RawElementRef<'_> {
+        RawElementRef {
+            index: 0,
+            offset: 0,
+            header: RawElementHeader {
+                level: 3,
+                element_type,
+                complex_component: false,
+                reserved: false,
+                deleted: false,
+                words_to_follow: (bytes.len() / 2 - 2) as u16,
+            },
+            bytes,
+        }
+    }
+
+    fn shared_cell_bytes(transform: [[f64; 2]; 2], origin: (i32, i32), name: &str) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 180];
+        bytes[36..38].copy_from_slice(&118_u16.to_le_bytes());
+        // 範囲(3次元トリプレット、素のリトルエンディアン)
+        for (index, value) in [-400_i32, -79, 0, 0, 79, 0].into_iter().enumerate() {
+            bytes[SHARED_CELL_RANGE_OFFSET + index * 4..SHARED_CELL_RANGE_OFFSET + index * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        for (index, value) in transform.into_iter().flatten().enumerate() {
+            let offset = SHARED_CELL_TRANSFORM_OFFSET + index * 8;
+            bytes[offset..offset + 8].copy_from_slice(&encode_vax_d_f64(value));
+        }
+        bytes[SHARED_CELL_ORIGIN_OFFSET..SHARED_CELL_ORIGIN_OFFSET + 4]
+            .copy_from_slice(&origin.0.to_le_bytes());
+        bytes[SHARED_CELL_ORIGIN_OFFSET + 4..SHARED_CELL_ORIGIN_OFFSET + 8]
+            .copy_from_slice(&origin.1.to_le_bytes());
+        bytes[SHARED_CELL_NAME_OFFSET..SHARED_CELL_NAME_OFFSET + name.len()]
+            .copy_from_slice(name.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decodes_shared_cell_definition_and_instance_layout() {
+        let bytes = shared_cell_bytes([[1.0, 0.0], [0.0, 1.0]], (0, 0), "ARR");
+        let definition = decode_shared_cell_definition(record(&bytes, 34), settings())
+            .expect("definition must decode");
+        assert_eq!(definition.total_length_words, 118);
+        assert_eq!(definition.name, "ARR");
+        assert_eq!(definition.range_low_uor, Point2 { x: -400, y: -79 });
+        assert_eq!(definition.range_high_uor, Point2 { x: 0, y: 79 });
+        assert_eq!(definition.transform, [[1.0, 0.0], [0.0, 1.0]]);
+        assert_eq!(definition.origin_master, Some(Point2 { x: 0.0, y: 0.0 }));
+
+        let bytes = shared_cell_bytes(
+            [[0.0, 44.9375], [-44.375, 0.0]],
+            (6_410_881, 2_200_346),
+            "ARR",
+        );
+        let instance = decode_shared_cell_instance(record(&bytes, 35), settings())
+            .expect("instance must decode");
+        assert_eq!(instance.name, "ARR");
+        assert_eq!(instance.transform, [[0.0, 44.9375], [-44.375, 0.0]]);
+        assert_eq!(
+            instance.origin_uor,
+            Point2 {
+                x: 6_410_881,
+                y: 2_200_346
+            }
+        );
+        let origin_master = instance.origin_master.expect("origin master");
+        assert!((origin_master.x - 64_108.81).abs() < 1.0e-6);
+        assert!((origin_master.y - 22_003.46).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn degrades_short_or_implausible_shared_cell_records() {
+        let short = vec![0_u8; 96];
+        assert!(decode_shared_cell_definition(record(&short, 34), settings()).is_none());
+        assert!(decode_shared_cell_instance(record(&short, 35), settings()).is_none());
+        // 変換行列が壊れている(非有限/桁あふれ)場合もUnsupported扱いに落とす
+        let mut absurd = shared_cell_bytes([[1.0, 0.0], [0.0, 1.0]], (0, 0), "ARR");
+        absurd[SHARED_CELL_TRANSFORM_OFFSET..SHARED_CELL_TRANSFORM_OFFSET + 8]
+            .copy_from_slice(&encode_vax_d_f64(5.0e13));
+        assert!(decode_shared_cell_definition(record(&absurd, 34), settings()).is_none());
+        // 名前が空のインスタンスは解決できない
+        let unnamed = shared_cell_bytes([[1.0, 0.0], [0.0, 1.0]], (0, 0), "");
+        assert!(decode_shared_cell_instance(record(&unnamed, 35), settings()).is_none());
     }
 }

@@ -175,6 +175,23 @@ type LinkageRow = (
     Option<u32>,
     Option<HighPrecisionRow>,
 );
+type SharedCellDefinitionRow = (
+    usize,
+    (u16, String),
+    (PointI32Row, PointI32Row),
+    Option<(PointF64Row, PointF64Row)>,
+    ((f64, f64), (f64, f64)),
+    PointI32Row,
+    Option<PointF64Row>,
+);
+type SharedCellInstanceRow = (
+    usize,
+    String,
+    ((f64, f64), (f64, f64)),
+    PointI32Row,
+    Option<PointF64Row>,
+);
+type SharedCellRows = (Vec<SharedCellDefinitionRow>, Vec<SharedCellInstanceRow>);
 type Phase4Row = (
     Vec<MultiPointRow>,
     Vec<CellRow>,
@@ -184,6 +201,7 @@ type Phase4Row = (
     BSplineRows,
     Vec<HierarchyRow>,
     Vec<Vec<LinkageRow>>,
+    SharedCellRows,
 );
 type PrimitiveScanRow = (
     HeaderScanRow,
@@ -1091,6 +1109,8 @@ fn primitive_scan_row(document: &V7Document2D<'_>) -> PrimitiveScanRow {
     let mut bspline_curves = Vec::new();
     let mut bspline_weights = Vec::new();
     let mut color_tables = Vec::new();
+    let mut shared_cell_definitions = Vec::new();
+    let mut shared_cell_instances = Vec::new();
 
     for element in &document.elements {
         let index = element.raw.index;
@@ -1286,6 +1306,31 @@ fn primitive_scan_row(document: &V7Document2D<'_>) -> PrimitiveScanRow {
                     .map(|color| (color[0], color[1], color[2]))
                     .collect(),
             )),
+            ElementData2D::SharedCellDefinition(definition) => shared_cell_definitions.push((
+                index,
+                (definition.total_length_words, definition.name.clone()),
+                (
+                    point_i32_row(definition.range_low_uor),
+                    point_i32_row(definition.range_high_uor),
+                ),
+                pair_points(definition.range_low_master, definition.range_high_master),
+                (
+                    (definition.transform[0][0], definition.transform[0][1]),
+                    (definition.transform[1][0], definition.transform[1][1]),
+                ),
+                point_i32_row(definition.origin_uor),
+                definition.origin_master.map(point_f64_row),
+            )),
+            ElementData2D::SharedCellInstance(instance) => shared_cell_instances.push((
+                index,
+                instance.name.clone(),
+                (
+                    (instance.transform[0][0], instance.transform[0][1]),
+                    (instance.transform[1][0], instance.transform[1][1]),
+                ),
+                point_i32_row(instance.origin_uor),
+                instance.origin_master.map(point_f64_row),
+            )),
             ElementData2D::Unsupported => {}
         }
     }
@@ -1337,6 +1382,7 @@ fn primitive_scan_row(document: &V7Document2D<'_>) -> PrimitiveScanRow {
                 .iter()
                 .map(|element| element.linkages.iter().map(linkage_row).collect())
                 .collect(),
+            (shared_cell_definitions, shared_cell_instances),
         ),
     )
 }

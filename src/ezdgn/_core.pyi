@@ -173,6 +173,25 @@ LinkageRow: TypeAlias = tuple[
     int | None,
     HighPrecisionRow | None,
 ]
+SharedCellDefinitionRow: TypeAlias = tuple[
+    int,
+    tuple[int, str],
+    tuple[tuple[int, int], tuple[int, int]],
+    tuple[tuple[float, float], tuple[float, float]] | None,
+    tuple[tuple[float, float], tuple[float, float]],
+    tuple[int, int],
+    tuple[float, float] | None,
+]
+SharedCellInstanceRow: TypeAlias = tuple[
+    int,
+    str,
+    tuple[tuple[float, float], tuple[float, float]],
+    tuple[int, int],
+    tuple[float, float] | None,
+]
+SharedCellRows: TypeAlias = tuple[
+    list[SharedCellDefinitionRow], list[SharedCellInstanceRow]
+]
 Phase4Row: TypeAlias = tuple[
     list[MultiPointRow],
     list[CellRow],
@@ -182,6 +201,7 @@ Phase4Row: TypeAlias = tuple[
     BSplineRows,
     list[HierarchyRow],
     list[list[LinkageRow]],
+    SharedCellRows,
 ]
 PrimitiveScanRow: TypeAlias = tuple[
     HeaderScanRow,

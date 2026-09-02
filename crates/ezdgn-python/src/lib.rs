@@ -526,6 +526,7 @@ fn v8_raw_document_dict<'py>(
     result.set_item("total_inflated_bytes", document.total_inflated_bytes)?;
     result.set_item("graphical_object_count", document.graphical_object_count())?;
     result.set_item("total_object_count", document.total_object_count())?;
+    result.set_item("skipped_models", document.skipped_models.clone())?;
 
     let models = PyList::empty(py);
     for model in &document.models {

@@ -271,6 +271,9 @@ pub struct V8RawDocument {
     pub named_pages: Vec<V8ObjectPage>,
     pub named_auxiliary_pages: Vec<V8AuxiliaryPage>,
     pub total_inflated_bytes: usize,
+    /// Model-header stream paths that the model index references but the
+    /// container does not store (deleted or externalized models).
+    pub skipped_models: Vec<String>,
 }
 
 impl V8RawDocument {
@@ -327,44 +330,65 @@ fn scan_v8_streams(
     let model_index = parse_model_index(&index_bytes, options)?;
 
     let mut models = Vec::with_capacity(model_index.len());
+    let mut skipped_models = Vec::new();
     for entry in model_index {
-        let storage_path = format!("/Dgn-Md/#{:06}", entry.storage_index);
-        let model_header_path = format!("{storage_path}/Dgn~Mh");
-        let model_header_stream = streams.get(&model_header_path).cloned().ok_or_else(|| {
-            DgnError::InvalidV8ModelHeader {
-                path: model_header_path.clone(),
-                context: "stream is missing".to_owned(),
-            }
-        })?;
-        let model_header_bytes: Arc<[u8]> =
-            Arc::from(inflate_and_charge(&model_header_stream, 0, &mut budget)?);
+        // Writers keep deleted or externalized models in the index while
+        // dropping their storage; skip those instead of rejecting the file,
+        // as long as at least one stored model remains.
+        let header_path = format!("/Dgn-Md/#{:06}/Dgn~Mh", entry.storage_index);
+        match scan_model_storage(&streams, entry, &mut budget)? {
+            Some(model) => models.push(model),
+            None => skipped_models.push(header_path),
+        }
+    }
 
-        let graphical_pages = scan_object_family(
-            &streams,
-            &format!("{storage_path}/Dgn^G/"),
-            V8ObjectFamily::Graphical,
-            &mut budget,
-        )?;
-        let graphical_auxiliary_pages =
-            scan_auxiliary_family(&streams, &format!("{storage_path}/Dgn^GA/"), &mut budget)?;
-        let control_pages = scan_object_family(
-            &streams,
-            &format!("{storage_path}/Dgn^C/"),
-            V8ObjectFamily::Control,
-            &mut budget,
-        )?;
-        let control_auxiliary_pages =
-            scan_auxiliary_family(&streams, &format!("{storage_path}/Dgn^CA/"), &mut budget)?;
-        models.push(V8RawModel {
-            index: entry,
-            storage_path,
-            model_header_stream,
-            model_header_bytes,
-            graphical_pages,
-            graphical_auxiliary_pages,
-            control_pages,
-            control_auxiliary_pages,
-        });
+    // The inverse inconsistency also exists: model storages the index does
+    // not reference (stale or partial /Dgn^Ix/Dgn~Mix). Load those too so
+    // their graphics are not lost.
+    let mut orphan_indices: Vec<u16> = streams
+        .streams
+        .iter()
+        .filter_map(|stream| {
+            let rest = stream.path.strip_prefix("/Dgn-Md/#")?;
+            let (number, tail) = rest.split_once('/')?;
+            if tail != "Dgn~Mh" || number.len() != 6 {
+                return None;
+            }
+            number.parse::<u16>().ok()
+        })
+        .collect();
+    orphan_indices.sort_unstable();
+    orphan_indices.dedup();
+    for storage_index in orphan_indices {
+        if models
+            .iter()
+            .any(|model| model.index.storage_index == storage_index)
+        {
+            continue;
+        }
+        let entry = V8ModelIndexEntry {
+            index: models.len(),
+            raw_number: u32::from(storage_index),
+            storage_index,
+            model_number: storage_index,
+            flags: 0,
+            model_id: 0,
+            name: String::new(),
+            description: String::new(),
+            raw_bytes: Arc::from(&[][..]),
+        };
+        if let Some(model) = scan_model_storage(&streams, entry, &mut budget)? {
+            models.push(model);
+        }
+    }
+
+    if models.is_empty() {
+        if let Some(path) = skipped_models.first() {
+            return Err(DgnError::InvalidV8ModelHeader {
+                path: path.clone(),
+                context: "stream is missing".to_owned(),
+            });
+        }
     }
 
     let named_pages = scan_object_family(&streams, "/Dgn^Nm/", V8ObjectFamily::Named, &mut budget)?;
@@ -376,7 +400,51 @@ fn scan_v8_streams(
         named_pages,
         named_auxiliary_pages,
         total_inflated_bytes: budget.total_inflated,
+        skipped_models,
     })
+}
+
+/// Scan the object pages of one model storage, or return `None` when the
+/// storage has no model-header stream.
+fn scan_model_storage(
+    streams: &V8StreamSet,
+    entry: V8ModelIndexEntry,
+    budget: &mut ScanBudget,
+) -> Result<Option<V8RawModel>, DgnError> {
+    let storage_path = format!("/Dgn-Md/#{:06}", entry.storage_index);
+    let model_header_path = format!("{storage_path}/Dgn~Mh");
+    let Some(model_header_stream) = streams.get(&model_header_path).cloned() else {
+        return Ok(None);
+    };
+    let model_header_bytes: Arc<[u8]> =
+        Arc::from(inflate_and_charge(&model_header_stream, 0, budget)?);
+
+    let graphical_pages = scan_object_family(
+        streams,
+        &format!("{storage_path}/Dgn^G/"),
+        V8ObjectFamily::Graphical,
+        budget,
+    )?;
+    let graphical_auxiliary_pages =
+        scan_auxiliary_family(streams, &format!("{storage_path}/Dgn^GA/"), budget)?;
+    let control_pages = scan_object_family(
+        streams,
+        &format!("{storage_path}/Dgn^C/"),
+        V8ObjectFamily::Control,
+        budget,
+    )?;
+    let control_auxiliary_pages =
+        scan_auxiliary_family(streams, &format!("{storage_path}/Dgn^CA/"), budget)?;
+    Ok(Some(V8RawModel {
+        index: entry,
+        storage_path,
+        model_header_stream,
+        model_header_bytes,
+        graphical_pages,
+        graphical_auxiliary_pages,
+        control_pages,
+        control_auxiliary_pages,
+    }))
 }
 
 #[derive(Debug)]

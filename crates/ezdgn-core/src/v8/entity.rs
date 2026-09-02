@@ -12,6 +12,10 @@ use super::raw::{read_u16, read_u32, read_u64};
 use super::{scan_v8_objects, V8AuxiliaryRecord, V8RawDocument, V8RawObject, V8ScanOptions};
 
 const COMMON_HEADER_BYTES: usize = 0x68;
+/// Identification prefix (type/flags, attribute offset, size, level, element
+/// id, model id) shared by short component records such as B-spline knot and
+/// weight vectors, which do not carry the graphic fields of the full header.
+const COMPONENT_PREFIX_BYTES: usize = 0x20;
 const ELEMENT_3D_FLAG: u32 = 0x0000_0800;
 const TEXT_MULTIPLIER_TO_UOR: f64 = 6.0 / 1000.0;
 
@@ -328,7 +332,15 @@ fn decode_model_elements(
             options,
             &format!("element {}", common.element_id),
         )?;
-        let data = decode_element(raw, &common, metadata, &linkages, options)?;
+        let data = match decode_element(raw, &common, metadata, &linkages, options) {
+            Ok(data) => data,
+            // Component records (B-spline knots/weights and other
+            // writer-specific payloads shorter than a graphical element)
+            // must not reject the model; the enclosing header still gets its
+            // decodable children, everything else stays a raw child.
+            Err(_) if raw.role.is_component() => V8ElementData::Unknown,
+            Err(error) => return Err(error),
+        };
         elements.push(V8Element {
             index: elements.len(),
             raw: raw.clone(),
@@ -352,11 +364,23 @@ fn decode_common(
     metadata: &V8ModelMetadata,
 ) -> Result<V8CommonHeader, DgnError> {
     let bytes = raw.as_bytes();
-    if bytes.len() < COMMON_HEADER_BYTES {
+    if bytes.len() < COMMON_HEADER_BYTES && !raw.role.is_component() {
         return Err(geometry_error(
             raw,
             format!(
                 "common graphical header needs {COMMON_HEADER_BYTES} bytes, got {}",
+                bytes.len()
+            ),
+        ));
+    }
+    if bytes.len() < COMPONENT_PREFIX_BYTES {
+        // Even component records (B-spline knot/weight vectors carry only the
+        // identification prefix of the graphical header) need type, id, and
+        // attribute fields.
+        return Err(geometry_error(
+            raw,
+            format!(
+                "component header needs {COMPONENT_PREFIX_BYTES} bytes, got {}",
                 bytes.len()
             ),
         ));

@@ -221,6 +221,7 @@ class V8RawDocument:
     total_inflated_bytes: int
     graphical_object_count: int
     total_object_count: int
+    skipped_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,6 +635,7 @@ def _raw_document_from_core(row: dict[str, Any]) -> V8RawDocument:
         total_inflated_bytes=row["total_inflated_bytes"],
         graphical_object_count=row["graphical_object_count"],
         total_object_count=row["total_object_count"],
+        skipped_models=tuple(row.get("skipped_models", ())),
     )
 
 

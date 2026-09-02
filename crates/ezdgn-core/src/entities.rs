@@ -28,6 +28,7 @@ const BSPLINE_SURFACE_BOUNDARY: u8 = 25;
 const BSPLINE_KNOT: u8 = 26;
 const BSPLINE_CURVE: u8 = 27;
 const BSPLINE_WEIGHT: u8 = 28;
+const SHARED_CELL_DEFINITION_TYPE: u8 = 34;
 const ANGLE_UNITS_PER_DEGREE: f64 = 360_000.0;
 const UNIT_I32_MAX: f64 = 2_147_483_647.0;
 const SUB_UOR_DIVISOR: f64 = 32_767.0;
@@ -900,10 +901,42 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         .map(|element| element.raw.offset)
         .chain(std::iter::once(stream_end))
         .collect::<HashSet<_>>();
-    let descriptors = elements
+    let mut descriptors = elements
         .iter()
         .map(|element| container_descriptor(element, stream_end))
         .collect::<Result<Vec<_>, _>>()?;
+    // Shared cell definitions (type 34) enclose their component records the
+    // same way cells do (total length in words at byte 36, components from
+    // byte 38); the element itself is otherwise not decoded yet. The length is
+    // only trusted when it lands exactly on a record boundary.
+    for (index, element) in elements.iter().enumerate() {
+        if descriptors[index].is_some()
+            || element.raw.header.element_type != SHARED_CELL_DEFINITION_TYPE
+        {
+            continue;
+        }
+        let record_end = element.raw.offset + element.raw.bytes.len();
+        let words = element
+            .raw
+            .bytes
+            .get(36..38)
+            .map(|bytes| usize::from(u16::from_le_bytes([bytes[0], bytes[1]])));
+        let declared_end = words.and_then(|words| {
+            element
+                .raw
+                .offset
+                .checked_add(38)
+                .and_then(|base| base.checked_add(words * 2))
+        });
+        if let Some(end) = declared_end {
+            if end >= record_end && end <= stream_end && boundaries.contains(&end) {
+                descriptors[index] = Some(ContainerDescriptor {
+                    end,
+                    kind: ContainerKind::Cell,
+                });
+            }
+        }
+    }
     for (element, descriptor) in elements.iter().zip(descriptors.iter().flatten()) {
         if !boundaries.contains(&descriptor.end) {
             return Err(DgnError::InvalidDescriptionBoundary {
@@ -953,12 +986,11 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
                     });
                 }
             }
-        } else if element.raw.header.complex_component {
-            return Err(DgnError::OrphanComplexComponent {
-                offset,
-                element_type: element.raw.header.element_type,
-            });
         }
+        // A component bit without an enclosing description (writer
+        // inconsistency, or an unrecognized container type) keeps the record
+        // as a standalone element instead of rejecting the file, matching the
+        // V8 hierarchy behaviour.
 
         if let Some(descriptor) = descriptors[index] {
             stack.push((index, descriptor.end));

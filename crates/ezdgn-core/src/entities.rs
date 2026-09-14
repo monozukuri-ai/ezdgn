@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::numbers::{decode_middle_endian_i32, decode_middle_endian_u32, decode_vax_d_f64};
 use crate::{
-    decode_attribute_linkages, decode_common_header, decode_design_settings, scan_records,
+    decode_attribute_linkages, decode_common_header_lenient, decode_design_settings, scan_records,
     AttributeLinkage, CommonElementHeader, DesignSettings, DgnError, LinkageData, RawElementRef,
     RecordScan, ScanOptions, V7Dimension,
 };
@@ -451,7 +451,9 @@ pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>
     let mut elements = Vec::with_capacity(scan.records.len());
     let mut active_color_table = None;
     for record in scan.records.iter().copied() {
-        let common_header = decode_common_header(record, settings.dimension)?;
+        // 属性ポインタが壊れた要素(実ファイルでは型56の1536バイトのベンダ記録)で
+        // ファイル全体を落とさない。ジオメトリ語はポインタと無関係なので属性なしで続ける
+        let common_header = decode_common_header_lenient(record, settings.dimension)?;
         let linkages = decode_attribute_linkages(record, common_header);
         let data = decode_element_data(record, common_header, &linkages, settings)?;
         if matches!(data, ElementData2D::ColorTable(_)) {

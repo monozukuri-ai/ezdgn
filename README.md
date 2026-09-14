@@ -120,7 +120,9 @@ Known DMRS/database, association ID, shape fill, and high-precision linkages
 have typed fields. Unknown user linkages and malformed trailing attribute bytes
 remain accessible through read-only raw views. Shared-cell definition/instance
 types 34/35 remain raw because the public ISFF chapter does not specify their
-layout.
+layout. A display header whose attribute pointer does not land inside the record
+(seen in vendor element type 56 blocks from real designs) no longer fails the
+whole file: the element keeps its geometry and simply carries no linkages.
 
 The high-level `read()`/`readfile()` API deliberately rejects V7 3D files.
 `scan_records()` and `inspect_headers()` still support bounded inspection of

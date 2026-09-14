@@ -130,9 +130,36 @@ pub const fn element_type_has_common_header(element_type: u8) -> bool {
 }
 
 /// Decodes the standard range/display header when the element type has one.
+///
+/// An attribute pointer that does not land inside the record is an error here;
+/// document readers that prefer to keep going use
+/// [`decode_common_header_lenient`].
 pub fn decode_common_header(
     record: RawElementRef<'_>,
     dimension: V7Dimension,
+) -> Result<Option<CommonElementHeader>, DgnError> {
+    decode_common_header_impl(record, dimension, true)
+}
+
+/// Like [`decode_common_header`], but an invalid attribute pointer degrades to
+/// "no attribute linkages" instead of failing.
+///
+/// Real files contain vendor records (for example element type 56 written as a
+/// 1536-byte TCB-sized block) whose word 16 sets the attributes bit while the
+/// pointer stays 0. Failing the whole design for such a record loses every
+/// drawable element around it; the geometry words of the record itself are not
+/// affected by the pointer, so decoding continues without linkages.
+pub fn decode_common_header_lenient(
+    record: RawElementRef<'_>,
+    dimension: V7Dimension,
+) -> Result<Option<CommonElementHeader>, DgnError> {
+    decode_common_header_impl(record, dimension, false)
+}
+
+fn decode_common_header_impl(
+    record: RawElementRef<'_>,
+    dimension: V7Dimension,
+    strict_attributes: bool,
 ) -> Result<Option<CommonElementHeader>, DgnError> {
     if !element_type_has_common_header(record.header.element_type) {
         return Ok(None);
@@ -174,14 +201,18 @@ pub fn decode_common_header(
     let (attribute_offset, attribute_length) = if properties.has_attributes {
         let offset = 32 + usize::from(attribute_index) * 2;
         if !(COMMON_HEADER_SIZE..record.bytes.len()).contains(&offset) {
-            return Err(DgnError::InvalidAttributeOffset {
-                offset: record.offset,
-                element_type: record.header.element_type,
-                attribute_offset: offset,
-                record_size: record.bytes.len(),
-            });
+            if strict_attributes {
+                return Err(DgnError::InvalidAttributeOffset {
+                    offset: record.offset,
+                    element_type: record.header.element_type,
+                    attribute_offset: offset,
+                    record_size: record.bytes.len(),
+                });
+            }
+            (None, 0)
+        } else {
+            (Some(offset), record.bytes.len() - offset)
         }
-        (Some(offset), record.bytes.len() - offset)
     } else {
         (None, 0)
     };

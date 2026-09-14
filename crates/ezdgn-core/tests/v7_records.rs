@@ -283,6 +283,40 @@ fn rejects_phase_two_header_inconsistencies_without_panicking() {
 }
 
 #[test]
+fn keeps_records_with_invalid_attribute_pointers_instead_of_failing_the_design() {
+    // 本番の実ファイル: 型56・1536バイトのベンダ記録が属性ビット(0x0800)付きでポインタ0だった。
+    // 以前は "invalid attribute offset 32 for a 1536-byte record" でファイル全体が読めなかった
+    let mut vendor = synthetic_record(56, 0, &[0; 1500], false, &[]);
+    vendor[30..32].copy_from_slice(&0_u16.to_le_bytes());
+    vendor[32..34].copy_from_slice(&0x0800_u16.to_le_bytes());
+    let line = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let data = with_synthetic_records(&[vendor, line]);
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.elements.len(), 13);
+    let vendor_element = &document.elements[11];
+    assert_eq!(vendor_element.raw.header.element_type, 56);
+    assert!(matches!(vendor_element.data, ElementData2D::Unsupported));
+    let header = vendor_element.common_header.unwrap();
+    assert!(header.properties.has_attributes);
+    assert_eq!(header.attribute_offset, None);
+    assert_eq!(header.attribute_length, 0);
+    assert!(vendor_element.linkages.is_empty());
+    assert!(matches!(document.elements[12].data, ElementData2D::Line(_)));
+
+    // 既知の型でも同じ: SHAPE のポインタを壊しても形状は残り、属性リンケージだけ無くなる
+    let mut invalid_attribute = SMALLTEST.to_vec();
+    invalid_attribute[10_278 + 30] = 0xff;
+    invalid_attribute[10_278 + 31] = 0xff;
+    let document = read_v7_2d(&invalid_attribute, ScanOptions::default()).unwrap();
+    assert_eq!(document.elements.len(), 15);
+    let shape = &document.elements[13];
+    assert!(matches!(shape.data, ElementData2D::Shape(_)));
+    assert_eq!(shape.common_header.unwrap().attribute_offset, None);
+    assert!(shape.linkages.is_empty());
+    // 低レベルの厳格API(decode_common_header)は従来どおりエラーを返す(上のテスト)
+}
+
+#[test]
 fn decodes_smalltest_phase_three_primitives_exactly() {
     let document = read_v7_2d(SMALLTEST, ScanOptions::default()).unwrap();
     assert_eq!(document.elements.len(), 15);

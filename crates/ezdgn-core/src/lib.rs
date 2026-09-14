@@ -20,8 +20,8 @@ mod v8;
 mod writer;
 
 pub use common::{
-    decode_common_header, element_type_has_common_header, CommonElementHeader, ElementProperties,
-    ElementRange, ElementSymbology, MasterElementRange,
+    decode_common_header, decode_common_header_lenient, element_type_has_common_header,
+    CommonElementHeader, ElementProperties, ElementRange, ElementSymbology, MasterElementRange,
 };
 pub use entities::{
     read_v7_2d, Arc2D, BSplineCurve2D, BSplineKnot2D, BSplinePole2D, BSplineSurface2D,

@@ -217,6 +217,21 @@ def test_high_level_reader_rejects_unsupported_dimensions_and_bad_entities() -> 
         ezdgn.read(_with_phase_three_records(_record(4, 2, invalid_body)))
 
 
+def test_keeps_records_with_invalid_attribute_pointers() -> None:
+    # 本番の実ファイル: 型56・1536バイトのベンダ記録が属性ビット付きでポインタ0だった。
+    # 以前は "invalid attribute offset" でファイル全体が読めなかった
+    vendor = bytearray(_record(56, 0, bytes(1500)))
+    vendor[30:32] = (0).to_bytes(2, "little")
+    vendor[32:34] = (0x0800).to_bytes(2, "little")
+    line = _record(3, 2, bytes(16))
+    drawing = ezdgn.read(_with_phase_three_records(bytes(vendor), line))
+
+    assert [entity.kind for entity in drawing.entities] == ["LINE"]
+    assert drawing.elements[11].record.element_type == 56
+    assert isinstance(drawing.elements[11], ezdgn.UnsupportedElement)
+    assert len(drawing.elements) == 13
+
+
 def test_last_color_table_is_active_for_all_entity_styles() -> None:
     first = _color_table_body((1, 2, 3))
     last = _color_table_body((30, 20, 10))

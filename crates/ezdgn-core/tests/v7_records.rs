@@ -498,6 +498,78 @@ fn restores_nested_phase_four_hierarchy_from_declared_word_ranges() {
 }
 
 #[test]
+fn splits_text_nodes_that_store_their_strings_inside_the_node_record() {
+    // 本番の実ファイル3件: テキストノードの words-to-follow が複合グループ全体を覆い、
+    // 文字列(型17・複合ビット付き)がノードのレコード内に入っていた。以前は
+    // "declares 2 direct components, but 0 records were found" でファイル全体が読めなかった
+    let mut first_body = vec![0; 24 + 2];
+    first_body[22] = 2; // 文字数
+    first_body[24..26].copy_from_slice(b"AB");
+    let first = synthetic_record(17, 2, &first_body, true, &[]);
+    let mut second_body = vec![0; 24 + 4];
+    second_body[22] = 3;
+    second_body[24..27].copy_from_slice(b"CDE");
+    let second = synthetic_record(17, 2, &second_body, true, &[]);
+
+    let group_size = 70 + first.len() + second.len();
+    let mut node_body = vec![0; 34];
+    node_body[..2].copy_from_slice(&u16::try_from((group_size - 38) / 2).unwrap().to_le_bytes());
+    node_body[2..4].copy_from_slice(&2_u16.to_le_bytes());
+    let mut node = synthetic_record(7, 2, &node_body, false, &[]);
+    assert_eq!(node.len(), 70);
+    // ノードの words-to-follow を複合グループ全体にして、文字列をレコード内へ入れる
+    node.extend_from_slice(&first);
+    node.extend_from_slice(&second);
+    let words = u16::try_from(node.len() / 2 - 2).unwrap();
+    node[2..4].copy_from_slice(&words.to_le_bytes());
+    let line = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let data = with_synthetic_records(&[node.clone(), line]);
+
+    let scan = scan_records(&data, ScanOptions::default()).unwrap();
+    let node_record = scan.records[11];
+    assert_eq!(node_record.header.element_type, 7);
+    assert_eq!(node_record.bytes.len(), 70);
+    assert_eq!(node_record.header.byte_len(), node.len());
+    assert_eq!(scan.records[12].offset, node_record.offset + 70);
+    assert_eq!(scan.records[12].bytes, first.as_slice());
+    assert_eq!(scan.records[13].bytes, second.as_slice());
+    assert_eq!(scan.records[14].header.element_type, 3);
+    assert_eq!(
+        scan.records
+            .iter()
+            .map(|record| record.index)
+            .collect::<Vec<_>>(),
+        (0..scan.records.len()).collect::<Vec<_>>()
+    );
+    // レコードのバイト列は隙間も重なりもなくファイルを覆う
+    let covered: usize = scan.records.iter().map(|record| record.bytes.len()).sum();
+    assert_eq!(covered, scan.termination.offset());
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::TextNode(_)
+    ));
+    assert_eq!(document.elements[11].child_indices, [12, 13]);
+    let ElementData2D::Text(text) = &document.elements[13].data else {
+        panic!("expected the nested text string");
+    };
+    assert_eq!(text.text_bytes, b"CDE");
+    assert_eq!(document.elements[14].parent_index, None);
+
+    // 文字列数が合わない・複合ビットが無いなど曖昧な場合は分割しない(従来どおり1レコード)
+    let mut ambiguous = node;
+    ambiguous[70] &= 0x7f; // 1件目の複合ビットを落とす
+    let data = with_synthetic_records(&[ambiguous]);
+    let scan = scan_records(&data, ScanOptions::default()).unwrap();
+    assert_eq!(scan.records.len(), 12);
+    assert_eq!(
+        scan.records[11].bytes.len(),
+        scan.records[11].header.byte_len()
+    );
+}
+
+#[test]
 fn rejects_phase_four_component_count_mismatches() {
     let line = synthetic_record(3, 2, &[0; 16], true, &[]);
     let group_size = 48 + line.len();

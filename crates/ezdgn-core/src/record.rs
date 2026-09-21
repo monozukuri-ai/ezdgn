@@ -1,10 +1,14 @@
 use std::iter::FusedIterator;
 
 use crate::io::ByteCursor;
-use crate::{detect_format, DgnError, DgnFormat, ScanOptions};
+use crate::{detect_format, DgnError, DgnFormat, ScanOptions, V7Dimension};
 
 const RECORD_HEADER_SIZE: usize = 4;
 const END_MARKER: [u8; 2] = [0xff, 0xff];
+const TEXT_NODE_TYPE: u8 = 7;
+const TEXT_TYPE: u8 = 17;
+/// Smallest record that still carries the 18-word display header.
+const MIN_COMPONENT_SIZE: usize = 36;
 
 /// Decoded four-byte header shared by all V7 element records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +42,13 @@ impl RawElementHeader {
 }
 
 /// Borrowed raw record yielded by [`V7RecordIter`].
+///
+/// `bytes` normally spans `header.byte_len()` bytes. The one exception is a
+/// text node whose writer stored the text strings *inside* the node record
+/// (its words-to-follow covers the whole complex group): the scanner yields
+/// the node with `bytes` cut at the end of the node header and then yields
+/// the nested text records as ordinary records, so `bytes` of consecutive
+/// records still tile the file without gaps or overlaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawElementRef<'a> {
     pub index: usize,
@@ -100,6 +111,9 @@ pub struct V7RecordIter<'a> {
     record_index: usize,
     finished: bool,
     termination: Option<RecordStreamEnd>,
+    /// Text records nested in the previously yielded text node:
+    /// (absolute offset of the next nested record, remaining nested bytes).
+    nested: Option<(usize, &'a [u8])>,
 }
 
 impl<'a> V7RecordIter<'a> {
@@ -124,6 +138,7 @@ impl<'a> V7RecordIter<'a> {
             record_index: 0,
             finished: false,
             termination: None,
+            nested: None,
         })
     }
 
@@ -154,6 +169,29 @@ impl<'a> Iterator for V7RecordIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
+        }
+
+        if let Some((offset, rest)) = self.nested.take() {
+            if self.record_index >= self.options.max_records {
+                return self.finish_with_error(DgnError::RecordLimitExceeded {
+                    offset,
+                    limit: self.options.max_records,
+                });
+            }
+            // `nested_text_node_header_len` proved that `rest` tiles exactly.
+            let header = RawElementHeader::decode(rest);
+            let (bytes, remaining) = rest.split_at(header.byte_len());
+            if !remaining.is_empty() {
+                self.nested = Some((offset + bytes.len(), remaining));
+            }
+            let record = RawElementRef {
+                index: self.record_index,
+                offset,
+                header,
+                bytes,
+            };
+            self.record_index += 1;
+            return Some(Ok(record));
         }
 
         let offset = self.cursor.position();
@@ -211,10 +249,15 @@ impl<'a> Iterator for V7RecordIter<'a> {
             });
         }
 
-        let bytes = match self.cursor.read_exact(byte_len, "record body") {
+        let mut bytes = match self.cursor.read_exact(byte_len, "record body") {
             Ok(bytes) => bytes,
             Err(error) => return self.finish_with_error(error),
         };
+        if let Some(header_len) = nested_text_node_header_len(bytes, header, self.format) {
+            let (node, components) = bytes.split_at(header_len);
+            bytes = node;
+            self.nested = Some((offset + header_len, components));
+        }
         let record = RawElementRef {
             index: self.record_index,
             offset,
@@ -227,6 +270,58 @@ impl<'a> Iterator for V7RecordIter<'a> {
 }
 
 impl FusedIterator for V7RecordIter<'_> {}
+
+/// Detects a text node whose text strings are stored inside the node record.
+///
+/// Some writers set the node's words-to-follow to the length of the whole
+/// complex group instead of the node header, so the component text records
+/// never appear as records of their own and the node looks like it declares
+/// strings that do not exist. The variant is accepted only when it is
+/// unambiguous: the node's description ends exactly at the end of its record
+/// and the bytes after the fixed node header tile into exactly the declared
+/// number of text records that carry the complex-component bit.
+fn nested_text_node_header_len(
+    bytes: &[u8],
+    header: RawElementHeader,
+    format: DgnFormat,
+) -> Option<usize> {
+    if header.element_type != TEXT_NODE_TYPE {
+        return None;
+    }
+    let header_len = match format.dimension()? {
+        V7Dimension::Two => 70,
+        V7Dimension::Three => 86,
+    };
+    if bytes.len() < header_len + MIN_COMPONENT_SIZE {
+        return None;
+    }
+    let total_words = usize::from(u16::from_le_bytes([bytes[36], bytes[37]]));
+    let declared_strings = usize::from(u16::from_le_bytes([bytes[38], bytes[39]]));
+    if declared_strings == 0 || 38 + total_words * 2 != bytes.len() {
+        return None;
+    }
+
+    let mut position = header_len;
+    let mut strings = 0_usize;
+    while position < bytes.len() {
+        let rest = &bytes[position..];
+        if rest.len() < RECORD_HEADER_SIZE {
+            return None;
+        }
+        let component = RawElementHeader::decode(rest);
+        let component_len = component.byte_len();
+        if component.element_type != TEXT_TYPE
+            || !component.complex_component
+            || component_len < MIN_COMPONENT_SIZE
+            || component_len > rest.len()
+        {
+            return None;
+        }
+        position += component_len;
+        strings += 1;
+    }
+    (strings == declared_strings).then_some(header_len)
+}
 
 /// Fully collected zero-copy view of a V7 record stream.
 #[derive(Debug)]

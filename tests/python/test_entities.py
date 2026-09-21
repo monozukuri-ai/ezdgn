@@ -232,6 +232,34 @@ def test_keeps_records_with_invalid_attribute_pointers() -> None:
     assert len(drawing.elements) == 13
 
 
+def test_reads_text_nodes_that_store_their_strings_inside_the_node_record() -> None:
+    # 本番の実ファイル3件: テキストノードの words-to-follow が複合グループ全体を覆い、文字列が
+    # ノードのレコード内に入っていた。以前は "declares 2 direct components, but 0 records
+    # were found" でファイル全体が読めなかった
+    def text(value: bytes) -> bytes:
+        body = bytearray(24 + len(value) + len(value) % 2)
+        body[22] = len(value)
+        body[24 : 24 + len(value)] = value
+        return _record(17, 2, body, complex=True)
+
+    strings = text(b"AB") + text(b"CDE")
+    node_body = bytearray(34)
+    node_body[0:2] = ((70 + len(strings) - 38) // 2).to_bytes(2, "little")
+    node_body[2:4] = (2).to_bytes(2, "little")
+    node = bytearray(_record(7, 2, node_body)) + strings
+    node[2:4] = (len(node) // 2 - 2).to_bytes(2, "little")
+
+    drawing = ezdgn.read(_with_phase_three_records(bytes(node), _record(3, 2, bytes(16))))
+
+    assert [entity.kind for entity in drawing.entities] == ["TEXT_NODE", "LINE"]
+    node_element = drawing.elements[11]
+    assert node_element.record.element_type == 7
+    assert node_element.record.size_bytes == 70
+    assert [drawing.elements[index].record.element_type for index in (12, 13, 14)] == [17, 17, 3]
+    assert drawing.elements[12].record.offset == node_element.record.offset + 70
+    assert len(drawing.elements) == 15
+
+
 def test_last_color_table_is_active_for_all_entity_styles() -> None:
     first = _color_table_body((1, 2, 3))
     last = _color_table_body((30, 20, 10))

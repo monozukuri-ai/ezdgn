@@ -1,8 +1,8 @@
 use ezdgn_core::{
-    decode_common_header, decode_design_settings, detect_format, inspect_v8_container, read_v7_2d,
-    scan_records, write_v7_2d, DgnError, DgnFormat, ElementData2D, Point2, RawPoint,
-    RecordStreamEnd, ScanOptions, V7Dimension, V7ElementStyle, V7WriteOptions, V8CfbEntryKind,
-    WritableElement2D, DEFAULT_MAX_CFB_ENTRIES,
+    decode_common_header, decode_design_settings, detect_format, encode_vax_d_f64,
+    inspect_v8_container, read_v7_2d, scan_records, write_v7_2d, DgnError, DgnFormat,
+    ElementData2D, Point2, RawPoint, RecordStreamEnd, ScanOptions, V7Dimension, V7ElementStyle,
+    V7WriteOptions, V8CfbEntryKind, WritableElement2D, DEFAULT_MAX_CFB_ENTRIES,
 };
 
 const SMALLTEST: &[u8] = include_bytes!("../../../tests/data/dgn/v7/smalltest.dgn");
@@ -427,13 +427,15 @@ fn decodes_smalltest_phase_three_primitives_exactly() {
 }
 
 #[test]
-fn phase_three_rejects_3d_but_keeps_zero_scale_unknown_records() {
-    assert!(matches!(
-        read_v7_2d(SEED_3D, ScanOptions::default()),
-        Err(DgnError::UnsupportedDimension {
-            dimension: V7Dimension::Three,
-        })
-    ));
+fn phase_three_reads_3d_seeds_and_keeps_zero_scale_unknown_records() {
+    // 3D 設計ファイルは拒否せず、XY 平面へ投影して読む(本番で 3D の V7 が 4 件落ちていた)
+    let seed = read_v7_2d(SEED_3D, ScanOptions::default()).unwrap();
+    assert_eq!(seed.settings.dimension, V7Dimension::Three);
+    assert_eq!(seed.elements.len(), 3);
+    assert!(seed
+        .elements
+        .iter()
+        .all(|element| !element.data.is_graphic()));
 
     let knot = read_v7_2d(KNOT_OOB, ScanOptions::default()).unwrap();
     assert_eq!(knot.elements.len(), 2);
@@ -443,6 +445,233 @@ fn phase_three_rejects_3d_but_keeps_zero_scale_unknown_records() {
     assert_eq!(values.values_raw, [0]);
     assert_eq!(values.values, [0.0]);
     assert_eq!(knot.elements[1].raw.bytes, &KNOT_OOB[1536..1576]);
+}
+
+#[test]
+fn projects_3d_elements_onto_the_xy_plane() {
+    // 3D の要素レイアウト(座標 3 長語、向きは四元数)を 2D オブジェクトモデルへ投影する。
+    // 四元数は (w, x, y, z)・2^31 スケール、要素のローカル軸は回転行列の「行」
+    fn me(value: i32) -> [u8; 4] {
+        let mut out = [0u8; 4];
+        put_middle_i32(&mut out, 0, value);
+        out
+    }
+    fn quat(w: f64, x: f64, y: f64, z: f64) -> Vec<u8> {
+        [w, x, y, z]
+            .iter()
+            .flat_map(|c| me((c * 2_147_483_647.0).round() as i32))
+            .collect()
+    }
+    fn vax(value: f64) -> [u8; 8] {
+        encode_vax_d_f64(value)
+    }
+    let body = |parts: &[&[u8]]| parts.concat();
+    let angle = |degrees: f64| (degrees * 360_000.0).round() as i32;
+    let z90 = quat(45f64.to_radians().cos(), 0.0, 0.0, 45f64.to_radians().sin());
+    let x60 = quat(30f64.to_radians().cos(), 30f64.to_radians().sin(), 0.0, 0.0);
+    let identity = quat(1.0, 0.0, 0.0, 0.0);
+    let x180 = quat(0.0, 1.0, 0.0, 0.0);
+
+    let line = synthetic_record(
+        3,
+        2,
+        &body(&[&me(10), &me(20), &me(30), &me(40), &me(50), &me(60)]),
+        false,
+        &[],
+    );
+    let mut vertices = 3u16.to_le_bytes().to_vec();
+    for v in [0, 0, 7, 100, 0, 7, 100, 100, 7] {
+        vertices.extend_from_slice(&me(v));
+    }
+    let line_string = synthetic_record(4, 2, &vertices, false, &[]);
+    // 3D 文字: font/just、長さ・高さ倍率、四元数、原点 xyz、文字数、編集フィールド、文字列
+    let text = synthetic_record(
+        17,
+        2,
+        &body(&[
+            &[3, 0],
+            &me(100_000),
+            &me(100_000),
+            &z90,
+            &me(5),
+            &me(6),
+            &me(7),
+            &[2, 0],
+            b"AB",
+        ]),
+        false,
+        &[],
+    );
+    // 楕円(4×2)を Z 軸まわりに回した向き: 長軸は ±Y
+    let ellipse_z = synthetic_record(
+        15,
+        2,
+        &body(&[&vax(4.0), &vax(2.0), &z90, &vax(1.0), &vax(2.0), &vax(3.0)]),
+        false,
+        &[],
+    );
+    // 半径 4 の円を X 軸まわりに 60 度傾けた向き: 投影は 4×2 の楕円(長軸 X)
+    let ellipse_tilted = synthetic_record(
+        15,
+        2,
+        &body(&[&vax(4.0), &vax(4.0), &x60, &vax(0.0), &vax(0.0), &vax(0.0)]),
+        false,
+        &[],
+    );
+    // 半径 4 の円を X 軸まわりに 90 度傾けた向き(辺から見る): 長軸 4 の線分状の楕円
+    let x90 = quat(45f64.to_radians().cos(), 45f64.to_radians().sin(), 0.0, 0.0);
+    let ellipse_edge_on = synthetic_record(
+        15,
+        2,
+        &body(&[&vax(4.0), &vax(4.0), &x90, &vax(0.0), &vax(0.0), &vax(0.0)]),
+        false,
+        &[],
+    );
+    // 円弧(半径 5、30 度から 90 度掃引)、向きは単位四元数: そのまま
+    let arc_plain = synthetic_record(
+        16,
+        2,
+        &body(&[
+            &me(angle(30.0)),
+            &me(angle(90.0)),
+            &vax(5.0),
+            &vax(5.0),
+            &identity,
+            &vax(10.0),
+            &vax(20.0),
+            &vax(30.0),
+        ]),
+        false,
+        &[],
+    );
+    // 同じ円弧を X 軸まわりに 180 度回した向き(裏返し): 始角 330 度・掃引 -90 度
+    let arc_mirrored = synthetic_record(
+        16,
+        2,
+        &body(&[
+            &me(angle(30.0)),
+            &me(angle(90.0)),
+            &vax(5.0),
+            &vax(5.0),
+            &x180,
+            &vax(0.0),
+            &vax(0.0),
+            &vax(0.0),
+        ]),
+        false,
+        &[],
+    );
+    // 3D セルヘッダ(124 バイト): 範囲 2×3 長語、3×3 行列(単位行列)、原点 xyz。成分は 3D 線分
+    let cell_line = synthetic_record(
+        3,
+        2,
+        &body(&[&me(1), &me(2), &me(3), &me(4), &me(5), &me(6)]),
+        true,
+        &[],
+    );
+    let total_words = u16::try_from((124 + cell_line.len() - 38) / 2).unwrap();
+    let unit = 214_748; // 1.0 in CELL_MATRIX_UNIT
+    let mut cell_body = Vec::new();
+    cell_body.extend_from_slice(&total_words.to_le_bytes());
+    cell_body.extend_from_slice(&[0u8; 14]); // name(4) class(2) levels(8)
+    for v in [0, 0, 0, 0, 0, 0] {
+        cell_body.extend_from_slice(&me(v));
+    }
+    for v in [unit, 0, 0, 0, unit, 0, 0, 0, unit] {
+        cell_body.extend_from_slice(&me(v));
+    }
+    for v in [7, 8, 9] {
+        cell_body.extend_from_slice(&me(v));
+    }
+    let cell = synthetic_record(2, 2, &cell_body, false, &[]);
+    assert_eq!(cell.len(), 124);
+
+    let mut data = SEED_3D.to_vec();
+    for record in [
+        &line,
+        &line_string,
+        &text,
+        &ellipse_z,
+        &ellipse_tilted,
+        &ellipse_edge_on,
+        &arc_plain,
+        &arc_mirrored,
+        &cell,
+        &cell_line,
+    ] {
+        data.extend_from_slice(record);
+    }
+    data.extend_from_slice(&[0xff, 0xff]);
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.settings.dimension, V7Dimension::Three);
+    assert_eq!(document.elements.len(), 13);
+    let ElementData2D::Ellipse(edge_on) = &document.elements[8].data else {
+        panic!("expected an edge-on circle");
+    };
+    assert_near(edge_on.primary_axis_uor, 4.0);
+    assert!(edge_on.secondary_axis_uor > 0.0 && edge_on.secondary_axis_uor < 1.0e-6);
+    assert_near(edge_on.rotation_degrees, 0.0);
+
+    let ElementData2D::Line(line) = &document.elements[3].data else {
+        panic!("expected a projected line");
+    };
+    assert_eq!((line.start_uor.x, line.start_uor.y), (10, 20));
+    assert_eq!((line.end_uor.x, line.end_uor.y), (40, 50));
+    let ElementData2D::LineString(line_string) = &document.elements[4].data else {
+        panic!("expected a projected line string");
+    };
+    assert_eq!(
+        line_string
+            .vertices_uor
+            .iter()
+            .map(|v| (v.x, v.y))
+            .collect::<Vec<_>>(),
+        [(0, 0), (100, 0), (100, 100)]
+    );
+    let ElementData2D::Text(text) = &document.elements[5].data else {
+        panic!("expected a projected text");
+    };
+    assert_eq!(text.text_bytes, b"AB");
+    assert_eq!((text.origin_uor.x, text.origin_uor.y), (5, 6));
+    assert_eq!(text.font_id, 3);
+    assert_near(text.rotation_degrees, -90.0);
+    let ElementData2D::Ellipse(ellipse) = &document.elements[6].data else {
+        panic!("expected a projected ellipse");
+    };
+    assert_near(ellipse.primary_axis_uor, 4.0);
+    assert_near(ellipse.secondary_axis_uor, 2.0);
+    assert_near(ellipse.rotation_degrees.abs(), 90.0);
+    assert_near(ellipse.center_uor.x, 1.0);
+    assert_near(ellipse.center_uor.y, 2.0);
+    let ElementData2D::Ellipse(tilted) = &document.elements[7].data else {
+        panic!("expected a projected tilted circle");
+    };
+    assert_near(tilted.primary_axis_uor, 4.0);
+    assert_near(tilted.secondary_axis_uor, 2.0);
+    assert_near(tilted.rotation_degrees, 0.0);
+    let ElementData2D::Arc(arc) = &document.elements[9].data else {
+        panic!("expected a projected arc");
+    };
+    assert_near(arc.primary_axis_uor, 5.0);
+    assert_near(arc.secondary_axis_uor, 5.0);
+    assert_near(arc.rotation_degrees, 0.0);
+    assert_near(arc.start_angle_degrees, 30.0);
+    assert_near(arc.sweep_angle_degrees, 90.0);
+    assert_near(arc.center_uor.x, 10.0);
+    assert_near(arc.center_uor.y, 20.0);
+    let ElementData2D::Arc(mirrored) = &document.elements[10].data else {
+        panic!("expected a mirrored arc");
+    };
+    assert_near(mirrored.start_angle_degrees, 330.0);
+    assert_near(mirrored.sweep_angle_degrees, -90.0);
+    let ElementData2D::Cell(cell) = &document.elements[11].data else {
+        panic!("expected a projected cell header");
+    };
+    assert_eq!((cell.origin_uor.x, cell.origin_uor.y), (7, 8));
+    assert!((cell.transform[0][0] - 1.0).abs() < 1.0e-4);
+    assert_eq!(cell.transform[0][1], 0.0);
+    assert_eq!(document.elements[11].child_indices, [12]);
+    assert!(matches!(document.elements[12].data, ElementData2D::Line(_)));
 }
 
 #[test]
@@ -887,4 +1116,12 @@ fn put_middle_i32(bytes: &mut [u8], offset: usize, value: i32) {
         value as u8,
         (value >> 8) as u8,
     ]);
+}
+
+/// 四元数は 2^31 スケールの整数なので、投影した値は 1e-9 より粗い丸めを持つ
+fn assert_near(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-6,
+        "expected {expected}, got {actual}"
+    );
 }

@@ -203,9 +203,34 @@ def test_decodes_line_string_arc_color_table_and_resolves_style() -> None:
     assert arc.style.rgb == (10, 20, 30)
 
 
-def test_high_level_reader_rejects_unsupported_dimensions_and_bad_entities() -> None:
-    with pytest.raises(ezdgn.UnsupportedDgnError, match="3D geometry"):
-        ezdgn.readfile(SEED_3D)
+def test_three_dimensional_designs_are_projected_onto_xy() -> None:
+    # 本番の V7 3D 図面 4 件が「2D 読み取り専用」で丸ごと落ちていた。3D は Z を落として読む
+    seed = ezdgn.readfile(SEED_3D)
+    assert seed.design_settings.dimension == 3
+    assert list(seed.entities) == []
+
+    def middle_endian(value: int) -> bytes:
+        raw = (value & 0xFFFFFFFF).to_bytes(4, "little")
+        return raw[2:4] + raw[0:2]
+
+    # 3D の線分: 始点・終点とも 3 長語(12 バイト)。Z(30/60)は捨てられる
+    line = _record(3, 2, b"".join(middle_endian(v) for v in (10, 20, 30, 40, 50, 60)))
+    # 3D の折線: 頂点数 + 12 バイト刻みの頂点
+    points = (0, 0, 7, 100, 0, 7, 100, 100, 7)
+    line_string = _record(4, 2, (3).to_bytes(2, "little") + b"".join(middle_endian(v) for v in points))
+    data = SEED_3D.read_bytes() + line + line_string + b"\xff\xff"
+
+    drawing = ezdgn.read(data)
+    assert drawing.design_settings.dimension == 3
+    kinds = [entity.kind for entity in drawing.entities]
+    assert kinds == ["LINE", "LINE_STRING"]
+    first, second = drawing.entities
+    assert tuple(first.start_uor) == (10, 20)
+    assert tuple(first.end_uor) == (40, 50)
+    assert [tuple(v) for v in second.vertices_uor] == [(0, 0), (100, 0), (100, 100)]
+
+
+def test_high_level_reader_rejects_limits_and_bad_entities() -> None:
     with pytest.raises(ezdgn.DgnLimitError, match="record count"):
         ezdgn.readfile(SMALLTEST, max_records=1)
     with pytest.raises(TypeError, match="filesystem path"):
@@ -520,7 +545,7 @@ def test_decodes_text_node_and_bspline_groups_in_fixed_component_order() -> None
     assert parsed_weight.values == pytest.approx((1, 1, 1, 1))
 
 
-def test_rejects_complex_count_and_bspline_order_mismatches() -> None:
+def test_rejects_complex_count_and_demotes_bspline_order_mismatches() -> None:
     line = _record(3, 2, bytes(16), complex=True)
     group_size = 48 + len(line)
     header_body = bytearray(4)
@@ -537,8 +562,10 @@ def test_rejects_complex_count_and_bspline_order_mismatches() -> None:
     spline_body[4] = 0x40  # rational, but no weight follows
     spline_body[6:8] = (2).to_bytes(2, "little")
     spline = _record(27, 2, spline_body)
-    with pytest.raises(ezdgn.InvalidDgnError, match="missing rational weight"):
-        ezdgn.read(_with_phase_three_records(spline, pole))
+    # 成分の合わない B-spline ヘッダはファイル全体を落とさず、ヘッダだけ Unsupported に降格する
+    drawing = ezdgn.read(_with_phase_three_records(spline, pole))
+    assert isinstance(drawing.elements[11], ezdgn.UnsupportedElement)
+    assert drawing.elements[11].record.element_type == 27
 
 
 def test_decodes_trimmed_bspline_surface_without_stroking_it() -> None:

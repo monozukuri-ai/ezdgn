@@ -125,7 +125,18 @@ layout. A display header whose attribute pointer does not land inside the record
 whole file: the element keeps its geometry and simply carries no linkages. Text
 nodes whose writer stored the text strings inside the node record (the node's
 words-to-follow spans the whole complex group) are split by the record scanner
-into the node header followed by ordinary text records.
+into the node header followed by ordinary text records. B-spline headers whose
+components do not match the header are kept as raw records instead of rejecting
+the design.
+
+3D V7 designs are read into the same 2D model by projecting onto the XY plane:
+coordinates drop Z, and elements that carry an orientation quaternion (text,
+text nodes, ellipses, arcs, cells) are rewritten as the equivalent 2D element
+seen from above — a tilted circle becomes an ellipse with the correct principal
+axes, and arc start/sweep angles are remapped into that ellipse's parameter
+space. `DesignSettings.dimension` still reports 3, so consumers can flag the
+projection. Shared cells and high-precision linkages are not decoded for 3D
+designs yet.
 
 The high-level `read()`/`readfile()` API deliberately rejects V7 3D files.
 `scan_records()` and `inspect_headers()` still support bounded inspection of

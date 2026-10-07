@@ -442,11 +442,10 @@ impl V7Document2D<'_> {
 pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>, DgnError> {
     let scan = scan_records(input, options)?;
     let settings = decode_design_settings(&scan)?;
-    if settings.dimension != V7Dimension::Two {
-        return Err(DgnError::UnsupportedDimension {
-            dimension: settings.dimension,
-        });
-    }
+    // 3D 設計ファイルも同じ 2D オブジェクトモデルに読む: 座標は Z を落として XY 平面へ
+    // 投影し、四元数で向きを持つ要素(文字・楕円・円弧・セル)は XY 平面上の等価な
+    // 2D パラメータに直す(本番の V7 3D 図面 4 件が「2D 読み取り専用」で丸ごと落ちていた)。
+    // 投影であることは DesignSettings::dimension(=Three) で利用側が判別できる
 
     let mut elements = Vec::with_capacity(scan.records.len());
     let mut active_color_table = None;
@@ -469,7 +468,7 @@ pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>
         });
     }
     build_hierarchy(&mut elements, scan.termination.offset())?;
-    validate_bspline_groups(&elements)?;
+    demote_invalid_bspline_groups(&mut elements);
 
     Ok(V7Document2D {
         scan,
@@ -577,21 +576,37 @@ fn decode_cell(
     common_header: Option<CommonElementHeader>,
     settings: DesignSettings,
 ) -> Result<CellHeader2D, DgnError> {
-    require_data_size(record, common_header, 92, "2D cell header")?;
+    // 2D: 範囲 2 点(各 2 長語)・2x2 行列・原点 → 92 バイト。
+    // 3D: 範囲 2 点(各 3 長語)・3x3 行列・原点(3 長語) → 124 バイト。XY 平面への投影では
+    // 3x3 の左上 2x2 と原点の XY を使う(セル内容の Z 成分による寄与は落ちる)
+    let three = settings.dimension == V7Dimension::Three;
+    require_data_size(
+        record,
+        common_header,
+        if three { 124 } else { 92 },
+        "cell header",
+    )?;
     let name_words = [read_u16(record.bytes, 38), read_u16(record.bytes, 40)];
+    let stride = point_bytes(settings.dimension);
     let range_low_uor = read_point_i32(record.bytes, 52);
-    let range_high_uor = read_point_i32(record.bytes, 60);
+    let range_high_uor = read_point_i32(record.bytes, 52 + stride);
+    let matrix = 52 + 2 * stride;
+    let (row0, row1) = if three {
+        (matrix, matrix + 12)
+    } else {
+        (matrix, matrix + 8)
+    };
     let transform_raw = [
         [
-            decode_middle_endian_i32(read_four(record.bytes, 68)),
-            decode_middle_endian_i32(read_four(record.bytes, 72)),
+            decode_middle_endian_i32(read_four(record.bytes, row0)),
+            decode_middle_endian_i32(read_four(record.bytes, row0 + 4)),
         ],
         [
-            decode_middle_endian_i32(read_four(record.bytes, 76)),
-            decode_middle_endian_i32(read_four(record.bytes, 80)),
+            decode_middle_endian_i32(read_four(record.bytes, row1)),
+            decode_middle_endian_i32(read_four(record.bytes, row1 + 4)),
         ],
     ];
-    let origin_uor = read_point_i32(record.bytes, 84);
+    let origin_uor = read_point_i32(record.bytes, matrix + if three { 36 } else { 16 });
     Ok(CellHeader2D {
         total_length_words: read_u16(record.bytes, 36),
         name_words,
@@ -670,7 +685,8 @@ fn decode_shared_cell_definition(
     settings: DesignSettings,
 ) -> Option<SharedCellDefinition2D> {
     let bytes = record.bytes;
-    if bytes.len() < SHARED_CELL_NAME_OFFSET {
+    // 固定レイアウトは 2D ファイルで観測したもの。3D は未確認なので Unsupported に留める
+    if settings.dimension != V7Dimension::Two || bytes.len() < SHARED_CELL_NAME_OFFSET {
         return None;
     }
     // 範囲はセル原点まわりの3次元トリプレット(2Dファイルでもz=0が入る)
@@ -694,7 +710,7 @@ fn decode_shared_cell_instance(
     settings: DesignSettings,
 ) -> Option<SharedCellInstance2D> {
     let bytes = record.bytes;
-    if bytes.len() < SHARED_CELL_NAME_OFFSET {
+    if settings.dimension != V7Dimension::Two || bytes.len() < SHARED_CELL_NAME_OFFSET {
         return None;
     }
     let name = shared_cell_name(bytes)?;
@@ -716,10 +732,14 @@ fn decode_line(
     linkages: &[AttributeLinkage<'_>],
     settings: DesignSettings,
 ) -> Result<Line2D, DgnError> {
-    require_data_size(record, common_header, 52, "2D line coordinates")?;
+    let stride = point_bytes(settings.dimension);
+    require_data_size(record, common_header, 36 + 2 * stride, "line coordinates")?;
     let start_uor = read_point_i32(record.bytes, 36);
-    let end_uor = read_point_i32(record.bytes, 44);
-    let precise = precise_points(&[start_uor, end_uor], linkages);
+    let end_uor = read_point_i32(record.bytes, 36 + stride);
+    let precise = precise_points(
+        &[start_uor, end_uor],
+        precision_linkages(linkages, settings),
+    );
     Ok(Line2D {
         start_uor,
         end_uor,
@@ -737,7 +757,7 @@ fn decode_vertices(
     settings: DesignSettings,
     minimum: usize,
 ) -> Result<VertexCoordinates, DgnError> {
-    require_data_size(record, common_header, 38, "2D vertex count")?;
+    require_data_size(record, common_header, 38, "vertex count")?;
     let count = usize::from(read_u16(record.bytes, 36));
     if count < minimum {
         return Err(DgnError::InvalidVertexCount {
@@ -747,12 +767,14 @@ fn decode_vertices(
             minimum,
         });
     }
-    let needed = checked_variable_end(record, 38, count, 8, "2D vertices")?;
-    require_data_size(record, common_header, needed, "2D vertices")?;
+    let stride = point_bytes(settings.dimension);
+    let needed = checked_variable_end(record, 38, count, stride, "vertices")?;
+    require_data_size(record, common_header, needed, "vertices")?;
     let vertices_uor = (0..count)
-        .map(|index| read_point_i32(record.bytes, 38 + index * 8))
+        .map(|index| read_point_i32(record.bytes, 38 + index * stride))
         .collect::<Vec<_>>();
-    let vertices_uor_precise = precise_points(&vertices_uor, linkages);
+    let vertices_uor_precise =
+        precise_points(&vertices_uor, precision_linkages(linkages, settings));
     let vertices_master = vertices_uor_precise
         .iter()
         .copied()
@@ -766,12 +788,24 @@ fn decode_text_node(
     common_header: Option<CommonElementHeader>,
     settings: DesignSettings,
 ) -> Result<TextNode2D, DgnError> {
-    require_data_size(record, common_header, 70, "2D text node header")?;
+    let three = settings.dimension == V7Dimension::Three;
+    require_data_size(
+        record,
+        common_header,
+        if three { 86 } else { 70 },
+        "text node header",
+    )?;
     let line_spacing_raw = decode_middle_endian_i32(read_four(record.bytes, 46));
     let length_multiplier_raw = decode_middle_endian_i32(read_four(record.bytes, 50));
     let height_multiplier_raw = decode_middle_endian_i32(read_four(record.bytes, 54));
-    let rotation_raw = decode_middle_endian_i32(read_four(record.bytes, 58));
-    let origin_uor = read_point_i32(record.bytes, 62);
+    // 3D は回転角の代わりに四元数(16 バイト)、原点は 3 長語
+    let (rotation_raw, rotation_degrees) = if three {
+        projected_rotation(read_orientation(record.bytes, 58))
+    } else {
+        let raw = decode_middle_endian_i32(read_four(record.bytes, 58));
+        (raw, angle_degrees(raw))
+    };
+    let origin_uor = read_point_i32(record.bytes, if three { 74 } else { 62 });
     let multiplier_scale = settings.scale().map(|scale| scale * 6.0 / 1000.0);
     Ok(TextNode2D {
         total_length_words: read_u16(record.bytes, 36),
@@ -790,7 +824,7 @@ fn decode_text_node(
         height_multiplier_master: multiplier_scale
             .map(|scale| f64::from(height_multiplier_raw) * scale),
         rotation_raw,
-        rotation_degrees: angle_degrees(rotation_raw),
+        rotation_degrees,
         origin_uor,
         origin_master: transform_integer_point(settings, origin_uor),
     })
@@ -812,13 +846,33 @@ fn decode_ellipse(
     common_header: Option<CommonElementHeader>,
     settings: DesignSettings,
 ) -> Result<Ellipse2D, DgnError> {
-    require_data_size(record, common_header, 72, "2D ellipse parameters")?;
-    let primary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 36));
-    let secondary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 44));
-    let rotation_raw = decode_middle_endian_i32(read_four(record.bytes, 52));
+    let three = settings.dimension == V7Dimension::Three;
+    require_data_size(
+        record,
+        common_header,
+        if three { 92 } else { 72 },
+        "ellipse parameters",
+    )?;
+    let mut primary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 36));
+    let mut secondary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 44));
+    // 3D: 四元数(16 バイト)で平面の向きを持つ。XY へ投影した楕円の主軸に直す
+    let (rotation_raw, rotation_degrees, center_offset) = if three {
+        let projected = project_ellipse(
+            primary_axis_uor,
+            secondary_axis_uor,
+            read_orientation(record.bytes, 52),
+        );
+        primary_axis_uor = projected.primary;
+        secondary_axis_uor = projected.secondary;
+        let (raw, degrees) = synthetic_angle(projected.rotation_degrees);
+        (raw, degrees, 68)
+    } else {
+        let raw = decode_middle_endian_i32(read_four(record.bytes, 52));
+        (raw, angle_degrees(raw), 56)
+    };
     let center_uor = Point2 {
-        x: decode_vax_d_f64(read_eight(record.bytes, 56)),
-        y: decode_vax_d_f64(read_eight(record.bytes, 64)),
+        x: decode_vax_d_f64(read_eight(record.bytes, center_offset)),
+        y: decode_vax_d_f64(read_eight(record.bytes, center_offset + 8)),
     };
     Ok(Ellipse2D {
         center_uor,
@@ -828,7 +882,7 @@ fn decode_ellipse(
         primary_axis_master: settings.transform_distance(primary_axis_uor),
         secondary_axis_master: settings.transform_distance(secondary_axis_uor),
         rotation_raw,
-        rotation_degrees: angle_degrees(rotation_raw),
+        rotation_degrees,
     })
 }
 
@@ -837,21 +891,50 @@ fn decode_arc(
     common_header: Option<CommonElementHeader>,
     settings: DesignSettings,
 ) -> Result<Arc2D, DgnError> {
-    require_data_size(record, common_header, 80, "2D arc parameters")?;
-    let start_angle_raw = decode_middle_endian_i32(read_four(record.bytes, 36));
+    let three = settings.dimension == V7Dimension::Three;
+    require_data_size(
+        record,
+        common_header,
+        if three { 100 } else { 80 },
+        "arc parameters",
+    )?;
+    let mut start_angle_raw = decode_middle_endian_i32(read_four(record.bytes, 36));
     let sweep_encoded = decode_middle_endian_u32(read_four(record.bytes, 40));
     let sweep_magnitude = (sweep_encoded & 0x7fff_ffff) as i32;
-    let sweep_angle_raw = if sweep_encoded & 0x8000_0000 != 0 {
+    let mut sweep_angle_raw = if sweep_encoded & 0x8000_0000 != 0 {
         -sweep_magnitude
     } else {
         sweep_magnitude
     };
-    let primary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 44));
-    let secondary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 52));
-    let rotation_raw = decode_middle_endian_i32(read_four(record.bytes, 60));
+    let mut primary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 44));
+    let mut secondary_axis_uor = decode_vax_d_f64(read_eight(record.bytes, 52));
+    let mut start_angle_degrees = angle_degrees(start_angle_raw);
+    let mut sweep_angle_degrees = if sweep_angle_raw == 0 {
+        360.0
+    } else {
+        angle_degrees(sweep_angle_raw)
+    };
+    let (rotation_raw, rotation_degrees, center_offset) = if three {
+        // 投影した楕円の主軸に直し、始角と掃引角もその主軸系のパラメータへ写す
+        let projected = project_ellipse(
+            primary_axis_uor,
+            secondary_axis_uor,
+            read_orientation(record.bytes, 60),
+        );
+        let (start, sweep) = projected.map_arc_degrees(start_angle_degrees, sweep_angle_degrees);
+        primary_axis_uor = projected.primary;
+        secondary_axis_uor = projected.secondary;
+        (start_angle_raw, start_angle_degrees) = synthetic_angle(start);
+        (sweep_angle_raw, sweep_angle_degrees) = synthetic_angle(sweep);
+        let (raw, degrees) = synthetic_angle(projected.rotation_degrees);
+        (raw, degrees, 76)
+    } else {
+        let raw = decode_middle_endian_i32(read_four(record.bytes, 60));
+        (raw, angle_degrees(raw), 64)
+    };
     let center_uor = Point2 {
-        x: decode_vax_d_f64(read_eight(record.bytes, 64)),
-        y: decode_vax_d_f64(read_eight(record.bytes, 72)),
+        x: decode_vax_d_f64(read_eight(record.bytes, center_offset)),
+        y: decode_vax_d_f64(read_eight(record.bytes, center_offset + 8)),
     };
     Ok(Arc2D {
         center_uor,
@@ -861,15 +944,11 @@ fn decode_arc(
         primary_axis_master: settings.transform_distance(primary_axis_uor),
         secondary_axis_master: settings.transform_distance(secondary_axis_uor),
         rotation_raw,
-        rotation_degrees: angle_degrees(rotation_raw),
+        rotation_degrees,
         start_angle_raw,
-        start_angle_degrees: angle_degrees(start_angle_raw),
+        start_angle_degrees,
         sweep_angle_raw,
-        sweep_angle_degrees: if sweep_angle_raw == 0 {
-            360.0
-        } else {
-            angle_degrees(sweep_angle_raw)
-        },
+        sweep_angle_degrees,
     })
 }
 
@@ -878,15 +957,27 @@ fn decode_text<'a>(
     common_header: Option<CommonElementHeader>,
     settings: DesignSettings,
 ) -> Result<Text2D<'a>, DgnError> {
-    require_data_size(record, common_header, 60, "2D text header")?;
+    let three = settings.dimension == V7Dimension::Three;
+    require_data_size(
+        record,
+        common_header,
+        if three { 76 } else { 60 },
+        "text header",
+    )?;
     let length_multiplier_raw = decode_middle_endian_i32(read_four(record.bytes, 38));
     let height_multiplier_raw = decode_middle_endian_i32(read_four(record.bytes, 42));
-    let rotation_raw = decode_middle_endian_i32(read_four(record.bytes, 46));
-    let origin_uor = read_point_i32(record.bytes, 50);
-    let text_length = usize::from(record.bytes[58]);
-    let text_offset = 60;
+    // 3D: 四元数(16 バイト)+原点 3 長語+文字数で 76 バイトのヘッダ
+    let (rotation_raw, rotation_degrees) = if three {
+        projected_rotation(read_orientation(record.bytes, 46))
+    } else {
+        let raw = decode_middle_endian_i32(read_four(record.bytes, 46));
+        (raw, angle_degrees(raw))
+    };
+    let origin_uor = read_point_i32(record.bytes, if three { 62 } else { 50 });
+    let text_offset = if three { 76 } else { 60 };
+    let text_length = usize::from(record.bytes[text_offset - 2]);
     let needed = text_offset + text_length;
-    require_data_size(record, common_header, needed, "2D text bytes")?;
+    require_data_size(record, common_header, needed, "text bytes")?;
     let multiplier_scale = settings.scale().map(|scale| scale * 6.0 / 1000.0);
     Ok(Text2D {
         font_id: record.bytes[36],
@@ -898,10 +989,10 @@ fn decode_text<'a>(
         height_multiplier_master: multiplier_scale
             .map(|scale| f64::from(height_multiplier_raw) * scale),
         rotation_raw,
-        rotation_degrees: angle_degrees(rotation_raw),
+        rotation_degrees,
         origin_uor,
         origin_master: transform_integer_point(settings, origin_uor),
-        editable_fields: record.bytes[59],
+        editable_fields: record.bytes[text_offset - 1],
         text_offset,
         text_bytes: &record.bytes[text_offset..needed],
     })
@@ -1237,17 +1328,30 @@ fn container_descriptor(
     }))
 }
 
-fn validate_bspline_groups(elements: &[Element2D<'_>]) -> Result<(), DgnError> {
-    for element in elements {
-        match element.data {
-            ElementData2D::BSplineCurve(curve) => validate_bspline_curve(element, curve, elements)?,
-            ElementData2D::BSplineSurface(surface) => {
-                validate_bspline_surface(element, surface, elements)?
-            }
-            _ => {}
-        }
+/// B-spline headers whose components do not match the header are kept as raw
+/// (`Unsupported`) records instead of rejecting the whole design. 3D designs
+/// carry B-spline surfaces the 2D model cannot validate meaningfully; a real
+/// 3D file had one surface with inconsistent knot counts and lost 12,000 lines.
+fn demote_invalid_bspline_groups(elements: &mut [Element2D<'_>]) {
+    let invalid = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element)| {
+            let result = match element.data {
+                ElementData2D::BSplineCurve(curve) => {
+                    validate_bspline_curve(element, curve, elements)
+                }
+                ElementData2D::BSplineSurface(surface) => {
+                    validate_bspline_surface(element, surface, elements)
+                }
+                _ => Ok(()),
+            };
+            result.is_err().then_some(index)
+        })
+        .collect::<Vec<_>>();
+    for index in invalid {
+        elements[index].data = ElementData2D::Unsupported;
     }
-    Ok(())
 }
 
 fn validate_bspline_curve(
@@ -1420,6 +1524,207 @@ fn expected_non_uniform_knots(poles: u16, order: u8, closed: bool) -> Option<usi
         return None;
     }
     Some(if closed { poles - 1 } else { poles - order })
+}
+
+/// Bytes per stored point: two or three middle-endian longs.
+const fn point_bytes(dimension: V7Dimension) -> usize {
+    match dimension {
+        V7Dimension::Two => 8,
+        V7Dimension::Three => 12,
+    }
+}
+
+/// High-precision deltas are decoded per 2D point; a 3D linkage carries three
+/// deltas per vertex, so the projection keeps the integer coordinates instead.
+fn precision_linkages<'a, 'b>(
+    linkages: &'a [AttributeLinkage<'b>],
+    settings: DesignSettings,
+) -> &'a [AttributeLinkage<'b>] {
+    match settings.dimension {
+        V7Dimension::Two => linkages,
+        V7Dimension::Three => &[],
+    }
+}
+
+/// Quaternion components of 3D elements are signed longs scaled by 2^31.
+const QUATERNION_UNIT: f64 = 2_147_483_648.0;
+
+/// Local X/Y axes of a 3D element in design space.
+///
+/// V7 stores the orientation as a quaternion `(w, x, y, z)`; the element's local
+/// axes are the *rows* of the standard rotation matrix built from it (checked
+/// against the stored ranges of 400 ellipses in a real 3D design: the row
+/// convention reproduces every range, the column convention does not).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Orientation {
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+}
+
+impl Orientation {
+    const IDENTITY: Self = Self {
+        x_axis: [1.0, 0.0, 0.0],
+        y_axis: [0.0, 1.0, 0.0],
+    };
+
+    /// Rotation of the local X axis within the XY plane, in degrees.
+    fn plane_rotation_degrees(self) -> f64 {
+        self.x_axis[1].atan2(self.x_axis[0]).to_degrees()
+    }
+}
+
+fn read_orientation(bytes: &[u8], offset: usize) -> Orientation {
+    let component = |index: usize| {
+        f64::from(decode_middle_endian_i32(read_four(
+            bytes,
+            offset + 4 * index,
+        )))
+    };
+    let (w, x, y, z) = (component(0), component(1), component(2), component(3));
+    let norm = (w * w + x * x + y * y + z * z).sqrt();
+    // 零四元数(未設定)や NaN は向き無しとみなす
+    if norm.is_nan() || norm <= QUATERNION_UNIT * 1.0e-6 {
+        return Orientation::IDENTITY;
+    }
+    let (w, x, y, z) = (w / norm, x / norm, y / norm, z / norm);
+    Orientation {
+        x_axis: [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        y_axis: [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+    }
+}
+
+/// An angle that only exists in the projection, in both the raw unit and degrees.
+fn synthetic_angle(degrees: f64) -> (i32, f64) {
+    let degrees = if degrees.is_finite() { degrees } else { 0.0 };
+    let raw = (degrees * ANGLE_UNITS_PER_DEGREE)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    (raw, degrees)
+}
+
+fn projected_rotation(orientation: Orientation) -> (i32, f64) {
+    synthetic_angle(orientation.plane_rotation_degrees())
+}
+
+/// XY projection of an ellipse that lies in a rotated plane.
+///
+/// With `u`/`v` the projected primary/secondary semi-axes (conjugate
+/// semi-diameters), the projected curve is `u cos t + v sin t`; its principal
+/// axes come from the eigen-decomposition of `[u v][u v]^T`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProjectedEllipse {
+    primary: f64,
+    secondary: f64,
+    rotation_degrees: f64,
+    u: [f64; 2],
+    v: [f64; 2],
+    major_axis: [f64; 2],
+}
+
+fn project_ellipse(primary: f64, secondary: f64, orientation: Orientation) -> ProjectedEllipse {
+    let u = [
+        primary * orientation.x_axis[0],
+        primary * orientation.x_axis[1],
+    ];
+    let v = [
+        secondary * orientation.y_axis[0],
+        secondary * orientation.y_axis[1],
+    ];
+    let a = u[0] * u[0] + v[0] * v[0];
+    let b = u[0] * u[1] + v[0] * v[1];
+    let c = u[1] * u[1] + v[1] * v[1];
+    let mean = 0.5 * (a + c);
+    let spread = (0.25 * (a - c) * (a - c) + b * b).sqrt();
+    let major = (mean + spread).max(0.0).sqrt();
+    // 平面が XY に垂直な円(配管を上から見た円など)は線分に潰れる。短軸 0 は下流で
+    // 「正の軸長」の検証に落ちるので、見た目は線分のままの極小値にする
+    let minor = (mean - spread).max(0.0).sqrt().max(major * 1.0e-9);
+    let direction = if b.abs() > 1.0e-12 * (a + c).max(1.0) {
+        [major * major - c, b]
+    } else if a >= c {
+        [1.0, 0.0]
+    } else {
+        [0.0, 1.0]
+    };
+    let length = (direction[0] * direction[0] + direction[1] * direction[1]).sqrt();
+    let major_axis = if length > 0.0 {
+        [direction[0] / length, direction[1] / length]
+    } else {
+        [1.0, 0.0]
+    };
+    ProjectedEllipse {
+        primary: major,
+        secondary: minor,
+        rotation_degrees: major_axis[1].atan2(major_axis[0]).to_degrees(),
+        u,
+        v,
+        major_axis,
+    }
+}
+
+impl ProjectedEllipse {
+    /// Parameter angle (degrees) of the projected ellipse, in its principal
+    /// frame, for a parameter angle of the source ellipse.
+    fn map_parameter_degrees(&self, degrees: f64) -> f64 {
+        let t = degrees.to_radians();
+        let point = [
+            self.u[0] * t.cos() + self.v[0] * t.sin(),
+            self.u[1] * t.cos() + self.v[1] * t.sin(),
+        ];
+        let along = point[0] * self.major_axis[0] + point[1] * self.major_axis[1];
+        let across = -point[0] * self.major_axis[1] + point[1] * self.major_axis[0];
+        let along_term = if self.primary > 0.0 {
+            along / self.primary
+        } else {
+            0.0
+        };
+        // 平面が XY に垂直(辺から見た楕円)なら短軸が 0 になる。その場合は長軸上の位置だけ
+        let across_term = if self.secondary > self.primary * 1.0e-9 {
+            across / self.secondary
+        } else {
+            0.0
+        };
+        across_term.atan2(along_term).to_degrees()
+    }
+
+    /// Whether the projection preserves the direction of travel around the ellipse.
+    fn preserves_orientation(&self) -> bool {
+        self.u[0] * self.v[1] - self.u[1] * self.v[0] >= 0.0
+    }
+
+    /// Start and signed sweep (degrees) of an arc after projection.
+    fn map_arc_degrees(&self, start_degrees: f64, sweep_degrees: f64) -> (f64, f64) {
+        let start = self.map_parameter_degrees(start_degrees).rem_euclid(360.0);
+        let positive = (sweep_degrees >= 0.0) == self.preserves_orientation();
+        if sweep_degrees.abs() >= 360.0 - 1.0e-9 {
+            return (start, if positive { 360.0 } else { -360.0 });
+        }
+        let end = self.map_parameter_degrees(start_degrees + sweep_degrees);
+        let delta = (end - start).rem_euclid(360.0);
+        let sweep = if positive {
+            if delta <= 1.0e-9 && sweep_degrees.abs() > 1.0e-9 {
+                360.0
+            } else {
+                delta
+            }
+        } else {
+            let backwards = (360.0 - delta).rem_euclid(360.0);
+            if backwards <= 1.0e-9 && sweep_degrees.abs() > 1.0e-9 {
+                -360.0
+            } else {
+                -backwards
+            }
+        };
+        (start, sweep)
+    }
 }
 
 fn precise_points(points: &[Point2<i32>], linkages: &[AttributeLinkage<'_>]) -> Vec<Point2<f64>> {

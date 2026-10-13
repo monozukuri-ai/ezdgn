@@ -207,6 +207,12 @@ limits = ezdgn.V8ScanLimits(
 document = ezdgn.read_v8("drawing-v8.dgn", limits=limits)
 ```
 
+The level table of a V8 file is available as `document.levels` (one `V8Level`
+per defined level: `level_id` as graphical headers store it, the user-visible
+`number`, `name`, and the level's own line style, weight and color index) and
+`document.level(level_id)`. An element header that holds the ByLevel sentinel
+`0xffffffff` in its weight, color or style takes the value of its level.
+
 Malformed structure raises `InvalidDgnError`; configured resource ceilings
 raise `DgnLimitError`. The complete clean-room boundary, evidence ledger, and
 known limitations are recorded in [docs/v8/SCOPE.md](docs/v8/SCOPE.md),

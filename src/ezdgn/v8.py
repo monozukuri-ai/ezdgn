@@ -441,6 +441,103 @@ class V8Model:
 
 
 @dataclass(frozen=True, slots=True)
+class V8Level:
+    """One level-table entry: a type-95 named object whose ``level`` field is 1.
+
+    ``level_id`` is the number graphical headers store in their ``level`` field;
+    ``number`` is the user-visible level number. ``line_style``, ``line_weight``
+    and ``color_index`` are the level's own ("ByLevel") symbology, which an
+    element with the ByLevel sentinel (``0xffffffff``) in its header takes over.
+    """
+
+    raw: V8RawObject
+    level_id: int
+    number: int
+    name: str
+    line_style: int
+    line_weight: int
+    color_index: int
+
+
+LEVEL_TABLE_ELEMENT_TYPE = 95
+LEVEL_TABLE_KIND = 1
+NAME_LINKAGE_SIGNATURE = 0x56D2
+# Symbology sentinels in V8 headers and level entries.
+SYMBOLOGY_BY_LEVEL = 0xFFFFFFFF
+SYMBOLOGY_BY_CELL = 0xFFFFFFFE
+
+
+def level_table(raw: V8RawDocument) -> tuple[V8Level, ...]:
+    """Decode the level-table entries of a scanned document (see FORMAT_NOTES)."""
+
+    levels: list[V8Level] = []
+    for page in raw.named_pages:
+        for item in page.objects:
+            if (
+                item.element_type != LEVEL_TABLE_ELEMENT_TYPE
+                or item.level != LEVEL_TABLE_KIND
+            ):
+                continue
+            primary = item.primary_bytes
+            if len(primary) < 0x60:
+                continue
+            levels.append(
+                V8Level(
+                    raw=item,
+                    level_id=_u32(primary, 0x20),
+                    number=_u32(primary, 0x5C),
+                    name=_name_linkage(item.attribute_bytes),
+                    line_style=_i32(primary, 0x40),
+                    line_weight=_u32(primary, 0x44),
+                    color_index=_u32(primary, 0x48),
+                )
+            )
+    return tuple(levels)
+
+
+def _u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little", signed=False)
+
+
+def _i32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little", signed=True)
+
+
+def _name_linkage(attributes: bytes) -> str:
+    """The name stored in the ``0x56d2`` linkage of a table entry, or ``""``.
+
+    Linkages are word-framed (byte length ``2 * (low byte + 1)`` of the first
+    word). The name linkage holds a version, the payload byte length and the
+    payload: ``ff fd`` + UTF-16LE, ``ff fe`` + a code-page word + 8-bit text, or
+    plain 8-bit text.
+    """
+
+    position = 0
+    while position + 12 <= len(attributes):
+        header = int.from_bytes(attributes[position : position + 2], "little")
+        length = 2 * ((header & 0xFF) + 1)
+        signature = int.from_bytes(attributes[position + 2 : position + 4], "little")
+        if signature == NAME_LINKAGE_SIGNATURE:
+            size = _u32(attributes, position + 8)
+            payload = attributes[position + 12 : position + 12 + size]
+            return _decode_name(payload)
+        if length <= 0:
+            break
+        position += length
+    return ""
+
+
+def _decode_name(payload: bytes) -> str:
+    if payload[:2] == b"\xff\xfd":
+        text = payload[2:].decode("utf-16-le", "replace")
+    elif payload[:2] == b"\xff\xfe":
+        text = payload[4:].decode("cp1252", "replace")
+    else:
+        text = payload.decode("cp1252", "replace")
+    return text.rstrip("\x00")
+
+
+@dataclass(frozen=True, slots=True)
 class V8Document:
     raw: V8RawDocument
     models: tuple[V8Model, ...]
@@ -448,6 +545,20 @@ class V8Document:
     @property
     def entities(self) -> tuple[V8Element, ...]:
         return tuple(element for model in self.models for element in model.entities)
+
+    @property
+    def levels(self) -> tuple[V8Level, ...]:
+        """The level table (``0.2.8``): an entry per defined level, in file order."""
+
+        return level_table(self.raw)
+
+    def level(self, level_id: int) -> V8Level | None:
+        """The level-table entry a header's ``level`` number refers to, if defined."""
+
+        for item in self.levels:
+            if item.level_id == level_id:
+                return item
+        return None
 
     def __iter__(self) -> Iterator[V8Model]:
         return iter(self.models)
@@ -808,6 +919,7 @@ __all__ = [
     "V8Document",
     "V8Element",
     "V8ElementData",
+    "V8Level",
     "V8Linkage",
     "V8Model",
     "V8ModelIndexEntry",
@@ -819,7 +931,13 @@ __all__ = [
     "V8RawModel",
     "V8RawObject",
     "V8ScanLimits",
+    "LEVEL_TABLE_ELEMENT_TYPE",
+    "LEVEL_TABLE_KIND",
+    "NAME_LINKAGE_SIGNATURE",
+    "SYMBOLOGY_BY_CELL",
+    "SYMBOLOGY_BY_LEVEL",
     "inspect_v8_container",
+    "level_table",
     "read_v8",
     "read_v8file",
     "scan_v8_objects",

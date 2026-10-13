@@ -16,6 +16,44 @@ V8 = DATA / "v8" / "test_dgnv8.dgn"
 V7 = DATA / "v7" / "smalltest.dgn"
 
 
+def test_level_table_entries_are_decoded() -> None:
+    document = ezdgn.read_v8(V8)
+    levels = document.levels
+    assert [
+        (item.level_id, item.number, item.name, item.line_style, item.line_weight, item.color_index)
+        for item in levels
+    ] == [(64, 0, "Default", 0, 0, 0)]
+    entry = levels[0]
+    assert entry.raw.element_type == ezdgn.v8.LEVEL_TABLE_ELEMENT_TYPE
+    assert entry.raw.level == ezdgn.v8.LEVEL_TABLE_KIND
+    assert entry.raw.element_id == 33
+    assert document.level(64) == entry
+    assert document.level(65) is None
+    # the graphical elements of the fixture sit on that level
+    assert {element.level for element in document.entities} <= {64, 0, 1}
+    assert ezdgn.v8.level_table(document.raw) == levels
+
+
+def test_level_names_decode_the_observed_linkage_encodings() -> None:
+    from ezdgn.v8 import _name_linkage
+
+    # UTF-16LE after ff fd (the checked-in fixture, written by the ODA toolkit)
+    utf16 = bytes.fromhex(
+        "0f10d2560100000010000000fffd44006500660061007500" "6c0074000000000000000000"
+    )
+    assert _name_linkage(utf16) == "Default"
+    # 8-bit text after the ff fe 01 00 code-page marker (MicroStation-native file)
+    marked = bytes.fromhex("0f10d256010000000d000000fffe01005761746572" "6d61696e00000000000000")
+    assert _name_linkage(marked) == "Watermain"
+    # plain 8-bit text (a file converted from DWG)
+    plain = bytes.fromhex("0b10d256010000000600000040455452415300000000000000".replace("40", "4c", 1))
+    assert _name_linkage(plain) == "LETRAS"
+    # another linkage first, then the name; an entry without a name linkage is ""
+    assert _name_linkage(bytes.fromhex("0110abcd00000000") + plain) == "LETRAS"
+    assert _name_linkage(bytes.fromhex("0110abcd00000000")) == ""
+    assert _name_linkage(b"") == ""
+
+
 def test_scans_lossless_v8_model_pages_and_objects() -> None:
     raw = ezdgn.scan_v8_objects(V8)
 

@@ -209,6 +209,34 @@ property ID at `+0x04`, payload length at `+0x08`, and payload at `+0x0c`;
 observed `ff fd` payloads are UTF-16LE. Unknown and incomplete linkages retain
 their exact bytes.
 
+## Level table entries
+
+Levels are defined by named objects (`/Dgn^Nm` pages) of element type 95 whose
+header `level` word (`0x0c`) is 1; the other table kinds observed in that type
+are 2 (fonts), 7 and 8 (line style definitions). The fields reproduced by the
+reader on the checked-in fixture (`Default`) and on two real-world files that
+are not checked in (one written by MicroStation with 2,666 levels, one
+converted from DWG with 15) are:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x20` | `u32` | level ID: the number graphical headers store at `0x0c` |
+| `0x40` | `i32` | line style of the level (ByLevel symbology) |
+| `0x44` | `u32` | line weight of the level, 0..=31 |
+| `0x48` | `u32` | color index of the level |
+| `0x5c` | `u32` | user-visible level number |
+
+The name is a `0x56d2` linkage in the attribute bytes: version at `+0x04`,
+payload byte length at `+0x08`, payload at `+0x0c`. Payloads were `ff fd` +
+UTF-16LE (ODA), `ff fe 01 00` + 8-bit text (MicroStation) and plain 8-bit text
+(DWG conversion). The weight field was corroborated by elements that carry the
+ByLevel sentinel `0xffffffff` in their header weight: in the DWG conversion
+every element on the two levels whose entry stores weight 2 uses the sentinel,
+and the only other weights in that file are explicit 0 and 2. `0x4c` repeated
+the color index on the MicroStation file and was 0 on the DWG conversion;
+`0x28`, `0x2c` and `0x60` vary by file and remain unresolved. Element headers
+use `0xffffffff` (ByLevel) and `0xfffffffe` (ByCell) in their symbology words.
+
 ## Deliberately unresolved semantics
 
 The parser does not infer product-specific XAttributes, custom schemas, Item

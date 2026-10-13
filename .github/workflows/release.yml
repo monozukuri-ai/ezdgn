@@ -18,8 +18,47 @@ env:
   PYTHON_VERSION: "3.12"
 
 jobs:
+  release-status:
+    name: Check for completed release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      completed: ${{ steps.completed.outputs.result }}
+
+    steps:
+      # Concurrency serializes duplicate tag pushes but does not discard them.
+      - name: Find successful release for this tag and commit
+        id: completed
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo,
+              workflow_id: 'release.yml',
+              event: 'push',
+              status: 'success',
+              head_sha: context.sha,
+              per_page: 100,
+            });
+            const tag = context.ref.slice('refs/tags/'.length);
+            const previous = runs.find(run =>
+              run.id !== context.runId &&
+              run.head_branch === tag &&
+              run.head_sha === context.sha &&
+              run.event === 'push' &&
+              run.conclusion === 'success'
+            );
+            if (previous) {
+              core.notice(`Release already completed: ${previous.html_url}; skipping duplicate run.`);
+            }
+            return Boolean(previous);
+
   preflight:
     name: Test and validate release
+    needs: release-status
+    if: needs.release-status.outputs.completed != 'true'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

@@ -244,9 +244,12 @@ pub struct V8AuxiliaryPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V8ModelIndexEntry {
     pub index: usize,
+    /// Flags word at entry offset 0 (bit 16 marks a 3D model).
     pub raw_number: u32,
+    /// Storage number named by the model ID at entry offset 4.
     pub storage_index: u16,
     pub model_number: u16,
+    /// The model ID at entry offset 4, kept under its historical name.
     pub flags: u32,
     pub model_id: u64,
     pub name: String,
@@ -349,41 +352,49 @@ fn scan_v8_streams(
 
     let mut models = Vec::with_capacity(model_index.len());
     let mut skipped_models = Vec::new();
+    let mut claimed_storages = Vec::new();
     for entry in model_index {
         // Writers keep deleted or externalized models in the index while
         // dropping their storage; skip those instead of rejecting the file,
         // as long as at least one stored model remains.
-        let header_path = format!("/Dgn-Md/#{:06}/Dgn~Mh", entry.storage_index);
-        match scan_model_storage(&streams, entry, &mut budget)? {
-            Some(model) => models.push(model),
-            None => skipped_models.push(header_path),
+        let candidates = model_storage_candidates(&entry);
+        let storage_path = candidates
+            .iter()
+            .find(|path| {
+                !claimed_storages.contains(*path) && streams.get(&model_header_path(path)).is_some()
+            })
+            .cloned();
+        let Some(storage_path) = storage_path else {
+            skipped_models.push(model_header_path(&candidates[0]));
+            continue;
+        };
+        claimed_storages.push(storage_path.clone());
+        if let Some(model) = scan_model_storage(&streams, entry, storage_path, &mut budget)? {
+            models.push(model);
         }
     }
 
     // The inverse inconsistency also exists: model storages the index does
     // not reference (stale or partial /Dgn^Ix/Dgn~Mix). Load those too so
     // their graphics are not lost.
-    let mut orphan_indices: Vec<u16> = streams
+    let mut orphan_storages: Vec<&str> = streams
         .streams
         .iter()
         .filter_map(|stream| {
-            let rest = stream.path.strip_prefix("/Dgn-Md/#")?;
-            let (number, tail) = rest.split_once('/')?;
-            if tail != "Dgn~Mh" || number.len() != 6 {
-                return None;
-            }
-            number.parse::<u16>().ok()
+            let storage = stream.path.strip_suffix("/Dgn~Mh")?;
+            let number = storage.strip_prefix(MODEL_STORAGE_PREFIX)?;
+            (number.len() == 6 && !number.contains('/')).then_some(storage)
         })
+        .filter(|storage| !claimed_storages.iter().any(|claimed| claimed == storage))
         .collect();
-    orphan_indices.sort_unstable();
-    orphan_indices.dedup();
-    for storage_index in orphan_indices {
-        if models
-            .iter()
-            .any(|model| model.index.storage_index == storage_index)
-        {
-            continue;
-        }
+    orphan_storages.sort_unstable();
+    orphan_storages.dedup();
+    for storage_path in orphan_storages {
+        let number = &storage_path[MODEL_STORAGE_PREFIX.len()..];
+        let storage_index = u16::from_str_radix(number, 16)
+            .ok()
+            .or_else(|| number.parse::<u16>().ok())
+            .unwrap_or_default();
         let entry = V8ModelIndexEntry {
             index: models.len(),
             raw_number: u32::from(storage_index),
@@ -395,7 +406,8 @@ fn scan_v8_streams(
             description: String::new(),
             raw_bytes: Arc::from(&[][..]),
         };
-        if let Some(model) = scan_model_storage(&streams, entry, &mut budget)? {
+        let storage_path = storage_path.to_owned();
+        if let Some(model) = scan_model_storage(&streams, entry, storage_path, &mut budget)? {
             models.push(model);
         }
     }
@@ -422,16 +434,40 @@ fn scan_v8_streams(
     })
 }
 
+const MODEL_STORAGE_PREFIX: &str = "/Dgn-Md/#";
+
+fn model_header_path(storage_path: &str) -> String {
+    format!("{storage_path}/Dgn~Mh")
+}
+
+/// Storage paths an index entry may name, most likely first. The model ID at
+/// entry offset 4 names the storage in lowercase hex (`#00000a`); the decimal
+/// spelling and the low half of the flags word are fallbacks for writers whose
+/// IDs never reach 10 or whose entries are laid out the older way.
+fn model_storage_candidates(entry: &V8ModelIndexEntry) -> Vec<String> {
+    let legacy_storage = entry.raw_number as u16;
+    let mut candidates = Vec::with_capacity(3);
+    for candidate in [
+        format!("{MODEL_STORAGE_PREFIX}{:06x}", entry.storage_index),
+        format!("{MODEL_STORAGE_PREFIX}{:06}", entry.storage_index),
+        format!("{MODEL_STORAGE_PREFIX}{legacy_storage:06}"),
+    ] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
 /// Scan the object pages of one model storage, or return `None` when the
 /// storage has no model-header stream.
 fn scan_model_storage(
     streams: &V8StreamSet,
     entry: V8ModelIndexEntry,
+    storage_path: String,
     budget: &mut ScanBudget,
 ) -> Result<Option<V8RawModel>, DgnError> {
-    let storage_path = format!("/Dgn-Md/#{:06}", entry.storage_index);
-    let model_header_path = format!("{storage_path}/Dgn~Mh");
-    let Some(model_header_stream) = streams.get(&model_header_path).cloned() else {
+    let Some(model_header_stream) = streams.get(&model_header_path(&storage_path)).cloned() else {
         return Ok(None);
     };
     let model_header_bytes: Arc<[u8]> =
@@ -635,7 +671,7 @@ fn parse_model_index(
         entries.push(V8ModelIndexEntry {
             index,
             raw_number,
-            storage_index: raw_number as u16,
+            storage_index: u16::try_from(flags).unwrap_or(raw_number as u16),
             model_number: (raw_number >> 16) as u16,
             flags,
             model_id,
@@ -1092,6 +1128,83 @@ mod tests {
         cfb.into_inner().into_inner()
     }
 
+    /// A V8 container whose storages each hold one object with a distinct
+    /// element ID, indexed by `(flags word, model ID, name)` entries.
+    fn dgn_with_models(storages: &[(&str, u64)], entries: &[(u32, u32, &str)]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut cfb = cfb::CompoundFile::create_with_version(cfb::Version::V3, cursor).unwrap();
+        for storage in ["/Dgn-Md", "/Dgn^Ix"] {
+            cfb.create_storage(storage).unwrap();
+        }
+        for stream in ["/Dgn~H", "/Dgn~S"] {
+            cfb.create_stream(stream)
+                .unwrap()
+                .write_all(b"marker")
+                .unwrap();
+        }
+
+        let mut index = Vec::new();
+        index.extend(MODEL_INDEX_MAGIC.to_le_bytes());
+        index.extend(4_u32.to_le_bytes());
+        index.extend(u32::try_from(entries.len()).unwrap().to_le_bytes());
+        index.extend(0_u32.to_le_bytes());
+        for (flags_word, model_id, name) in entries {
+            let name_bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            index.extend(flags_word.to_le_bytes());
+            index.extend(model_id.to_le_bytes());
+            index.extend(0_u64.to_le_bytes());
+            index.extend(u16::try_from(32 + name_bytes.len()).unwrap().to_le_bytes());
+            index.extend(u16::try_from(name_bytes.len()).unwrap().to_le_bytes());
+            index.extend(0_u32.to_le_bytes());
+            index.extend(0_u64.to_le_bytes());
+            index.extend(name_bytes);
+        }
+        cfb.create_stream("/Dgn^Ix/Dgn~Mix")
+            .unwrap()
+            .write_all(&zlib(&index))
+            .unwrap();
+
+        for (storage, element_id) in storages {
+            let storage_path = format!("/Dgn-Md/{storage}");
+            cfb.create_storage(&storage_path).unwrap();
+            cfb.create_storage(format!("{storage_path}/Dgn^G")).unwrap();
+            cfb.create_stream(format!("{storage_path}/Dgn~Mh"))
+                .unwrap()
+                .write_all(&zlib(&[0; 32]))
+                .unwrap();
+            let mut inflated = 0_u32.to_le_bytes().to_vec();
+            inflated.extend(object(0x1000_0003, 64, *element_id));
+            let mut page = Vec::new();
+            for word in [1_u32, 2, 1, 1] {
+                page.extend(word.to_le_bytes());
+            }
+            page.extend(zlib(&inflated));
+            cfb.create_stream(format!("{storage_path}/Dgn^G/$1"))
+                .unwrap()
+                .write_all(&page)
+                .unwrap();
+        }
+        cfb.into_inner().into_inner()
+    }
+
+    fn scanned_models(bytes: &[u8]) -> Vec<(String, String, Option<u64>)> {
+        let raw = scan_v8_objects(bytes, V8ScanOptions::default()).unwrap();
+        raw.models
+            .iter()
+            .map(|model| {
+                let element_id = model
+                    .graphical_objects()
+                    .next()
+                    .and_then(|object| object.element_id);
+                (
+                    model.index.name.clone(),
+                    model.storage_path.clone(),
+                    element_id,
+                )
+            })
+            .collect()
+    }
+
     fn object_page_stream(
         count: u32,
         version: u32,
@@ -1129,6 +1242,77 @@ mod tests {
         assert_eq!(objects[0].level, Some(64));
         assert_eq!(objects[0].element_id, Some(42));
         assert_eq!(objects[0].len(), 32);
+    }
+
+    #[test]
+    fn maps_index_entries_to_storages_by_model_id() {
+        let bytes = dgn_with_models(
+            &[("#000000", 1), ("#000002", 2)],
+            &[(0, 0, "Default-2D"), (0x0001_0000, 2, "Default-3D")],
+        );
+        assert_eq!(
+            scanned_models(&bytes),
+            vec![
+                (
+                    "Default-2D".to_owned(),
+                    "/Dgn-Md/#000000".to_owned(),
+                    Some(1)
+                ),
+                (
+                    "Default-3D".to_owned(),
+                    "/Dgn-Md/#000002".to_owned(),
+                    Some(2)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn names_model_storages_in_hex_with_a_decimal_fallback() {
+        let hex = dgn_with_models(
+            &[("#000000", 1), ("#00000a", 10)],
+            &[(0, 0, "a"), (0, 10, "b")],
+        );
+        assert_eq!(scanned_models(&hex)[1].1, "/Dgn-Md/#00000a");
+        let decimal = dgn_with_models(
+            &[("#000000", 1), ("#000010", 10)],
+            &[(0, 0, "a"), (0, 10, "b")],
+        );
+        assert_eq!(scanned_models(&decimal)[1].1, "/Dgn-Md/#000010");
+    }
+
+    #[test]
+    fn falls_back_to_the_flags_word_for_older_index_layouts() {
+        let bytes = dgn_with_models(
+            &[("#000000", 1), ("#000001", 2)],
+            &[(0, 0, "a"), (1, 7, "sheet")],
+        );
+        assert_eq!(
+            scanned_models(&bytes)[1],
+            ("sheet".to_owned(), "/Dgn-Md/#000001".to_owned(), Some(2))
+        );
+    }
+
+    #[test]
+    fn never_hands_one_storage_to_two_index_entries() {
+        let bytes = dgn_with_models(&[("#000000", 1)], &[(0, 0, "first"), (0, 0, "second")]);
+        let raw = scan_v8_objects(&bytes, V8ScanOptions::default()).unwrap();
+        assert_eq!(raw.models.len(), 1);
+        assert_eq!(raw.models[0].index.name, "first");
+        assert_eq!(
+            raw.skipped_models,
+            vec!["/Dgn-Md/#000000/Dgn~Mh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn loads_storages_the_index_does_not_name_with_hex_numbers() {
+        let bytes = dgn_with_models(&[("#000000", 1), ("#00000b", 11)], &[(0, 0, "a")]);
+        let raw = scan_v8_objects(&bytes, V8ScanOptions::default()).unwrap();
+        assert_eq!(raw.models.len(), 2);
+        assert_eq!(raw.models[1].storage_path, "/Dgn-Md/#00000b");
+        assert_eq!(raw.models[1].index.storage_index, 11);
+        assert!(raw.models[1].index.name.is_empty());
     }
 
     #[test]

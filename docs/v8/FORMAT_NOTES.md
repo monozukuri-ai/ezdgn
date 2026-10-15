@@ -209,6 +209,27 @@ property ID at `+0x04`, payload length at `+0x08`, and payload at `+0x0c`;
 observed `ff fd` payloads are UTF-16LE. Unknown and incomplete linkages retain
 their exact bytes.
 
+## Meshes
+
+Type 105 is a mesh header. Its component count is at `0x68` and its style at
+`0x6c`; style 1 is an indexed face-loop mesh. In the observed files (an OpenRail
+cable-duct model, 261 meshes) every mesh has four components in the order
+101, 103, 101, 102:
+
+| Type | Role | Observed layout |
+| ---: | --- | --- |
+| 101 | matrix header | component count at `0x68` (0), column count at `0x6c`: 3 before the points, 1 before the indices |
+| 103 | double data | scalar count at `0x68` (repeated at `0x6c`), constant tag 49 at `0x70`, `f64` values from `0x78`, padded to four bytes |
+| 102 | integer data | scalar count at `0x68` (repeated at `0x6c`), constant tag 4386 at `0x70`, `i32` values from `0x78`, padded to four bytes |
+
+The double data holds XYZ points in UOR, three scalars per point. The integer
+data holds one-based point indices; zero ends a face loop and a negative index
+hides the edge that starts at that point. Loops of 3 to 144 points were seen,
+mostly quadrilaterals, and every index was in range. The decoded `Mesh` keeps
+the points (UOR and master) and the loops as zero-based indices with edge
+visibility. A mesh of another style, or whose components do not form a valid
+indexed face-loop mesh, stays an unknown complex element.
+
 ## Level table entries
 
 Levels are defined by named objects (`/Dgn^Nm` pages) of element type 95 whose

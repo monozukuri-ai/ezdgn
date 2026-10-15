@@ -945,6 +945,36 @@ fn v8_element_data_dict<'py>(
             Some(point) => result.set_item("anchor", v8_point_row(*point))?,
             None => result.set_item("anchor", py.None())?,
         },
+        V8ElementData::Mesh {
+            child_count,
+            style,
+            points,
+            faces,
+        } => {
+            result.set_item("child_count", *child_count)?;
+            result.set_item("style", *style)?;
+            result.set_item("vertices", v8_point_rows(points))?;
+            result.set_item(
+                "faces",
+                faces
+                    .iter()
+                    .map(|face| (face.point_indices.clone(), face.visible_edges.clone()))
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        V8ElementData::MatrixHeader {
+            child_count,
+            columns,
+        } => {
+            result.set_item("child_count", *child_count)?;
+            result.set_item("columns", *columns)?;
+        }
+        V8ElementData::MatrixIntegerData { values } => {
+            result.set_item("values", values)?;
+        }
+        V8ElementData::MatrixDoubleData { values } => {
+            result.set_item("values", values)?;
+        }
         V8ElementData::Unknown => {}
     }
     Ok(result)

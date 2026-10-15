@@ -193,3 +193,23 @@ def test_cli_v8_entities_include_native_text_and_hierarchy() -> None:
     assert records[4]["entity"]["height_master"] == pytest.approx(1)
     assert records[27]["child_indices"] == [28, 29]
     assert records[28]["parent_index"] == 27
+
+
+def test_mesh_rows_become_faces_with_edge_visibility() -> None:
+    from ezdgn.v8 import _element_data_from_core
+
+    point = ((10.0, 0.0, 0.0), (0.001, 0.0, 0.0))
+    data = _element_data_from_core(
+        {
+            "kind": "MESH",
+            "child_count": 4,
+            "style": 1,
+            "vertices": [point, point, point],
+            "faces": [([0, 1, 2], [True, True, False])],
+        }
+    )
+
+    assert data.kind == "MESH"
+    assert data.style == 1
+    assert len(data.vertices) == 3
+    assert data.faces == (ezdgn.V8MeshFace((0, 1, 2), (True, True, False)),)

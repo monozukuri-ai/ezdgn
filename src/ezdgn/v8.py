@@ -264,6 +264,19 @@ class V8CommonHeader:
 
 
 @dataclass(frozen=True, slots=True)
+class V8MeshFace:
+    """One face loop of an indexed mesh.
+
+    ``point_indices`` are zero-based indices into the mesh's ``vertices``;
+    ``visible_edges[i]`` tells whether the edge from point ``i`` to the next
+    point of the loop is drawn.
+    """
+
+    point_indices: tuple[int, ...]
+    visible_edges: tuple[bool, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class V8ElementData:
     """Native parameters for a supported V8 element kind."""
 
@@ -300,6 +313,10 @@ class V8ElementData:
     name: str | None = None
     properties_raw: int | None = None
     declared_poles: int | None = None
+    style: int | None = None
+    faces: tuple[V8MeshFace, ...] = ()
+    columns: int | None = None
+    values: tuple[float, ...] = ()
 
     @property
     def rotation_degrees(self) -> float | None:
@@ -350,6 +367,9 @@ class V8Element:
             "UNKNOWN_COMPLEX",
             "BSPLINE_POLE",
             "TEXT_NODE",
+            "MATRIX_HEADER",
+            "MATRIX_INTEGER_DATA",
+            "MATRIX_DOUBLE_DATA",
         }
 
     def dxftype(self) -> str:
@@ -828,6 +848,13 @@ def _element_data_from_core(row: dict[str, Any]) -> V8ElementData:
         name=row.get("name"),
         properties_raw=row.get("properties_raw"),
         declared_poles=row.get("declared_poles"),
+        style=row.get("style"),
+        faces=tuple(
+            V8MeshFace(tuple(point_indices), tuple(visible_edges))
+            for point_indices, visible_edges in row.get("faces", ())
+        ),
+        columns=row.get("columns"),
+        values=tuple(row.get("values", ())),
     )
 
 
@@ -921,6 +948,7 @@ __all__ = [
     "V8ElementData",
     "V8Level",
     "V8Linkage",
+    "V8MeshFace",
     "V8Model",
     "V8ModelIndexEntry",
     "V8ModelMetadata",

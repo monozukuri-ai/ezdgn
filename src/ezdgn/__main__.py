@@ -347,6 +347,11 @@ def _v8_entity_payload(element: V8Element) -> dict[str, Any]:
     if data.vertices:
         payload["vertices_uor"] = [point.uor for point in data.vertices]
         payload["vertices_master"] = [point.master for point in data.vertices]
+    if data.faces:
+        payload["faces"] = [
+            {"point_indices": face.point_indices, "visible_edges": face.visible_edges}
+            for face in data.faces
+        ]
     for name in ("origin", "center", "anchor"):
         point = getattr(data, name)
         if point is not None:
@@ -376,6 +381,8 @@ def _v8_entity_payload(element: V8Element) -> dict[str, Any]:
         "declared_poles",
         "encoding",
         "text",
+        "style",
+        "columns",
     ):
         value = getattr(data, name)
         if value is not None:

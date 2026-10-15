@@ -3,10 +3,11 @@ use std::sync::Arc;
 use crate::DgnError;
 
 use super::linkage::{decode_v8_linkages, V8Linkage};
-use super::raw::{read_u32, read_u64, V8RawModel, V8ScanOptions};
+use super::raw::{read_u32, read_u64, V8ModelIndexEntry, V8RawModel, V8ScanOptions};
 
 const MODEL_HEADER_TYPE: u16 = 66;
 const MODEL_DIMENSION_2D_FLAG: u32 = 0x0080_0000;
+const MODEL_INDEX_3D_FLAG: u32 = 0x0001_0000;
 const MODEL_ID_OFFSET: usize = 0x18;
 const MODEL_EXTENTS_OFFSET: usize = 0x90;
 const MODEL_ORIGIN_OFFSET: usize = 0xc8;
@@ -200,11 +201,7 @@ pub(crate) fn decode_model_metadata(
         index_model_id: model.index.model_id,
         name: model.index.name.clone(),
         description: model.index.description.clone(),
-        dimension: if type_and_flags & MODEL_DIMENSION_2D_FLAG != 0 {
-            V8Dimension::Two
-        } else {
-            V8Dimension::Three
-        },
+        dimension: model_dimension(type_and_flags, &model.index),
         type_and_flags,
         model_flags: read_u32(record, 0x10).unwrap_or_default(),
         uor_per_master,
@@ -217,6 +214,17 @@ pub(crate) fn decode_model_metadata(
         linkages,
         raw_header: Arc::from(record),
     })
+}
+
+/// A model-index entry marks a 3D model with bit 16 of its flags word; the
+/// header flag is the fallback for storages the index does not name.
+fn model_dimension(type_and_flags: u32, entry: &V8ModelIndexEntry) -> V8Dimension {
+    let indexed_as_2d = !entry.raw_bytes.is_empty() && entry.raw_number & MODEL_INDEX_3D_FLAG == 0;
+    if indexed_as_2d || type_and_flags & MODEL_DIMENSION_2D_FLAG != 0 {
+        V8Dimension::Two
+    } else {
+        V8Dimension::Three
+    }
 }
 
 fn find_model_header(model: &V8RawModel) -> Result<&[u8], DgnError> {
@@ -296,6 +304,38 @@ pub(crate) fn read_f64(bytes: &[u8], offset: usize) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn index_entry(raw_number: u32, raw_bytes: &[u8]) -> V8ModelIndexEntry {
+        V8ModelIndexEntry {
+            index: 0,
+            raw_number,
+            storage_index: 0,
+            model_number: (raw_number >> 16) as u16,
+            flags: 0,
+            model_id: 0,
+            name: String::new(),
+            description: String::new(),
+            raw_bytes: Arc::from(raw_bytes),
+        }
+    }
+
+    #[test]
+    fn model_dimension_follows_the_index_3d_flag() {
+        let entry_bytes = [0_u8; 32];
+        assert_eq!(
+            model_dimension(0, &index_entry(0, &entry_bytes)),
+            V8Dimension::Two
+        );
+        assert_eq!(
+            model_dimension(0, &index_entry(MODEL_INDEX_3D_FLAG, &entry_bytes)),
+            V8Dimension::Three
+        );
+        assert_eq!(model_dimension(0, &index_entry(0, &[])), V8Dimension::Three);
+        assert_eq!(
+            model_dimension(MODEL_DIMENSION_2D_FLAG, &index_entry(0, &[])),
+            V8Dimension::Two
+        );
+    }
 
     #[test]
     fn point_conversion_applies_scale_and_origin() {

@@ -50,9 +50,9 @@ links are in `PROVENANCE.md`.
 - The outer file is CFB. Generic sector, directory, storage, and logical-stream
   behavior is delegated to the Rust `cfb` crate.
 - Required DGN markers are `/Dgn~H`, `/Dgn~S`, and `/Dgn-Md`.
-- `/Dgn^Ix/Dgn~Mix` indexes models. A storage index associates an entry with
-  `/Dgn-Md/#NNNNNN`; this association is retained separately from IDs stored in
-  the model index and model header.
+- `/Dgn^Ix/Dgn~Mix` indexes models. The model ID at entry offset 4 names the
+  entry's storage `/Dgn-Md/#nnnnnn` in lowercase hex; this association is
+  retained separately from IDs stored in the model index and model header.
 - Known compressed streams use zlib. A decode is valid only when the decoder
   reaches `StreamEnd`, consumes the complete compressed payload, and stays
   within both per-stream and aggregate inflated-byte limits. A truncated stream
@@ -112,8 +112,8 @@ count. Each variable-size entry has a 32-byte header:
 
 | Offset | Type | Meaning |
 | ---: | --- | --- |
-| `0x00` | `u32` | low 16 bits storage index; high 16 bits model number |
-| `0x04` | `u32` | flags |
+| `0x00` | `u32` | flags word: bit 16 marks a 3D model, bit 0 was seen on a sheet model |
+| `0x04` | `u32` | model ID, which names the model storage |
 | `0x08` | `u64` | index model ID |
 | `0x10` | `u16` | complete entry byte length |
 | `0x12` | `u16` | UTF-16LE model-name byte length |
@@ -122,6 +122,21 @@ count. Each variable-size entry has a 32-byte header:
 
 Odd UTF-16 lengths, invalid UTF-16, undersized entries, overflow, trailing
 bytes, and configured string/model limits are rejected.
+
+The storage is `/Dgn-Md/#` plus the model ID as six lowercase hex digits. In
+MicroStation CONNECT and OpenRail files a second model with ID 1 or 2 lives in
+`#000001` or `#000002` while its flags word holds `0x00000000` or
+`0x00010000`, so the low half of the flags word does not name the storage.
+Hex is corroborated by hidden models in `/Dgn-Nd`, which share the ID sequence
+and are named `#00000d` through `#000033`. A decimal name and the low half of
+the flags word are accepted as fallbacks, and no storage is assigned to two
+entries; storages no entry names are still loaded, with an empty name.
+
+Bit 16 of the flags word is set exactly on the models with 3D content in the
+files observed, including an ODA-written 3D model, and clear on 2D design and
+sheet models whose type-66 header does not carry the 2D flag. A model named by
+an index entry takes its dimension from that bit; `model_number` (the high half
+of the flags word) therefore equals the 3D bit in those files.
 
 The per-model `Dgn~Mh` stream contains one complete type-66 object ending at
 the end of the inflated stream. Confirmed decoded offsets within that object

@@ -818,6 +818,70 @@ fn rejects_phase_four_component_count_mismatches() {
 }
 
 #[test]
+fn reads_deleted_complex_headers_that_span_their_components() {
+    // 本番の V7 図面5件: MicroStation は複合要素を削除すると見出しに削除ビットを立て、
+    // words-to-follow を部品ごと覆う長さに伸ばす。部品数を数えてファイル全体が落ちていた
+    let line = synthetic_record(3, 2, &[0; 16], true, &[]);
+    let group_size = 48 + 2 * line.len();
+    let mut header_body = vec![0; 4];
+    header_body[..2].copy_from_slice(&u16::try_from((group_size - 38) / 2).unwrap().to_le_bytes());
+    header_body[2..4].copy_from_slice(&2_u16.to_le_bytes());
+    let mut header = synthetic_record(12, 2, &header_body, false, &[0; 8]);
+    header.extend_from_slice(&line);
+    header.extend_from_slice(&line);
+    header[1] |= 0x80; // 削除ビット
+    let words = u16::try_from(header.len() / 2 - 2).unwrap();
+    header[2..4].copy_from_slice(&words.to_le_bytes());
+    let live = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let data = with_synthetic_records(&[header, live]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.elements.len(), 13);
+    let deleted = &document.elements[11];
+    assert!(deleted.raw.header.deleted);
+    assert!(deleted.child_indices.is_empty());
+    assert!(matches!(document.elements[12].data, ElementData2D::Line(_)));
+    assert_eq!(document.elements[12].parent_index, None);
+}
+
+#[test]
+fn demotes_live_complex_headers_that_enclose_no_components() {
+    // 本番の V7 図面: 部品1件と宣言しながら全長が見出し自身だけの複合図形(型14)。
+    // 描く物が無いので Unsupported に降格し、後続の要素はそのまま読む
+    let mut header_body = vec![0; 4];
+    header_body[..2].copy_from_slice(&5_u16.to_le_bytes()); // 38 + 10 = 48 = 見出し自身
+    header_body[2..4].copy_from_slice(&1_u16.to_le_bytes());
+    let header = synthetic_record(14, 2, &header_body, false, &[0; 8]);
+    assert_eq!(header.len(), 48);
+    let line = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let data = with_synthetic_records(&[header, line]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::Unsupported
+    ));
+    assert!(document.elements[11].child_indices.is_empty());
+    assert!(matches!(document.elements[12].data, ElementData2D::Line(_)));
+}
+
+#[test]
+fn deleted_records_with_undecodable_data_do_not_reject_the_file() {
+    let mut deleted = synthetic_record(3, 2, &[0; 4], false, &[]);
+    deleted[1] |= 0x80;
+    let data = with_synthetic_records(&[deleted]);
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::Unsupported
+    ));
+
+    // 削除されていない要素は従来どおり厳格に扱う
+    let live = synthetic_record(3, 2, &[0; 4], false, &[]);
+    assert!(read_v7_2d(&with_synthetic_records(&[live]), ScanOptions::default()).is_err());
+}
+
+#[test]
 fn every_scannable_smalltest_prefix_is_safe_for_phase_three() {
     for end in 0..=SMALLTEST.len() {
         let _ = read_v7_2d(&SMALLTEST[..end], ScanOptions::default());

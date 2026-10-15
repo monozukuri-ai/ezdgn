@@ -19,8 +19,15 @@ const MODEL_INDEX_ENTRY_HEADER_BYTES: usize = 32;
 pub const DEFAULT_MAX_V8_PAGES: usize = 16_384;
 /// Default maximum number of raw V8 objects across all scanned page families.
 pub const DEFAULT_MAX_V8_OBJECTS: usize = 1_000_000;
-/// Default maximum byte length of one raw object or auxiliary record (256 KiB).
-pub const DEFAULT_MAX_V8_OBJECT_SIZE_BYTES: usize = 256 * 1024;
+/// Default maximum byte length of one raw object or auxiliary record (16 MiB).
+///
+/// Objects are slices of an already inflated page, so this is not the
+/// decompression-bomb guard (that is [`DEFAULT_MAX_V8_INFLATED_STREAM_BYTES`]
+/// per page and [`DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES`] overall). It only
+/// bounds what one semantic decoder may be handed. Real files carry auxiliary
+/// records of 400+ KiB (embedded caches/attachments in `Dgn^CA`/`Dgn^GA`), which
+/// the former 256 KiB default rejected, failing the whole document.
+pub const DEFAULT_MAX_V8_OBJECT_SIZE_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum inflated byte length of one V8 payload (64 MiB).
 pub const DEFAULT_MAX_V8_INFLATED_STREAM_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum combined inflated size of all V8 payloads (1 GiB).
@@ -134,6 +141,17 @@ pub struct V8RawObject {
     pub model_id: Option<u64>,
     bytes: Arc<[u8]>,
     byte_range: Range<usize>,
+}
+
+#[cfg(test)]
+impl V8RawObject {
+    /// Test helper: the same object metadata over replacement object bytes.
+    pub(crate) fn with_object_bytes(&self, object: Vec<u8>) -> Self {
+        let mut copy = self.clone();
+        copy.byte_range = 0..object.len();
+        copy.bytes = Arc::from(object);
+        copy
+    }
 }
 
 impl V8RawObject {
@@ -827,15 +845,10 @@ fn scan_object_page(
                 limit: budget.options.max_object_size,
             });
         }
-        if attribute_words > words {
-            return Err(page_error(
-                &stream.path,
-                record_offset + 8,
-                format!(
-                    "attribute boundary {attribute_words} words exceeds object size {words} words"
-                ),
-            ));
-        }
+        // 属性境界がオブジェクト長を超える書き手がある(実ファイルの /Dgn^Nm/ ページ)。
+        // 枠は words で決まっているので、属性なしとして読み進める(V7 の属性ポインタ
+        // 不正と同じ扱い)
+        let attribute_words = attribute_words.min(words);
         let record_end = record_offset
             .checked_add(declared)
             .ok_or_else(|| page_error(&stream.path, record_offset, "object end overflows"))?;
@@ -1169,17 +1182,6 @@ mod tests {
             ),
             (
                 {
-                    let mut bytes = 0_u32.to_le_bytes().to_vec();
-                    bytes.extend(3_u32.to_le_bytes());
-                    bytes.extend(16_u32.to_le_bytes());
-                    bytes.extend(17_u32.to_le_bytes());
-                    bytes.extend([0; 20]);
-                    bytes
-                },
-                "attribute boundary 17 words exceeds",
-            ),
-            (
-                {
                     let mut bytes = valid_inflated_object();
                     bytes.push(0);
                     bytes
@@ -1213,6 +1215,55 @@ mod tests {
             ),
             Err(DgnError::V8ObjectSizeLimitExceeded { declared: 32, .. })
         ));
+    }
+
+    #[test]
+    fn clamps_attribute_boundaries_beyond_the_object() {
+        // 実ファイルの /Dgn^Nm/ ページ: 属性境界がオブジェクト長を超えていた。枠は words で
+        // 決まるので、属性なしとして読み進める(以前はファイル全体が読めなかった)
+        let mut inflated = 0_u32.to_le_bytes().to_vec();
+        inflated.extend(3_u32.to_le_bytes());
+        inflated.extend(16_u32.to_le_bytes());
+        inflated.extend(17_u32.to_le_bytes());
+        inflated.extend([0; 20]);
+        let stream = object_page_stream(1, 2, 1, 1, &inflated);
+        let page = scan_object_page(
+            &stream,
+            1,
+            V8ObjectFamily::Graphical,
+            &mut ScanBudget::new(V8ScanOptions::default()),
+        )
+        .unwrap();
+        let object = &page.objects[0];
+        assert_eq!(object.attribute_words, 16);
+        assert_eq!(object.primary_bytes().len(), 32);
+        assert!(object.attribute_bytes().is_empty());
+    }
+
+    #[test]
+    fn default_object_limit_accepts_large_auxiliary_payloads() {
+        // 実ファイルで 414〜453 KiB のオブジェクト(Dgn^CA / Dgn^GA)があり、旧既定の
+        // 256 KiB で文書全体が落ちていた。枠はページの展開上限で守られている
+        let size = 460 * 1024;
+        let words = u32::try_from(size / 2).unwrap();
+        let mut inflated = 0_u32.to_le_bytes().to_vec();
+        inflated.extend(3_u32.to_le_bytes());
+        inflated.extend(words.to_le_bytes());
+        inflated.extend(words.to_le_bytes());
+        inflated.extend(vec![0; size - OBJECT_HEADER_BYTES]);
+        let stream = object_page_stream(1, 2, 1, 1, &inflated);
+        let page = scan_object_page(
+            &stream,
+            1,
+            V8ObjectFamily::Graphical,
+            &mut ScanBudget::new(V8ScanOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(page.objects[0].byte_range.len(), size);
+        const {
+            assert!(DEFAULT_MAX_V8_OBJECT_SIZE_BYTES >= 16 * 1024 * 1024);
+            assert!(DEFAULT_MAX_V8_OBJECT_SIZE_BYTES <= DEFAULT_MAX_V8_INFLATED_STREAM_BYTES);
+        }
     }
 
     #[test]

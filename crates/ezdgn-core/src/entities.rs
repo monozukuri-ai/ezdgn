@@ -452,9 +452,21 @@ pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>
     for record in scan.records.iter().copied() {
         // 属性ポインタが壊れた要素(実ファイルでは型56の1536バイトのベンダ記録)で
         // ファイル全体を落とさない。ジオメトリ語はポインタと無関係なので属性なしで続ける
-        let common_header = decode_common_header_lenient(record, settings.dimension)?;
+        // 削除済み要素(ヘッダの削除ビット)は描かれない。MicroStation は複合要素を削除すると
+        // 見出しの words-to-follow を部品ごと覆う長さに伸ばすため、中身の形が崩れて見えても
+        // ファイル全体は落とさず Unsupported として残す(本番の V7 図面 5 件で確認)
+        let deleted = record.header.deleted;
+        let common_header = match decode_common_header_lenient(record, settings.dimension) {
+            Ok(header) => header,
+            Err(_) if deleted => None,
+            Err(error) => return Err(error),
+        };
         let linkages = decode_attribute_linkages(record, common_header);
-        let data = decode_element_data(record, common_header, &linkages, settings)?;
+        let data = match decode_element_data(record, common_header, &linkages, settings) {
+            Ok(data) => data,
+            Err(_) if deleted => ElementData2D::Unsupported,
+            Err(error) => return Err(error),
+        };
         if matches!(data, ElementData2D::ColorTable(_)) {
             active_color_table = Some(elements.len());
         }
@@ -1136,7 +1148,11 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         .collect::<HashSet<_>>();
     let mut descriptors = elements
         .iter()
-        .map(|element| container_descriptor(element, stream_end))
+        .map(|element| match container_descriptor(element, stream_end) {
+            // 削除済みの見出しの範囲が壊れていても、その要素を入れ物として扱わないだけにする
+            Err(_) if element.raw.header.deleted => Ok(None),
+            other => other,
+        })
         .collect::<Result<Vec<_>, _>>()?;
     // Shared cell definitions (type 34) enclose their component records the
     // same way cells do (total length in words at byte 36, components from
@@ -1170,7 +1186,18 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
             }
         }
     }
-    for (element, descriptor) in elements.iter().zip(descriptors.iter().flatten()) {
+    for (element, descriptor) in elements.iter().zip(descriptors.iter_mut()) {
+        if element.raw.header.deleted
+            && descriptor.is_some_and(|descriptor| !boundaries.contains(&descriptor.end))
+        {
+            *descriptor = None;
+        }
+    }
+    for (element, descriptor) in elements
+        .iter()
+        .zip(descriptors.iter())
+        .filter_map(|(element, descriptor)| descriptor.map(|descriptor| (element, descriptor)))
+    {
         if !boundaries.contains(&descriptor.end) {
             return Err(DgnError::InvalidDescriptionBoundary {
                 offset: element.raw.offset,
@@ -1239,6 +1266,7 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         }
     }
 
+    let mut empty_headers = Vec::new();
     for (index, descriptor) in descriptors.iter().enumerate() {
         if let Some(ContainerDescriptor {
             kind: ContainerKind::Counted(declared),
@@ -1246,15 +1274,30 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         }) = descriptor
         {
             let actual = children[index].len();
-            if *declared != actual {
-                return Err(DgnError::ComplexElementCountMismatch {
-                    offset: elements[index].raw.offset,
-                    element_type: elements[index].raw.header.element_type,
-                    declared: *declared,
-                    actual,
-                });
+            if *declared == actual {
+                continue;
             }
+            // 削除済みの複合要素は部品が見出しのレコード内に入っている(数えない)
+            if elements[index].raw.header.deleted {
+                continue;
+            }
+            // 部品を1件も囲んでいない見出し(全長が見出し自身だけ)は描く物が無い。
+            // ファイルごと落とさず Unsupported に降格する。部品が一部だけ見つかる
+            // 不一致は構造の読み違いの可能性があるので従来どおりエラーにする
+            if actual == 0 {
+                empty_headers.push(index);
+                continue;
+            }
+            return Err(DgnError::ComplexElementCountMismatch {
+                offset: elements[index].raw.offset,
+                element_type: elements[index].raw.header.element_type,
+                declared: *declared,
+                actual,
+            });
         }
+    }
+    for index in empty_headers {
+        elements[index].data = ElementData2D::Unsupported;
     }
     for (index, element) in elements.iter_mut().enumerate() {
         element.parent_index = parents[index];

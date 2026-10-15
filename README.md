@@ -54,6 +54,18 @@ addressable with exact bytes. Product-specific custom-object semantics, full
 dimension annotation semantics, V8 writing/editing, and 3D screen projection
 for plotting remain outside the supported scope.
 
+Real-world files are read tolerantly where the damage is local. Deleted V7
+records (the header's deleted bit) never reject a file: MicroStation extends a
+deleted complex header's words-to-follow over its components, so deleted
+headers are not counted against their declared component number. A live
+complex header that encloses no components is demoted to an unsupported
+element. In V8, a single element with malformed geometry (for example a line
+string with one vertex) becomes an unknown element instead of rejecting its
+model, and an attribute boundary past the end of its object is read as "no
+attributes". The per-object size limit defaults to 16 MiB; objects are slices
+of pages that are already bounded by the 64 MiB per-page and 1 GiB total
+inflation limits, which remain the decompression guards.
+
 V7 3D geometry is not supported. The V7 writer does not yet create cells,
 complex elements, B-splines, arbitrary linkages, or perform in-place editing.
 The raw V7 record framing is shared by 2D and 3D files, so `scan_records()` can

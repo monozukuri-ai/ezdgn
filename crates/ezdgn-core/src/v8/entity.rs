@@ -339,6 +339,10 @@ fn decode_model_elements(
             // must not reject the model; the enclosing header still gets its
             // decodable children, everything else stays a raw child.
             Err(_) if raw.role.is_component() => V8ElementData::Unknown,
+            // 1要素のジオメトリが壊れている(実ファイル: 頂点1個の線列)だけなら、その要素を
+            // Unknown にしてモデル全体は読む。オブジェクトの枠は生走査で検証済みなので、
+            // 他の要素の読み取りには影響しない
+            Err(DgnError::InvalidV8Geometry { .. }) => V8ElementData::Unknown,
             Err(error) => return Err(error),
         };
         elements.push(V8Element {
@@ -1067,6 +1071,43 @@ fn geometry_error(raw: &V8RawObject, context: impl Into<String>) -> DgnError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demotes_one_malformed_geometry_instead_of_rejecting_the_model() {
+        // 本番の V8 図面: 頂点1個の線列(型4)が1つあるだけでモデル全体が読めなかった
+        let fixture = include_bytes!("../../../../tests/data/dgn/v8/test_dgnv8.dgn");
+        let options = V8ScanOptions::default();
+        let mut raw = crate::v8::scan_v8_objects(fixture, options).unwrap();
+        let model = &mut raw.models[0];
+        let (page_index, object_index) = model
+            .graphical_pages
+            .iter()
+            .enumerate()
+            .find_map(|(page_index, page)| {
+                page.objects
+                    .iter()
+                    .position(|object| object.element_type == 4 && !object.role.is_component())
+                    .map(|object_index| (page_index, object_index))
+            })
+            .expect("fixture has a line string");
+        let object = &model.graphical_pages[page_index].objects[object_index];
+        let element_id = object.element_id;
+        let mut bytes = object.as_bytes().to_vec();
+        bytes[COMMON_HEADER_BYTES..COMMON_HEADER_BYTES + 4].copy_from_slice(&1_u32.to_le_bytes());
+        let broken = object.with_object_bytes(bytes);
+        model.graphical_pages[page_index].objects[object_index] = broken;
+
+        let metadata = crate::v8::metadata::decode_model_metadata(model, options).unwrap();
+        let elements = decode_model_elements(model, &metadata, options).unwrap();
+        let demoted = elements
+            .iter()
+            .find(|element| element.raw.element_id == element_id)
+            .unwrap();
+        assert!(matches!(demoted.data, V8ElementData::Unknown));
+        assert!(elements
+            .iter()
+            .any(|element| matches!(element.data, V8ElementData::LineString { .. })));
+    }
 
     #[test]
     fn decodes_text_escape_marker_without_losing_source_bytes() {

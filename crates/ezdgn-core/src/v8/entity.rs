@@ -391,16 +391,24 @@ fn decode_common(
             ),
         ));
     }
+    // The header stores the low corner followed by the extent, not the high
+    // corner.
+    let low = [
+        read_i64(bytes, 0x38).unwrap_or_default(),
+        read_i64(bytes, 0x40).unwrap_or_default(),
+        read_i64(bytes, 0x48).unwrap_or_default(),
+    ];
+    let extent = [
+        read_i64(bytes, 0x50).unwrap_or_default(),
+        read_i64(bytes, 0x58).unwrap_or_default(),
+        read_i64(bytes, 0x60).unwrap_or_default(),
+    ];
     let range_uor = V8Range3I64 {
-        low: [
-            read_i64(bytes, 0x38).unwrap_or_default(),
-            read_i64(bytes, 0x40).unwrap_or_default(),
-            read_i64(bytes, 0x48).unwrap_or_default(),
-        ],
+        low,
         high: [
-            read_i64(bytes, 0x50).unwrap_or_default(),
-            read_i64(bytes, 0x58).unwrap_or_default(),
-            read_i64(bytes, 0x60).unwrap_or_default(),
+            low[0].saturating_add(extent[0]),
+            low[1].saturating_add(extent[1]),
+            low[2].saturating_add(extent[2]),
         ],
     };
     let to_master = |point: [i64; 3]| {
@@ -1176,6 +1184,38 @@ mod tests {
         assert!(elements
             .iter()
             .any(|element| matches!(element.data, V8ElementData::LineString { .. })));
+    }
+
+    #[test]
+    fn range_high_is_the_low_corner_plus_the_stored_extent() {
+        let fixture = include_bytes!("../../../../tests/data/dgn/v8/test_dgnv8.dgn");
+        let options = V8ScanOptions::default();
+        let raw = crate::v8::scan_v8_objects(fixture, options).unwrap();
+        let metadata = crate::v8::metadata::decode_model_metadata(&raw.models[0], options).unwrap();
+        let elements = decode_model_elements(&raw.models[0], &metadata, options).unwrap();
+        let mut checked = 0;
+        for element in &elements {
+            let vertices: Vec<V8Point3> = match &element.data {
+                V8ElementData::Line { start, end } => vec![start.uor, end.uor],
+                V8ElementData::LineString { vertices } | V8ElementData::Shape { vertices } => {
+                    vertices.iter().map(|vertex| vertex.uor).collect()
+                }
+                _ => continue,
+            };
+            let max_x = vertices
+                .iter()
+                .map(|point| point.x)
+                .fold(f64::MIN, f64::max);
+            let max_y = vertices
+                .iter()
+                .map(|point| point.y)
+                .fold(f64::MIN, f64::max);
+            let high = element.common.range_uor.high;
+            assert!((high[0] as f64 - max_x).abs() <= 2.0, "{high:?} vs {max_x}");
+            assert!((high[1] as f64 - max_y).abs() <= 2.0, "{high:?} vs {max_y}");
+            checked += 1;
+        }
+        assert!(checked > 10);
     }
 
     #[test]

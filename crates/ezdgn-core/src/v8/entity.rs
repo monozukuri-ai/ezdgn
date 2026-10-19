@@ -17,6 +17,8 @@ const COMMON_HEADER_BYTES: usize = 0x68;
 /// weight vectors, which do not carry the graphic fields of the full header.
 const COMPONENT_PREFIX_BYTES: usize = 0x20;
 const ELEMENT_3D_FLAG: u32 = 0x0000_0800;
+/// A shared-cell instance stores a three-component origin even when its 3D flag is clear.
+const SHARED_CELL_ORIGIN_BYTES: usize = 24;
 const TEXT_MULTIPLIER_TO_UOR: f64 = 6.0 / 1000.0;
 
 /// Display and identity fields shared by standard V8 graphical objects.
@@ -465,7 +467,7 @@ fn decode_element(
             .map(|vertices| V8ElementData::BSplinePole { vertices }),
         22 => decode_point_string(raw, common, metadata, options),
         27 => decode_bspline_header(raw),
-        35 => decode_shared_cell(raw, common, metadata, linkages),
+        35 => decode_shared_cell(raw, metadata, linkages),
         36 => decode_dimension(raw, common, metadata),
         _ if raw.role.is_header() => Ok(V8ElementData::UnknownComplex {
             child_count: count_at(raw, raw.primary_bytes(), 0x68)?,
@@ -797,16 +799,15 @@ fn decode_cell(
 
 fn decode_shared_cell(
     raw: &V8RawObject,
-    common: &V8CommonHeader,
     metadata: &V8ModelMetadata,
     linkages: &[V8Linkage],
 ) -> Result<V8ElementData, DgnError> {
     let primary = raw.primary_bytes();
     let origin_offset = primary
         .len()
-        .checked_sub(point_bytes(common.dimension))
+        .checked_sub(SHARED_CELL_ORIGIN_BYTES)
         .ok_or_else(|| geometry_error(raw, "shared-cell origin is missing"))?;
-    let origin = decode_point(primary, origin_offset, common.dimension, metadata, raw)?;
+    let origin = decode_point(primary, origin_offset, V8Dimension::Three, metadata, raw)?;
     let transform_start = 0x70;
     let transform_bytes = origin_offset.saturating_sub(transform_start);
     let transform_count = transform_bytes / 8;
@@ -1071,6 +1072,74 @@ fn geometry_error(raw: &V8RawObject, context: impl Into<String>) -> DgnError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v8::raw::test_support::{dgn_with_objects, MODEL_ID};
+
+    const MODEL_HEADER_TYPE: u32 = 66;
+    const MODEL_HEADER_BYTES: usize = 0xe8;
+    const MODEL_UOR_PER_MASTER_OFFSET: usize = 0xe0;
+    const SHARED_CELL_RECORD_BYTES: usize = 0x100;
+    const SHARED_CELL_TRANSFORM_OFFSET: usize = 0x70;
+    const SHARED_CELL_TRANSFORM_VALUES: [f64; 15] = [
+        -1.0, -1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+
+    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_f64(bytes: &mut [u8], offset: usize, value: f64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn model_header() -> Vec<u8> {
+        let mut record = vec![0; MODEL_HEADER_BYTES];
+        write_u32(&mut record, 0, MODEL_HEADER_TYPE);
+        write_u32(&mut record, 4, (MODEL_HEADER_BYTES / 2) as u32);
+        write_u32(&mut record, 8, (MODEL_HEADER_BYTES / 2) as u32);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        write_f64(&mut record, MODEL_UOR_PER_MASTER_OFFSET, 1000.0);
+        let mut stream = 0_u32.to_le_bytes().to_vec();
+        stream.extend(record);
+        stream
+    }
+
+    fn shared_cell_record(geometry_flags: u32, origin_uor: [f64; 3]) -> Vec<u8> {
+        let mut record = vec![0; SHARED_CELL_RECORD_BYTES];
+        write_u32(&mut record, 0, 0x1000_0023);
+        write_u32(&mut record, 4, (SHARED_CELL_RECORD_BYTES / 2) as u32);
+        write_u32(&mut record, 8, (SHARED_CELL_RECORD_BYTES / 2) as u32);
+        write_u32(&mut record, 0x0c, 64);
+        write_u64(&mut record, 0x10, 602);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        write_u32(&mut record, 0x28, geometry_flags);
+        for (index, value) in SHARED_CELL_TRANSFORM_VALUES.iter().enumerate() {
+            write_f64(
+                &mut record,
+                SHARED_CELL_TRANSFORM_OFFSET + index * 8,
+                *value,
+            );
+        }
+        let origin_offset = SHARED_CELL_RECORD_BYTES - SHARED_CELL_ORIGIN_BYTES;
+        for (index, value) in origin_uor.iter().enumerate() {
+            write_f64(&mut record, origin_offset + index * 8, *value);
+        }
+        record
+    }
+
+    fn read_shared_cell(geometry_flags: u32, origin_uor: [f64; 3]) -> V8Element {
+        let dgn = dgn_with_objects(
+            &model_header(),
+            &[shared_cell_record(geometry_flags, origin_uor)],
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        let elements = &document.models[0].elements;
+        assert_eq!(elements.len(), 1);
+        elements[0].clone()
+    }
 
     #[test]
     fn demotes_one_malformed_geometry_instead_of_rejecting_the_model() {
@@ -1114,5 +1183,37 @@ mod tests {
         let raw = [0xff, 0xfe, 1, 0, b'm', b'y', b'T', 0xe9, b'x', b't'];
         let decoded = decode_windows_1252(&raw[4..]);
         assert_eq!(decoded, "myTéxt");
+    }
+
+    #[test]
+    fn shared_cell_instance_origin_keeps_three_components_without_the_3d_flag() {
+        let element = read_shared_cell(0, [1000.0, 2000.0, 0.0]);
+        assert_eq!(element.common.stored_dimension, V8Dimension::Two);
+        let V8ElementData::SharedCellInstance {
+            origin,
+            transform,
+            name,
+        } = &element.data
+        else {
+            panic!("expected a shared-cell instance, got {:?}", element.data);
+        };
+        assert_eq!(origin.uor.as_array(), [1000.0, 2000.0, 0.0]);
+        assert_eq!(origin.master.as_array(), [1.0, 2.0, 0.0]);
+        assert_eq!(transform.as_slice(), &SHARED_CELL_TRANSFORM_VALUES);
+        assert_eq!(name, &None);
+    }
+
+    #[test]
+    fn shared_cell_instance_origin_reads_the_same_bytes_with_the_3d_flag() {
+        let element = read_shared_cell(ELEMENT_3D_FLAG, [1000.0, 2000.0, 3000.0]);
+        assert_eq!(element.common.stored_dimension, V8Dimension::Three);
+        let V8ElementData::SharedCellInstance {
+            origin, transform, ..
+        } = &element.data
+        else {
+            panic!("expected a shared-cell instance, got {:?}", element.data);
+        };
+        assert_eq!(origin.uor.as_array(), [1000.0, 2000.0, 3000.0]);
+        assert_eq!(transform.len(), SHARED_CELL_TRANSFORM_VALUES.len());
     }
 }

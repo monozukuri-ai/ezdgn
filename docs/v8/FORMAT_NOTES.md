@@ -175,7 +175,7 @@ The decoder maps standard element types as follows:
 | 17 | text |
 | 21 / 27 | B-spline pole sequence / curve header |
 | 22 | point string with per-point orientation |
-| 35 | shared-cell instance, origin, transform, linked name when present |
+| 35 | shared-cell instance, origin, transform, linked name when present; the origin is the last three doubles of the record whether or not the 3D flag is set |
 | 36 | bounded dimension anchor |
 
 An unrecognized object carrying a header role becomes `UnknownComplex` with a

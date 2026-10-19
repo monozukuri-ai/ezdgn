@@ -236,6 +236,12 @@ mostly quadrilaterals, and every index was in range. The decoded `Mesh` keeps
 the points (UOR and master) and the loops as zero-based indices with edge
 visibility. A mesh of another style, or whose components do not form a valid
 indexed face-loop mesh, stays an unknown complex element.
+The supported layout is the four-component XYZ/point-index matrix pair above;
+other column counts and missing or extra components remain unknown. Empty
+meshes and face loops with fewer than three indices also remain unknown.
+The decoded point count is bounded by `max_vertices` before allocating points.
+The current mesh tests use constructed records; the private OpenRail corpus
+reported by the contributor is not included in the regression fixtures.
 
 ## Level table entries
 

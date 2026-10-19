@@ -395,7 +395,7 @@ fn decode_model_elements(
     }
     build_hierarchy(&mut elements, options.max_hierarchy_depth)?;
     resolve_container_dimensions(&mut elements);
-    resolve_meshes(&mut elements, metadata);
+    resolve_meshes(&mut elements, metadata, options.max_vertices)?;
     Ok(elements)
 }
 
@@ -982,10 +982,13 @@ const MATRIX_VALUES_PER_VERTEX_LIMIT: usize = 16;
 
 fn decode_mesh_header(raw: &V8RawObject) -> Result<V8ElementData, DgnError> {
     let bytes = raw.primary_bytes();
+    let child_count = count_at(raw, bytes, 0x68)?;
+    let Some(style) = read_u32(bytes, 0x6c) else {
+        return Ok(V8ElementData::UnknownComplex { child_count });
+    };
     Ok(V8ElementData::Mesh {
-        child_count: count_at(raw, bytes, 0x68)?,
-        style: read_u32(bytes, 0x6c)
-            .ok_or_else(|| geometry_error(raw, "mesh style is truncated"))?,
+        child_count,
+        style,
         points: Vec::new(),
         faces: Vec::new(),
     })
@@ -993,10 +996,13 @@ fn decode_mesh_header(raw: &V8RawObject) -> Result<V8ElementData, DgnError> {
 
 fn decode_matrix_header(raw: &V8RawObject) -> Result<V8ElementData, DgnError> {
     let bytes = raw.primary_bytes();
+    let child_count = count_at(raw, bytes, 0x68)?;
+    let Some(columns) = read_u32(bytes, 0x6c) else {
+        return Ok(V8ElementData::UnknownComplex { child_count });
+    };
     Ok(V8ElementData::MatrixHeader {
-        child_count: count_at(raw, bytes, 0x68)?,
-        columns: read_u32(bytes, 0x6c)
-            .ok_or_else(|| geometry_error(raw, "matrix column count is truncated"))?,
+        child_count,
+        columns,
     })
 }
 
@@ -1046,7 +1052,11 @@ fn decode_matrix_values<T>(
 /// indices, zero ending a face and a negative index marking a hidden edge.
 /// A mesh of another style, or whose children do not form such a mesh, is
 /// kept as an unknown complex element.
-fn resolve_meshes(elements: &mut [V8Element], metadata: &V8ModelMetadata) {
+fn resolve_meshes(
+    elements: &mut [V8Element],
+    metadata: &V8ModelMetadata,
+    max_vertices: usize,
+) -> Result<(), DgnError> {
     for index in 0..elements.len() {
         let V8ElementData::Mesh {
             child_count, style, ..
@@ -1055,12 +1065,12 @@ fn resolve_meshes(elements: &mut [V8Element], metadata: &V8ModelMetadata) {
             continue;
         };
         let resolved = if style == MESH_STYLE_INDEXED_FACE_LOOPS {
-            indexed_face_loop_mesh(elements, index, metadata)
+            indexed_face_loop_mesh(elements, index, metadata, max_vertices)?
         } else {
             None
         };
         elements[index].data = match resolved {
-            Some((points, faces)) => V8ElementData::Mesh {
+            Some(IndexedFaceLoopMesh { points, faces }) => V8ElementData::Mesh {
                 child_count,
                 style,
                 points,
@@ -1069,29 +1079,63 @@ fn resolve_meshes(elements: &mut [V8Element], metadata: &V8ModelMetadata) {
             None => V8ElementData::UnknownComplex { child_count },
         };
     }
+    Ok(())
+}
+
+struct IndexedFaceLoopMesh {
+    points: Vec<V8Point>,
+    faces: Vec<V8MeshFace>,
 }
 
 fn indexed_face_loop_mesh(
     elements: &[V8Element],
     index: usize,
     metadata: &V8ModelMetadata,
-) -> Option<(Vec<V8Point>, Vec<V8MeshFace>)> {
-    let children = &elements[index].child_indices;
-    let coordinates = children
-        .iter()
-        .find_map(|child| match &elements[*child].data {
-            V8ElementData::MatrixDoubleData { values } => Some(values),
-            _ => None,
-        })?;
-    let indices = children
-        .iter()
-        .find_map(|child| match &elements[*child].data {
-            V8ElementData::MatrixIntegerData { values } => Some(values),
-            _ => None,
-        })?;
-    if coordinates.len() % POINT_COMPONENTS != 0 {
-        return None;
+    max_vertices: usize,
+) -> Result<Option<IndexedFaceLoopMesh>, DgnError> {
+    // Only the observed XYZ and point-index matrix pair is supported. Do not
+    // guess when a different matrix layout or incomplete hierarchy is present.
+    let [point_header, point_data, index_header, index_data] =
+        elements[index].child_indices.as_slice()
+    else {
+        return Ok(None);
+    };
+    let (
+        V8ElementData::MatrixHeader {
+            child_count: 0,
+            columns: 3,
+        },
+        V8ElementData::MatrixDoubleData {
+            values: coordinates,
+        },
+        V8ElementData::MatrixHeader {
+            child_count: 0,
+            columns: 1,
+        },
+        V8ElementData::MatrixIntegerData { values: indices },
+    ) = (
+        &elements[*point_header].data,
+        &elements[*point_data].data,
+        &elements[*index_header].data,
+        &elements[*index_data].data,
+    )
+    else {
+        return Ok(None);
+    };
+    if coordinates.is_empty() || coordinates.len() % POINT_COMPONENTS != 0 {
+        return Ok(None);
     }
+    let point_count = coordinates.len() / POINT_COMPONENTS;
+    if point_count > max_vertices {
+        return Err(DgnError::V8VertexLimitExceeded {
+            element_id: elements[index].common.element_id,
+            actual: point_count,
+            limit: max_vertices,
+        });
+    }
+    let Some(faces) = face_loops(indices, point_count) else {
+        return Ok(None);
+    };
     let points: Vec<V8Point> = coordinates
         .chunks_exact(POINT_COMPONENTS)
         .map(|xyz| {
@@ -1102,8 +1146,7 @@ fn indexed_face_loop_mesh(
             }
         })
         .collect();
-    let faces = face_loops(indices, points.len())?;
-    Some((points, faces))
+    Ok(Some(IndexedFaceLoopMesh { points, faces }))
 }
 
 fn face_loops(indices: &[i32], point_count: usize) -> Option<Vec<V8MeshFace>> {
@@ -1112,6 +1155,9 @@ fn face_loops(indices: &[i32], point_count: usize) -> Option<Vec<V8MeshFace>> {
     for &value in indices {
         if value == 0 {
             if !face.point_indices.is_empty() {
+                if face.point_indices.len() < 3 {
+                    return None;
+                }
                 faces.push(std::mem::take(&mut face));
             }
             continue;
@@ -1124,9 +1170,12 @@ fn face_loops(indices: &[i32], point_count: usize) -> Option<Vec<V8MeshFace>> {
         face.visible_edges.push(value > 0);
     }
     if !face.point_indices.is_empty() {
+        if face.point_indices.len() < 3 {
+            return None;
+        }
         faces.push(face);
     }
-    Some(faces)
+    (!faces.is_empty()).then_some(faces)
 }
 
 fn resolve_container_dimensions(elements: &mut [V8Element]) {
@@ -1500,7 +1549,7 @@ mod tests {
             tetrahedron.clone(),
             vec![1, 2, -3, 0, 0, 1, 4, 2],
         );
-        resolve_meshes(&mut mesh, &metadata);
+        resolve_meshes(&mut mesh, &metadata, V8ScanOptions::default().max_vertices).unwrap();
         let V8ElementData::Mesh { points, faces, .. } = &mesh[0].data else {
             panic!("mesh was not resolved: {:?}", mesh[0].data);
         };
@@ -1522,18 +1571,153 @@ mod tests {
         );
 
         let mut out_of_range = mesh_elements(&decoded[0], 1, tetrahedron.clone(), vec![1, 5, 2, 0]);
-        resolve_meshes(&mut out_of_range, &metadata);
+        resolve_meshes(
+            &mut out_of_range,
+            &metadata,
+            V8ScanOptions::default().max_vertices,
+        )
+        .unwrap();
         assert!(matches!(
             out_of_range[0].data,
             V8ElementData::UnknownComplex { child_count: 4 }
         ));
 
         let mut other_style = mesh_elements(&decoded[0], 2, tetrahedron, vec![1, 2, 3, 0]);
-        resolve_meshes(&mut other_style, &metadata);
+        resolve_meshes(
+            &mut other_style,
+            &metadata,
+            V8ScanOptions::default().max_vertices,
+        )
+        .unwrap();
         assert!(matches!(
             other_style[0].data,
             V8ElementData::UnknownComplex { child_count: 4 }
         ));
+    }
+
+    fn mesh_records() -> Vec<Vec<u8>> {
+        let record = |element_type: u32, id: u64, size: usize| {
+            let mut bytes = vec![0; size];
+            write_u32(&mut bytes, 0, element_type);
+            write_u32(&mut bytes, 4, (size / 2) as u32);
+            write_u32(&mut bytes, 8, (size / 2) as u32);
+            write_u64(&mut bytes, 0x10, id);
+            write_u64(&mut bytes, 0x18, MODEL_ID);
+            write_u32(&mut bytes, 0x28, ELEMENT_3D_FLAG);
+            bytes
+        };
+        let mut mesh = record(0x3000_0069, 1, 0x70);
+        write_u32(&mut mesh, 0x68, 4);
+        write_u32(&mut mesh, 0x6c, 1);
+        let mut point_header = record(0x7000_0065, 2, 0x70);
+        write_u32(&mut point_header, 0x6c, 3);
+        let coordinates = [
+            0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 1000.0,
+        ];
+        let mut points = record(0x5000_0067, 3, 0x78 + coordinates.len() * 8);
+        write_u32(&mut points, 0x68, coordinates.len() as u32);
+        write_u32(&mut points, 0x6c, coordinates.len() as u32);
+        write_u32(&mut points, 0x70, 49);
+        for (index, value) in coordinates.iter().enumerate() {
+            write_f64(&mut points, 0x78 + index * 8, *value);
+        }
+        let mut index_header = record(0x7000_0065, 4, 0x70);
+        write_u32(&mut index_header, 0x6c, 1);
+        let indices = [1_i32, 2, -3, 0, 1, 4, 2, 0];
+        let mut faces = record(0x5000_0066, 5, 0x78 + indices.len() * 4);
+        write_u32(&mut faces, 0x68, indices.len() as u32);
+        write_u32(&mut faces, 0x6c, indices.len() as u32);
+        write_u32(&mut faces, 0x70, 4386);
+        for (index, value) in indices.iter().enumerate() {
+            faces[0x78 + index * 4..0x7c + index * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        vec![mesh, point_header, points, index_header, faces]
+    }
+
+    fn mesh_dgn() -> Vec<u8> {
+        dgn_with_objects(&model_header(), &mesh_records())
+    }
+
+    #[test]
+    fn malformed_mesh_payloads_preserve_the_model_and_raw_children() {
+        // Truncate a mesh header, matrix header, or point payload while
+        // keeping each raw record's framing valid.
+        for (index, size) in [(0, 0x6c), (1, 0x6c), (2, 0x80)] {
+            let mut records = mesh_records();
+            records[index].truncate(size);
+            write_u32(&mut records[index], 4, (size / 2) as u32);
+            write_u32(&mut records[index], 8, (size / 2) as u32);
+            let bytes = dgn_with_objects(&model_header(), &records);
+            let document = read_v8(&bytes, V8ScanOptions::default()).unwrap();
+            let elements = &document.models[0].elements;
+            assert_eq!(elements.len(), 5);
+            assert_eq!(elements[0].child_indices, vec![1, 2, 3, 4]);
+            assert!(matches!(
+                elements[0].data,
+                V8ElementData::UnknownComplex { .. }
+            ));
+            assert_eq!(elements[index].raw.as_bytes(), records[index]);
+        }
+    }
+
+    #[test]
+    fn reads_mesh_records_through_the_public_document_api() {
+        let document = read_v8(&mesh_dgn(), V8ScanOptions::default()).unwrap();
+        let elements = &document.models[0].elements;
+        let V8ElementData::Mesh { points, faces, .. } = &elements[0].data else {
+            panic!("mesh did not survive raw decoding and hierarchy construction");
+        };
+        assert_eq!(elements[0].child_indices, vec![1, 2, 3, 4]);
+        assert_eq!(points[1].master, V8Point3::new(1.0, 0.0, 0.0));
+        assert_eq!(faces[0].visible_edges, vec![true, true, false]);
+        assert_eq!(faces[1].point_indices, vec![0, 3, 1]);
+        assert!(elements[0].data.is_drawable());
+        assert!(elements[1..].iter().all(|child| !child.data.is_drawable()));
+    }
+
+    #[test]
+    fn mesh_points_obey_the_configured_vertex_limit() {
+        let options = V8ScanOptions {
+            max_vertices: 3,
+            ..V8ScanOptions::default()
+        };
+        assert!(matches!(
+            read_v8(&mesh_dgn(), options),
+            Err(DgnError::V8VertexLimitExceeded {
+                actual: 4,
+                limit: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_mesh_matrices_and_faces_remain_unknown() {
+        let (model, metadata) = fixture_model();
+        let decoded = decode_model_elements(&model, &metadata, V8ScanOptions::default()).unwrap();
+        let coordinates = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        for indices in [
+            vec![],
+            vec![0],
+            vec![1, 0],
+            vec![1, 2, 0],
+            vec![i32::MIN, 2, 3],
+        ] {
+            let mut mesh = mesh_elements(&decoded[0], 1, coordinates.clone(), indices);
+            resolve_meshes(&mut mesh, &metadata, V8ScanOptions::default().max_vertices).unwrap();
+            assert!(matches!(mesh[0].data, V8ElementData::UnknownComplex { .. }));
+        }
+        let mut mesh = mesh_elements(&decoded[0], 1, coordinates.clone(), vec![1, 2, 3, 0]);
+        mesh[1].data = V8ElementData::MatrixHeader {
+            child_count: 0,
+            columns: 2,
+        };
+        resolve_meshes(&mut mesh, &metadata, V8ScanOptions::default().max_vertices).unwrap();
+        assert!(matches!(mesh[0].data, V8ElementData::UnknownComplex { .. }));
+        let mut mesh = mesh_elements(&decoded[0], 1, coordinates, vec![1, 2, 3, 0]);
+        mesh[0].child_indices = vec![2, 4];
+        resolve_meshes(&mut mesh, &metadata, V8ScanOptions::default().max_vertices).unwrap();
+        assert!(matches!(mesh[0].data, V8ElementData::UnknownComplex { .. }));
     }
 
     #[test]

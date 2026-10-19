@@ -20,6 +20,27 @@ SEED_2D = DATA / "v7" / "seed_2d.dgn"
 V8 = DATA / "v8" / "test_dgnv8.dgn"
 
 
+@pytest.mark.parametrize("coordinate_space,scale", [("master", 1), ("uor", 1000)])
+def test_mesh_plot_hides_edges_and_draws_shared_edges_once(
+    mesh_document: ezdgn.V8Document, coordinate_space: str, scale: int
+) -> None:
+    figure, axes = ezdgn.plot(mesh_document, coordinate_space=coordinate_space)
+    segments = [
+        tuple(tuple(value / scale for value in point) for point in segment)
+        for collection in axes.collections
+        if isinstance(collection, LineCollection)
+        for segment in collection.get_segments()
+    ]
+    assert len(segments) == 4
+    assert set(segments) == {
+        ((0, 0), (2, 0)),
+        ((2, 0), (2, 2)),
+        ((0, 0), (0, 2)),
+        ((0, 2), (2, 0)),
+    }
+    plt.close(figure)
+
+
 def test_plot_renders_smalltest_without_flattening_entities() -> None:
     drawing = ezdgn.readfile(SMALLTEST)
 

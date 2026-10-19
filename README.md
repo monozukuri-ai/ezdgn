@@ -48,8 +48,9 @@ the selected seed's design plane are rejected instead of silently clipped.
 
 The native V8 reader decodes model metadata, line, line string, shape, curve,
 point string, text, ellipse, arc, text node, complex chain/shape, cell,
-shared-cell instance, B-spline curve/poles, indexed-face-loop mesh, and a
-bounded dimension anchor.
+shared-cell instance, B-spline curve/poles, indexed face-loop meshes (style 1,
+XYZ/point-index matrix pairs), and a bounded dimension anchor. Mesh previews
+draw visible edges in the XY plane; unsupported matrix layouts remain raw.
 Unknown graphical, control, name-table, linkage, and auxiliary records remain
 addressable with exact bytes. Product-specific custom-object semantics, full
 dimension annotation semantics, V8 writing/editing, and 3D screen projection

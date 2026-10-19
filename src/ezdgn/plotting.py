@@ -502,12 +502,27 @@ class _V8Renderer(_Renderer):
                 if child.kind == "BSPLINE_POLE":
                     points.extend(self._points(child.data.vertices))
             self._polyline(points, style)
+        elif data.kind == "MESH":
+            self._mesh_v8(element, style)
 
     def _points(self, points: tuple[Any, ...]) -> tuple[Point2, ...]:
         return tuple(
             (point.master if self.coordinate_space == "master" else point.uor)[:2]
             for point in points
         )
+
+    def _mesh_v8(self, element: V8Element, style: BasicStyle) -> None:
+        points = self._points(element.data.vertices)
+        drawn: set[tuple[int, int]] = set()
+        for face in element.data.faces:
+            loop = face.point_indices
+            for position, visible in enumerate(face.visible_edges):
+                start = loop[position]
+                end = loop[(position + 1) % len(loop)]
+                edge = (min(start, end), max(start, end))
+                if visible and start != end and edge not in drawn:
+                    drawn.add(edge)
+                    self._polyline((points[start], points[end]), style)
 
     def _ellipse_v8(self, element: V8Element, style: BasicStyle) -> None:
         data = element.data

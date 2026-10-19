@@ -193,3 +193,37 @@ def test_cli_v8_entities_include_native_text_and_hierarchy() -> None:
     assert records[4]["entity"]["height_master"] == pytest.approx(1)
     assert records[27]["child_indices"] == [28, 29]
     assert records[28]["parent_index"] == 27
+
+
+def test_mesh_rows_become_faces_with_edge_visibility() -> None:
+    from ezdgn.v8 import _element_data_from_core
+
+    point = ((10.0, 0.0, 0.0), (0.001, 0.0, 0.0))
+    data = _element_data_from_core(
+        {
+            "kind": "MESH",
+            "child_count": 4,
+            "style": 1,
+            "vertices": [point, point, point],
+            "faces": [([0, 1, 2], [True, True, False])],
+        }
+    )
+
+    assert data.kind == "MESH"
+    assert data.style == 1
+    assert len(data.vertices) == 3
+    assert data.faces == (ezdgn.V8MeshFace((0, 1, 2), (True, True, False)),)
+
+
+def test_mesh_cli_payload_preserves_faces_and_coordinates(mesh_document: ezdgn.V8Document) -> None:
+    from ezdgn.__main__ import _v8_entity_payload
+
+    mesh = mesh_document.models[0].elements[0]
+    assert mesh.is_drawable
+    payload = json.loads(json.dumps(_v8_entity_payload(mesh)))
+    assert payload["style"] == 1
+    assert payload["vertices_master"][3] == [0, 2, 1]
+    assert payload["faces"] == [
+        {"point_indices": [0, 1, 2], "visible_edges": [True, True, False]},
+        {"point_indices": [0, 3, 1], "visible_edges": [True, True, True]},
+    ]

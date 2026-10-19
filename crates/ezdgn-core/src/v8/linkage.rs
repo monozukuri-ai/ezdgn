@@ -115,6 +115,10 @@ pub(crate) fn decode_property_text(bytes: &[u8]) -> Option<String> {
             .collect::<Vec<_>>();
         return String::from_utf16(&units).ok();
     }
+    if let Some(escaped) = bytes.strip_prefix(&[0xff, 0xfe, 0x01, 0x00]) {
+        let escaped = escaped.strip_suffix(&[0]).unwrap_or(escaped);
+        return Some(decode_windows_1252(escaped));
+    }
     std::str::from_utf8(bytes)
         .map(str::to_owned)
         .ok()
@@ -181,5 +185,28 @@ mod tests {
         assert_eq!(malformed.len(), 1);
         assert!(!malformed[0].complete);
         assert_eq!(malformed[0].raw_bytes.as_ref(), [9, 1, 2]);
+    }
+
+    #[test]
+    fn decodes_escaped_windows_1252_property_text() {
+        let mut escaped = vec![0xff, 0xfe, 0x01, 0x00];
+        escaped.extend(b"Kabelr\xe4nna");
+        assert_eq!(
+            decode_property_text(&escaped).as_deref(),
+            Some("Kabelränna")
+        );
+        escaped.push(0);
+        assert_eq!(
+            decode_property_text(&escaped).as_deref(),
+            Some("Kabelränna")
+        );
+        assert_eq!(
+            decode_property_text(&[0xff, 0xfe, 0x01, 0x00, b'm']).as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            decode_property_text(b"BELARMATUR").as_deref(),
+            Some("BELARMATUR")
+        );
     }
 }

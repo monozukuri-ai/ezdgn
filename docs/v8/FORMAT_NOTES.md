@@ -206,8 +206,11 @@ decoded while its original bytes `ff fe 01 00 6d 79 54 e9 78 74` remain
 available. Inline linkages are word-framed with byte length
 `2 * (low_byte(signature) + 1)`. Property linkage kind `0x0056d210` stores the
 property ID at `+0x04`, payload length at `+0x08`, and payload at `+0x0c`;
-observed `ff fd` payloads are UTF-16LE. Unknown and incomplete linkages retain
-their exact bytes.
+observed `ff fd` payloads are UTF-16LE, and `ff fe 01 00` payloads are escaped
+Windows-1252 like text type 17. MicroStation CONNECT files use the escaped form
+for unit labels (properties 19 and 20) and cell names, and plain 8-bit text for
+other names in the same file. Unknown and incomplete linkages retain their
+exact bytes.
 
 ## Level table entries
 

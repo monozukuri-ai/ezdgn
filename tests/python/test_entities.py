@@ -323,6 +323,66 @@ def test_live_complex_header_without_components_is_unsupported() -> None:
     assert [entity.kind for entity in drawing.entities] == ["LINE"]
 
 
+def test_live_complex_headers_with_missing_components_are_skipped() -> None:
+    # 本番の V7 図面: 部品を失った複合見出し(型12/14 が 44 件)の全長が無関係なレコードの途中を
+    # 指していた。以前は "declares a description ending at byte 17348, which is not a record
+    # boundary" でファイル全体が読めなかった。部品ビットの続くレコードだけを部品にし(0 件)、
+    # 見出しは Unsupported に降格して残りを読む
+    header_body = bytearray(4)
+    header_body[0:2] = (3257).to_bytes(2, "little")
+    header_body[2:4] = (6).to_bytes(2, "little")
+    line_body = _middle_i32(0) * 2 + _middle_i32(100) * 2
+    drawing = ezdgn.read(
+        _with_phase_three_records(
+            _record(12, 12, header_body, linkages=bytes(8)), _record(3, 2, line_body)
+        )
+    )
+
+    assert drawing.repaired_container_indices == (11,)
+    assert drawing.repaired_containers == (drawing.elements[11],)
+    assert isinstance(drawing.elements[11], ezdgn.UnsupportedElement)
+    assert drawing.elements[11].record.element_type == 12
+    assert [entity.kind for entity in drawing.entities] == ["LINE"]
+
+
+def test_repaired_complex_header_keeps_its_flagged_components() -> None:
+    line_body = _middle_i32(0) * 2 + _middle_i32(100) * 2
+    component = _record(3, 2, line_body, complex=True)
+    header_body = bytearray(4)
+    header_body[0:2] = (10).to_bytes(2, "little")  # 後続の部品の途中で終わる全長
+    header_body[2:4] = (2).to_bytes(2, "little")
+    drawing = ezdgn.read(
+        _with_phase_three_records(
+            _record(12, 12, header_body, linkages=bytes(8)),
+            component,
+            component,
+            _record(3, 2, line_body),
+        )
+    )
+
+    assert drawing.repaired_container_indices == (11,)
+    assert [entity.kind for entity in drawing.entities] == ["COMPLEX_CHAIN", "LINE"]
+    assert [child.kind for child in drawing.children(11)] == ["LINE", "LINE"]
+
+
+def test_declared_components_without_the_bit_are_kept_when_plausible() -> None:
+    # 部品ビットを落とす書き手: 宣言した終わりが境界で、囲まれたレコードが部品として自然な型なら囲む
+    line_body = _middle_i32(0) * 2 + _middle_i32(100) * 2
+    plain = _record(3, 2, line_body)
+    header_body = bytearray(4)
+    header_body[0:2] = ((48 + 2 * len(plain) - 38) // 2).to_bytes(2, "little")
+    header_body[2:4] = (2).to_bytes(2, "little")
+    drawing = ezdgn.read(
+        _with_phase_three_records(
+            _record(14, 12, header_body, linkages=bytes(8)), plain, plain, plain
+        )
+    )
+
+    assert drawing.repaired_container_indices == (11,)
+    assert [entity.kind for entity in drawing.entities] == ["COMPLEX_SHAPE", "LINE"]
+    assert [child.kind for child in drawing.children(11)] == ["LINE", "LINE"]
+
+
 def test_last_color_table_is_active_for_all_entity_styles() -> None:
     first = _color_table_body((1, 2, 3))
     last = _color_table_body((30, 20, 10))

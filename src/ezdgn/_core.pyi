@@ -214,6 +214,7 @@ PrimitiveScanRow: TypeAlias = tuple[
     list[ColorTableRow],
     int | None,
     Phase4Row,
+    list[int],
 ]
 WriteStyleRow: TypeAlias = tuple[int, int, int, int, int, int]
 WriteEntityRow: TypeAlias = tuple[

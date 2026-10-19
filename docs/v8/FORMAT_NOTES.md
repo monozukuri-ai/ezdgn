@@ -168,7 +168,11 @@ Standard graphical objects share a 0x68-byte prefix:
 | `0x2c` | `u32` | line style |
 | `0x30` | `u32` | line weight |
 | `0x34` | `u32` | color index |
-| `0x38..0x67` | six `i64` | low/high XYZ range in UOR |
+| `0x38..0x67` | six `i64` | low XYZ corner, then XYZ extent, in UOR |
+
+The range's second triple is the extent, not the high corner: in files written
+by MicroStation CONNECT, OpenRail and ODA, low plus extent equals the vertex
+maximum for every element checked. The decoded range reports the high corner.
 
 Point payloads use little-endian finite `f64`: XY for a 2D object and XYZ for
 a 3D object. Complex headers in the baseline can store a 2D bit while owning
@@ -190,7 +194,7 @@ The decoder maps standard element types as follows:
 | 17 | text |
 | 21 / 27 | B-spline pole sequence / curve header |
 | 22 | point string with per-point orientation |
-| 35 | shared-cell instance, origin, transform, linked name when present |
+| 35 | shared-cell instance, origin, transform, linked name when present; the origin is the last three doubles of the record whether or not the 3D flag is set |
 | 36 | bounded dimension anchor |
 
 An unrecognized object carrying a header role becomes `UnknownComplex` with a
@@ -221,8 +225,11 @@ decoded while its original bytes `ff fe 01 00 6d 79 54 e9 78 74` remain
 available. Inline linkages are word-framed with byte length
 `2 * (low_byte(signature) + 1)`. Property linkage kind `0x0056d210` stores the
 property ID at `+0x04`, payload length at `+0x08`, and payload at `+0x0c`;
-observed `ff fd` payloads are UTF-16LE. Unknown and incomplete linkages retain
-their exact bytes.
+observed `ff fd` payloads are UTF-16LE, and `ff fe 01 00` payloads are escaped
+Windows-1252 like text type 17. MicroStation CONNECT files use the escaped form
+for unit labels (properties 19 and 20) and cell names, and plain 8-bit text for
+other names in the same file. Unknown and incomplete linkages retain their
+exact bytes.
 
 ## Level table entries
 

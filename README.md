@@ -60,7 +60,15 @@ records (the header's deleted bit) never reject a file: MicroStation extends a
 deleted complex header's words-to-follow over its components, so deleted
 headers are not counted against their declared component number. A live
 complex header that encloses no components is demoted to an unsupported
-element. In V8, a single element with malformed geometry (for example a line
+element. A live header whose declared description length is unusable (it does
+not end on a record boundary, encloses records without the complex-component
+bit, or points outside the stream, as left behind when an editor removes the
+components) is bounded by the run of component-flagged records that follow it
+instead, which is how MicroStation and GDAL group components. When the declared
+end is a record boundary and only encloses records of the kinds that container
+holds (a writer that left the bit clear on B-spline poles and weights), those
+records are kept as its components. Such headers are listed in
+`Drawing.repaired_containers`. In V8, a single element with malformed geometry (for example a line
 string with one vertex) becomes an unknown element instead of rejecting its
 model, and an attribute boundary past the end of its object is read as "no
 attributes". The per-object size limit defaults to 16 MiB; objects are slices

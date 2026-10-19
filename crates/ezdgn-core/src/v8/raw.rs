@@ -1013,32 +1013,27 @@ pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ]))
 }
 
+/// Builders for minimal synthetic V8 containers shared by the unit tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::io::{Cursor, Write};
 
     use flate2::{write::ZlibEncoder, Compression};
 
-    use super::*;
+    use super::MODEL_INDEX_MAGIC;
 
-    fn zlib(bytes: &[u8]) -> Vec<u8> {
+    /// Model id written to the index entry and expected in object headers.
+    pub(crate) const MODEL_ID: u64 = 7;
+
+    pub(crate) fn zlib(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
     }
 
-    fn object(type_and_flags: u32, level: u32, id: u64) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend(type_and_flags.to_le_bytes());
-        bytes.extend(16_u32.to_le_bytes());
-        bytes.extend(16_u32.to_le_bytes());
-        bytes.extend(level.to_le_bytes());
-        bytes.extend(id.to_le_bytes());
-        bytes.extend(7_u64.to_le_bytes());
-        bytes
-    }
-
-    fn dgn_with_one_object() -> Vec<u8> {
+    /// A single model whose header stream holds `model_header` and whose one
+    /// graphical page holds `objects`, each already framed as a complete record.
+    pub(crate) fn dgn_with_objects(model_header: &[u8], objects: &[Vec<u8>]) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut cfb = cfb::CompoundFile::create_with_version(cfb::Version::V3, cursor).unwrap();
         for storage in [
@@ -1063,7 +1058,7 @@ mod tests {
         index.extend(0_u32.to_le_bytes());
         index.extend(0x0001_0000_u32.to_le_bytes());
         index.extend(0_u32.to_le_bytes());
-        index.extend(7_u64.to_le_bytes());
+        index.extend(MODEL_ID.to_le_bytes());
         index.extend(36_u16.to_le_bytes());
         index.extend(2_u16.to_le_bytes());
         index.extend(2_u32.to_le_bytes());
@@ -1073,23 +1068,46 @@ mod tests {
         index_stream.write_all(&zlib(&index)).unwrap();
         drop(index_stream);
 
-        let mut model_header = cfb.create_stream("/Dgn-Md/#000000/Dgn~Mh").unwrap();
-        model_header.write_all(&zlib(&[0; 32])).unwrap();
-        drop(model_header);
+        let mut model_header_stream = cfb.create_stream("/Dgn-Md/#000000/Dgn~Mh").unwrap();
+        model_header_stream.write_all(&zlib(model_header)).unwrap();
+        drop(model_header_stream);
 
-        let object = object(0x1000_0003, 64, 42);
-        let mut inflated = 0_u32.to_le_bytes().to_vec();
-        inflated.extend(object);
+        let mut inflated = Vec::new();
+        for object in objects {
+            inflated.extend(0_u32.to_le_bytes());
+            inflated.extend(object);
+        }
         let mut page = Vec::new();
-        page.extend(1_u32.to_le_bytes());
+        page.extend(u32::try_from(objects.len()).unwrap().to_le_bytes());
         page.extend(2_u32.to_le_bytes());
         page.extend(1_u32.to_le_bytes());
-        page.extend(1_u32.to_le_bytes());
+        page.extend(u32::try_from(objects.len()).unwrap().to_le_bytes());
         page.extend(zlib(&inflated));
         let mut page_stream = cfb.create_stream("/Dgn-Md/#000000/Dgn^G/$1").unwrap();
         page_stream.write_all(&page).unwrap();
         drop(page_stream);
         cfb.into_inner().into_inner()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{dgn_with_objects, zlib, MODEL_ID};
+    use super::*;
+
+    fn object(type_and_flags: u32, level: u32, id: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(type_and_flags.to_le_bytes());
+        bytes.extend(16_u32.to_le_bytes());
+        bytes.extend(16_u32.to_le_bytes());
+        bytes.extend(level.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+        bytes.extend(MODEL_ID.to_le_bytes());
+        bytes
+    }
+
+    fn dgn_with_one_object() -> Vec<u8> {
+        dgn_with_objects(&[0; 32], &[object(0x1000_0003, 64, 42)])
     }
 
     fn object_page_stream(

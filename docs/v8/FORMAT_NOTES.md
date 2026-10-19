@@ -153,7 +153,11 @@ Standard graphical objects share a 0x68-byte prefix:
 | `0x2c` | `u32` | line style |
 | `0x30` | `u32` | line weight |
 | `0x34` | `u32` | color index |
-| `0x38..0x67` | six `i64` | low/high XYZ range in UOR |
+| `0x38..0x67` | six `i64` | low XYZ corner, then XYZ extent, in UOR |
+
+The range's second triple is the extent, not the high corner: in files written
+by MicroStation CONNECT, OpenRail and ODA, low plus extent equals the vertex
+maximum for every element checked. The decoded range reports the high corner.
 
 Point payloads use little-endian finite `f64`: XY for a 2D object and XYZ for
 a 3D object. Complex headers in the baseline can store a 2D bit while owning

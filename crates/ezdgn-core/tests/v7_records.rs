@@ -818,6 +818,167 @@ fn rejects_phase_four_component_count_mismatches() {
 }
 
 #[test]
+fn reads_deleted_complex_headers_that_span_their_components() {
+    // 本番の V7 図面5件: MicroStation は複合要素を削除すると見出しに削除ビットを立て、
+    // words-to-follow を部品ごと覆う長さに伸ばす。部品数を数えてファイル全体が落ちていた
+    let line = synthetic_record(3, 2, &[0; 16], true, &[]);
+    let group_size = 48 + 2 * line.len();
+    let mut header_body = vec![0; 4];
+    header_body[..2].copy_from_slice(&u16::try_from((group_size - 38) / 2).unwrap().to_le_bytes());
+    header_body[2..4].copy_from_slice(&2_u16.to_le_bytes());
+    let mut header = synthetic_record(12, 2, &header_body, false, &[0; 8]);
+    header.extend_from_slice(&line);
+    header.extend_from_slice(&line);
+    header[1] |= 0x80; // 削除ビット
+    let words = u16::try_from(header.len() / 2 - 2).unwrap();
+    header[2..4].copy_from_slice(&words.to_le_bytes());
+    let live = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let data = with_synthetic_records(&[header, live]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.elements.len(), 13);
+    let deleted = &document.elements[11];
+    assert!(deleted.raw.header.deleted);
+    assert!(deleted.child_indices.is_empty());
+    assert!(matches!(document.elements[12].data, ElementData2D::Line(_)));
+    assert_eq!(document.elements[12].parent_index, None);
+}
+
+#[test]
+fn demotes_live_complex_headers_that_enclose_no_components() {
+    // 本番の V7 図面: 部品1件と宣言しながら全長が見出し自身だけの複合図形(型14)。
+    // 描く物が無いので Unsupported に降格し、後続の要素はそのまま読む
+    let mut header_body = vec![0; 4];
+    header_body[..2].copy_from_slice(&5_u16.to_le_bytes()); // 38 + 10 = 48 = 見出し自身
+    header_body[2..4].copy_from_slice(&1_u16.to_le_bytes());
+    let header = synthetic_record(14, 2, &header_body, false, &[0; 8]);
+    assert_eq!(header.len(), 48);
+    let line = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let data = with_synthetic_records(&[header, line]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::Unsupported
+    ));
+    assert!(document.elements[11].child_indices.is_empty());
+    assert!(matches!(document.elements[12].data, ElementData2D::Line(_)));
+}
+
+#[test]
+fn reads_live_complex_headers_whose_components_are_missing() {
+    // 本番の V7 図面(1.6MB): 部品を失った生きた複合見出し(型12 が 3、型14 が 29)の全長が、
+    // 無関係なレコードの途中(10796 + 38 + 3257×2 = 17348)や、部品でないレコードを囲む境界を
+    // 指していた。MicroStation も GDAL も全長で境界を決めないので、部品ビットの続くレコード
+    // (ここでは 0 件)を部品とし、見出しは Unsupported に降格して残りを読む
+    let line = synthetic_record(3, 2, &[0; 16], false, &[]);
+    // 全長が終端より先(流れの外)
+    let beyond = complex_header(12, 3257, 6);
+    // 全長が後続のアプリ要素(型66)の終わり(レコード境界)に落ちるが、それは部品ではない
+    let foreign = synthetic_record(66, 2, &[0; 16], false, &[]);
+    let enclosing = complex_header(14, u16::try_from((48 + foreign.len() - 38) / 2).unwrap(), 1);
+    // 全長が後続の線の途中に落ちる
+    let midway = complex_header(12, 10, 2);
+    let data = with_synthetic_records(&[beyond, line.clone(), enclosing, foreign, midway, line]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.elements.len(), 17);
+    assert_eq!(document.repaired_containers, [11, 13, 15]);
+    for index in [11, 13, 15] {
+        assert!(matches!(
+            document.elements[index].data,
+            ElementData2D::Unsupported
+        ));
+        assert!(document.elements[index].child_indices.is_empty());
+    }
+    for index in [12, 16] {
+        assert!(matches!(
+            document.elements[index].data,
+            ElementData2D::Line(_)
+        ));
+    }
+    for index in [12, 14, 16] {
+        assert_eq!(document.elements[index].parent_index, None);
+    }
+}
+
+#[test]
+fn accepts_declared_component_runs_that_lack_the_component_bit() {
+    // 書き手が部品ビットを落とした部品(本番の V7 図面では複合図形 12 件の線と、B-spline の
+    // 極・重み): 宣言した終わりが境界で、囲まれたレコードがその見出しの部品として自然な型だけなら
+    // 宣言どおりに囲む
+    let plain = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let header = complex_header(
+        12,
+        u16::try_from((48 + 2 * plain.len() - 38) / 2).unwrap(),
+        2,
+    );
+    let data = with_synthetic_records(&[header, plain.clone(), plain.clone(), plain]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.repaired_containers, [11]);
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::ComplexChain(_)
+    ));
+    assert_eq!(document.elements[11].child_indices, [12, 13]);
+    assert_eq!(document.elements[12].parent_index, Some(11));
+    assert_eq!(document.elements[14].parent_index, None);
+}
+
+#[test]
+fn groups_repaired_complex_headers_by_the_component_bit() {
+    // 全長が合わない見出しでも、直後に部品ビットの付いたレコードが続けばそれを部品にする。
+    // 宣言した部品数(3)と見つかった数(2)の違いも、この見出しでは誤りにしない
+    let component = synthetic_record(3, 2, &[0; 16], true, &[]);
+    let plain = synthetic_record(3, 2, &[0; 16], false, &[]);
+    let header = complex_header(12, 10, 3);
+    let data = with_synthetic_records(&[header, component.clone(), component, plain]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert_eq!(document.repaired_containers, [11]);
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::ComplexChain(_)
+    ));
+    assert_eq!(document.elements[11].child_indices, [12, 13]);
+    assert_eq!(document.elements[12].parent_index, Some(11));
+    assert_eq!(document.elements[13].parent_index, Some(11));
+    assert_eq!(document.elements[14].parent_index, None);
+}
+
+#[test]
+fn consistent_complex_headers_are_not_reported_as_repaired() {
+    let component = synthetic_record(3, 2, &[0; 16], true, &[]);
+    let header = complex_header(
+        12,
+        u16::try_from((48 + 2 * component.len() - 38) / 2).unwrap(),
+        2,
+    );
+    let data = with_synthetic_records(&[header, component.clone(), component]);
+
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert!(document.repaired_containers.is_empty());
+    assert_eq!(document.elements[11].child_indices, [12, 13]);
+}
+
+#[test]
+fn deleted_records_with_undecodable_data_do_not_reject_the_file() {
+    let mut deleted = synthetic_record(3, 2, &[0; 4], false, &[]);
+    deleted[1] |= 0x80;
+    let data = with_synthetic_records(&[deleted]);
+    let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+    assert!(matches!(
+        document.elements[11].data,
+        ElementData2D::Unsupported
+    ));
+
+    // 削除されていない要素は従来どおり厳格に扱う
+    let live = synthetic_record(3, 2, &[0; 4], false, &[]);
+    assert!(read_v7_2d(&with_synthetic_records(&[live]), ScanOptions::default()).is_err());
+}
+
+#[test]
 fn every_scannable_smalltest_prefix_is_safe_for_phase_three() {
     for end in 0..=SMALLTEST.len() {
         let _ = read_v7_2d(&SMALLTEST[..end], ScanOptions::default());
@@ -1106,6 +1267,13 @@ fn synthetic_record(
         record[semantic_size..].copy_from_slice(linkages);
     }
     record
+}
+
+fn complex_header(element_type: u8, total_length_words: u16, num_elements: u16) -> Vec<u8> {
+    let mut body = vec![0; 4];
+    body[..2].copy_from_slice(&total_length_words.to_le_bytes());
+    body[2..4].copy_from_slice(&num_elements.to_le_bytes());
+    synthetic_record(element_type, 12, &body, false, &[0; 8])
 }
 
 fn put_middle_i32(bytes: &mut [u8], offset: usize, value: i32) {

@@ -415,6 +415,13 @@ pub struct V7Document2D<'a> {
     pub elements: Vec<Element2D<'a>>,
     /// Index into `elements` for the last color table in file order.
     pub active_color_table: Option<usize>,
+    /// File-order indices of live complex headers (cells, text nodes,
+    /// chains/shapes, B-spline headers) whose declared description length was
+    /// ignored: it did not end on a record boundary, enclosed records without
+    /// the complex-component bit, or pointed outside the stream. Their extent
+    /// is the run of component-flagged records that follows them instead; a
+    /// header that encloses nothing this way is demoted to `Unsupported`.
+    pub repaired_containers: Vec<usize>,
 }
 
 impl V7Document2D<'_> {
@@ -452,9 +459,21 @@ pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>
     for record in scan.records.iter().copied() {
         // 属性ポインタが壊れた要素(実ファイルでは型56の1536バイトのベンダ記録)で
         // ファイル全体を落とさない。ジオメトリ語はポインタと無関係なので属性なしで続ける
-        let common_header = decode_common_header_lenient(record, settings.dimension)?;
+        // 削除済み要素(ヘッダの削除ビット)は描かれない。MicroStation は複合要素を削除すると
+        // 見出しの words-to-follow を部品ごと覆う長さに伸ばすため、中身の形が崩れて見えても
+        // ファイル全体は落とさず Unsupported として残す(本番の V7 図面 5 件で確認)
+        let deleted = record.header.deleted;
+        let common_header = match decode_common_header_lenient(record, settings.dimension) {
+            Ok(header) => header,
+            Err(_) if deleted => None,
+            Err(error) => return Err(error),
+        };
         let linkages = decode_attribute_linkages(record, common_header);
-        let data = decode_element_data(record, common_header, &linkages, settings)?;
+        let data = match decode_element_data(record, common_header, &linkages, settings) {
+            Ok(data) => data,
+            Err(_) if deleted => ElementData2D::Unsupported,
+            Err(error) => return Err(error),
+        };
         if matches!(data, ElementData2D::ColorTable(_)) {
             active_color_table = Some(elements.len());
         }
@@ -467,7 +486,7 @@ pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>
             data,
         });
     }
-    build_hierarchy(&mut elements, scan.termination.offset())?;
+    let repaired_containers = build_hierarchy(&mut elements, scan.termination.offset())?;
     demote_invalid_bspline_groups(&mut elements);
 
     Ok(V7Document2D {
@@ -475,6 +494,7 @@ pub fn read_v7_2d(input: &[u8], options: ScanOptions) -> Result<V7Document2D<'_>
         settings,
         elements,
         active_color_table,
+        repaired_containers,
     })
 }
 
@@ -1128,16 +1148,41 @@ struct ContainerDescriptor {
     kind: ContainerKind,
 }
 
-fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<(), DgnError> {
+fn build_hierarchy(
+    elements: &mut [Element2D<'_>],
+    stream_end: usize,
+) -> Result<Vec<usize>, DgnError> {
     let boundaries = elements
         .iter()
         .map(|element| element.raw.offset)
         .chain(std::iter::once(stream_end))
         .collect::<HashSet<_>>();
-    let mut descriptors = elements
-        .iter()
-        .map(|element| container_descriptor(element, stream_end))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut repaired = vec![false; elements.len()];
+    let mut descriptors = Vec::with_capacity(elements.len());
+    for (index, element) in elements.iter().enumerate() {
+        let Some(spec) = container_spec(element) else {
+            descriptors.push(None);
+            continue;
+        };
+        let descriptor = match declared_container_end(element, spec, stream_end) {
+            Ok(end) => Some(ContainerDescriptor {
+                end,
+                kind: spec.kind,
+            }),
+            // 削除済みの見出しの範囲が壊れていても、その要素を入れ物として扱わないだけにする
+            Err(_) if element.raw.header.deleted => None,
+            // 生きた見出しの宣言した範囲が流れの外(見出し自身より短い・終端より先)。
+            // 長さは捨て、下で部品ビットの続く範囲に囲い直す
+            Err(_) => {
+                repaired[index] = true;
+                Some(ContainerDescriptor {
+                    end: usize::MAX,
+                    kind: spec.kind,
+                })
+            }
+        };
+        descriptors.push(descriptor);
+    }
     // Shared cell definitions (type 34) enclose their component records the
     // same way cells do (total length in words at byte 36, components from
     // byte 38); the element itself is otherwise not decoded yet. The length is
@@ -1170,13 +1215,58 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
             }
         }
     }
-    for (element, descriptor) in elements.iter().zip(descriptors.iter().flatten()) {
-        if !boundaries.contains(&descriptor.end) {
-            return Err(DgnError::InvalidDescriptionBoundary {
-                offset: element.raw.offset,
-                element_type: element.raw.header.element_type,
-                declared_end: descriptor.end,
-            });
+    for (element, descriptor) in elements.iter().zip(descriptors.iter_mut()) {
+        if element.raw.header.deleted
+            && descriptor.is_some_and(|descriptor| !boundaries.contains(&descriptor.end))
+        {
+            *descriptor = None;
+        }
+    }
+
+    // The declared description length (words from byte 38 to the end of the
+    // last component) is not what delimits a complex group: MicroStation and
+    // GDAL take the records that follow the header and carry the
+    // complex-component bit. Editors do not always keep the length in step
+    // with those records. A real file carried 44 live chain/shape headers
+    // whose components had been removed: their declared ends fell inside
+    // unrelated records (10796 + 38 + 3257 * 2 = 17348) or enclosed records
+    // without the component bit. A live header whose declared end is unusable
+    // keeps the run of component-flagged records after it as its extent
+    // (often nothing, which demotes it below) and is reported through
+    // `V7Document2D::repaired_containers` instead of rejecting the file.
+    let mut run_end = vec![stream_end; elements.len()];
+    let mut next_clear = stream_end;
+    for index in (0..elements.len()).rev() {
+        run_end[index] = next_clear;
+        if !elements[index].raw.header.complex_component {
+            next_clear = elements[index].raw.offset;
+        }
+    }
+    for (index, element) in elements.iter().enumerate() {
+        let Some(descriptor) = descriptors[index].as_mut() else {
+            continue;
+        };
+        let record_end = element.raw.offset + element.raw.bytes.len();
+        let fallback = run_end[index].max(record_end);
+        if repaired[index] || !boundaries.contains(&descriptor.end) {
+            descriptor.end = fallback;
+            repaired[index] = true;
+        } else if descriptor.end > fallback {
+            // 宣言した終わりは境界だが、途中に部品ビットの無いレコードがある。囲まれたレコードが
+            // この見出しの部品として自然な型だけなら(部品のビットを落とす書き手の B-spline の
+            // 極・重みなど)宣言を採り、そうでなければ部品ビットの続く範囲に縮める
+            let (end, kind) = (descriptor.end, descriptor.kind);
+            let plausible = elements[index + 1..]
+                .iter()
+                .take_while(|candidate| candidate.raw.offset < end)
+                .all(|candidate| {
+                    candidate.raw.header.complex_component
+                        || plausible_component(kind, candidate.raw.header.element_type)
+                });
+            if !plausible {
+                descriptor.end = fallback;
+            }
+            repaired[index] = true;
         }
     }
 
@@ -1198,7 +1288,8 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         }
 
         if let Some(&(parent, parent_end)) = stack.last() {
-            if !element.raw.header.complex_component {
+            // 囲い直した見出しの中は、部品ビットが無くても部品として扱う(上で型を確かめている)
+            if !element.raw.header.complex_component && !repaired[parent] {
                 return Err(DgnError::MissingComplexComponentFlag {
                     parent_offset: elements[parent].raw.offset,
                     parent_type: elements[parent].raw.header.element_type,
@@ -1208,15 +1299,11 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
             }
             parents[index] = Some(parent);
             children[parent].push(index);
-            if let Some(descriptor) = descriptors[index] {
+            if let Some(descriptor) = descriptors[index].as_mut() {
                 if descriptor.end > parent_end {
-                    return Err(DgnError::InvalidDescriptionRange {
-                        offset,
-                        element_type: element.raw.header.element_type,
-                        declared_end: descriptor.end as i64,
-                        record_end: offset + element.raw.bytes.len(),
-                        stream_end: parent_end,
-                    });
+                    // 入れ子の見出しが親の範囲をはみ出す宣言: 親の終わりで切る
+                    descriptor.end = parent_end;
+                    repaired[index] = true;
                 }
             }
         }
@@ -1239,6 +1326,7 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         }
     }
 
+    let mut empty_headers = Vec::new();
     for (index, descriptor) in descriptors.iter().enumerate() {
         if let Some(ContainerDescriptor {
             kind: ContainerKind::Counted(declared),
@@ -1246,27 +1334,55 @@ fn build_hierarchy(elements: &mut [Element2D<'_>], stream_end: usize) -> Result<
         }) = descriptor
         {
             let actual = children[index].len();
-            if *declared != actual {
-                return Err(DgnError::ComplexElementCountMismatch {
-                    offset: elements[index].raw.offset,
-                    element_type: elements[index].raw.header.element_type,
-                    declared: *declared,
-                    actual,
-                });
+            if *declared == actual {
+                continue;
             }
+            // 削除済みの複合要素は部品が見出しのレコード内に入っている(数えない)
+            if elements[index].raw.header.deleted {
+                continue;
+            }
+            // 部品を1件も囲んでいない見出し(全長が見出し自身だけ)は描く物が無い。
+            // ファイルごと落とさず Unsupported に降格する。部品が一部だけ見つかる
+            // 不一致は構造の読み違いの可能性があるので従来どおりエラーにする
+            if actual == 0 {
+                empty_headers.push(index);
+                continue;
+            }
+            // 宣言した長さを捨てて部品ビットで囲い直した見出しは、部品数の宣言も信用しない
+            if repaired[index] {
+                continue;
+            }
+            return Err(DgnError::ComplexElementCountMismatch {
+                offset: elements[index].raw.offset,
+                element_type: elements[index].raw.header.element_type,
+                declared: *declared,
+                actual,
+            });
         }
+    }
+    for index in empty_headers {
+        elements[index].data = ElementData2D::Unsupported;
     }
     for (index, element) in elements.iter_mut().enumerate() {
         element.parent_index = parents[index];
         element.child_indices = std::mem::take(&mut children[index]);
     }
-    Ok(())
+    Ok(repaired
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flag)| flag.then_some(index))
+        .collect())
 }
 
-fn container_descriptor(
-    element: &Element2D<'_>,
-    stream_end: usize,
-) -> Result<Option<ContainerDescriptor>, DgnError> {
+#[derive(Debug, Clone, Copy)]
+struct ContainerSpec {
+    /// Byte offset inside the header record from which `words` is counted.
+    base: i64,
+    words: i64,
+    kind: ContainerKind,
+}
+
+fn container_spec(element: &Element2D<'_>) -> Option<ContainerSpec> {
     let (base, words, kind) = match &element.data {
         ElementData2D::Cell(cell) => (
             38_i64,
@@ -1293,13 +1409,46 @@ fn container_descriptor(
             i64::from(surface.description_words),
             ContainerKind::BSplineSurface,
         ),
-        _ => return Ok(None),
+        _ => return None,
     };
+    Some(ContainerSpec { base, words, kind })
+}
+
+/// Record types a container may hold when a writer left the complex-component
+/// bit clear on them; anything else means the declared length swallowed
+/// unrelated records.
+fn plausible_component(kind: ContainerKind, element_type: u8) -> bool {
+    match kind {
+        // セルは何でも囲めるので、ビット無しの採用はしない(無関係な要素を飲み込みやすい)
+        ContainerKind::Cell => false,
+        ContainerKind::Counted(_) => {
+            matches!(
+                element_type,
+                LINE | LINE_STRING | SHAPE | CURVE | ARC | TEXT
+            )
+        }
+        ContainerKind::BSplineCurve => {
+            matches!(element_type, BSPLINE_POLE | BSPLINE_KNOT | BSPLINE_WEIGHT)
+        }
+        ContainerKind::BSplineSurface => matches!(
+            element_type,
+            BSPLINE_POLE | BSPLINE_SURFACE_BOUNDARY | BSPLINE_KNOT | BSPLINE_WEIGHT
+        ),
+    }
+}
+
+/// End offset the header declares for its description, validated against the
+/// header's own record and the bounded stream.
+fn declared_container_end(
+    element: &Element2D<'_>,
+    spec: ContainerSpec,
+    stream_end: usize,
+) -> Result<usize, DgnError> {
     let record_end = element.raw.offset + element.raw.bytes.len();
     let calculated = i64::try_from(element.raw.offset).ok().and_then(|offset| {
-        words
+        spec.words
             .checked_mul(2)
-            .and_then(|length| offset.checked_add(base + length))
+            .and_then(|length| offset.checked_add(spec.base + length))
     });
     let Some(declared_end) = calculated else {
         return Err(DgnError::InvalidDescriptionRange {
@@ -1310,7 +1459,7 @@ fn container_descriptor(
             stream_end,
         });
     };
-    if words < 0
+    if spec.words < 0
         || declared_end < i64::try_from(record_end).unwrap_or(i64::MAX)
         || declared_end > i64::try_from(stream_end).unwrap_or(i64::MAX)
     {
@@ -1322,10 +1471,7 @@ fn container_descriptor(
             stream_end,
         });
     }
-    Ok(Some(ContainerDescriptor {
-        end: declared_end as usize,
-        kind,
-    }))
+    Ok(declared_end as usize)
 }
 
 /// B-spline headers whose components do not match the header are kept as raw

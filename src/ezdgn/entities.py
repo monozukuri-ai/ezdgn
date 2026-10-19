@@ -212,6 +212,7 @@ PrimitiveScanRow: TypeAlias = tuple[
     list[ColorTableRow],
     int | None,
     Phase4Row,
+    list[int],
 ]
 
 
@@ -699,6 +700,9 @@ class Drawing:
     design_settings: DesignSettings
     elements: tuple[DgnElement, ...]
     active_color_table_index: int | None
+    #: Indices of complex headers whose declared description length was
+    #: ignored while restoring the hierarchy (see ``repaired_containers``).
+    repaired_container_indices: tuple[int, ...] = ()
 
     @property
     def entities(self) -> tuple[GraphicElement, ...]:
@@ -742,6 +746,19 @@ class Drawing:
             for element in self.elements
             if isinstance(element, UnsupportedElement)
         )
+
+    @property
+    def repaired_containers(self) -> tuple[DgnElement, ...]:
+        """Complex headers whose declared description length was ignored.
+
+        The length did not end on a record boundary, enclosed records without
+        the complex-component bit, or pointed outside the record stream, so the
+        header's components are the component-flagged records that follow it
+        (as MicroStation and GDAL read them). A header that encloses nothing
+        this way is also an :class:`UnsupportedElement`.
+        """
+
+        return tuple(self.elements[index] for index in self.repaired_container_indices)
 
     @property
     def color_table(self) -> ColorTable | None:
@@ -891,6 +908,7 @@ def _drawing_from_core(data: bytes, row: PrimitiveScanRow) -> Drawing:
         color_table_rows,
         active_color_table_index,
         phase4,
+        repaired_container_rows,
     ) = row
     (
         curve_rows,
@@ -981,6 +999,7 @@ def _drawing_from_core(data: bytes, row: PrimitiveScanRow) -> Drawing:
         design_settings=headers.design_settings,
         elements=elements,
         active_color_table_index=active_color_table_index,
+        repaired_container_indices=tuple(repaired_container_rows),
     )
 
 

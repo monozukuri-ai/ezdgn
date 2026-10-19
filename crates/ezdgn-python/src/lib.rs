@@ -214,6 +214,7 @@ type PrimitiveScanRow = (
     Vec<ColorTableRow>,
     Option<usize>,
     Phase4Row,
+    Vec<usize>,
 );
 type WriteStyleRow = (u8, u8, u8, u8, u16, u16);
 type WriteEntityRow = (
@@ -1384,6 +1385,7 @@ fn primitive_scan_row(document: &V7Document2D<'_>) -> PrimitiveScanRow {
                 .collect(),
             (shared_cell_definitions, shared_cell_instances),
         ),
+        document.repaired_containers.clone(),
     )
 }
 

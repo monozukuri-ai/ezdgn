@@ -131,6 +131,10 @@ Hex is corroborated by hidden models in `/Dgn-Nd`, which share the ID sequence
 and are named `#00000d` through `#000033`. A decimal name and the low half of
 the flags word are accepted as fallbacks, and no storage is assigned to two
 entries; storages no entry names are still loaded, with an empty name.
+Canonical hex paths are assigned for all entries before decimal and legacy
+fallbacks, so a stale entry cannot claim another model's canonical storage.
+Path lookup uses the full 32-bit ID; the historical `storage_index` field
+retains its 16-bit type, while `flags` and `storage_path` retain the full ID.
 
 Bit 16 of the flags word is set exactly on the models with 3D content in the
 files observed, including an ODA-written 3D model, and clear on 2D design and

@@ -246,7 +246,8 @@ pub struct V8ModelIndexEntry {
     pub index: usize,
     /// Flags word at entry offset 0 (bit 16 marks a 3D model).
     pub raw_number: u32,
-    /// Storage number named by the model ID at entry offset 4.
+    /// Legacy 16-bit storage number; full IDs remain available in `flags`
+    /// and the resolved model's `storage_path`.
     pub storage_index: u16,
     pub model_number: u16,
     /// The model ID at entry offset 4, kept under its historical name.
@@ -353,22 +354,34 @@ fn scan_v8_streams(
     let mut models = Vec::with_capacity(model_index.len());
     let mut skipped_models = Vec::new();
     let mut claimed_storages = Vec::new();
-    for entry in model_index {
+    let candidates: Vec<_> = model_index.iter().map(model_storage_candidates).collect();
+    let mut selected_storages = vec![None; model_index.len()];
+    // Reserve every canonical ID before trying decimal or legacy paths. A
+    // stale entry must not steal the storage of a later live index entry.
+    for priority in 0..3 {
+        for (index, paths) in candidates.iter().enumerate() {
+            let path = &paths[priority];
+            if selected_storages[index].is_none()
+                && !claimed_storages.contains(path)
+                && streams.get(&model_header_path(path)).is_some()
+            {
+                claimed_storages.push(path.clone());
+                selected_storages[index] = Some(path.clone());
+            }
+        }
+    }
+    for ((entry, storage_path), candidates) in model_index
+        .into_iter()
+        .zip(selected_storages)
+        .zip(candidates)
+    {
         // Writers keep deleted or externalized models in the index while
         // dropping their storage; skip those instead of rejecting the file,
         // as long as at least one stored model remains.
-        let candidates = model_storage_candidates(&entry);
-        let storage_path = candidates
-            .iter()
-            .find(|path| {
-                !claimed_storages.contains(*path) && streams.get(&model_header_path(path)).is_some()
-            })
-            .cloned();
         let Some(storage_path) = storage_path else {
             skipped_models.push(model_header_path(&candidates[0]));
             continue;
         };
-        claimed_storages.push(storage_path.clone());
         if let Some(model) = scan_model_storage(&streams, entry, storage_path, &mut budget)? {
             models.push(model);
         }
@@ -444,19 +457,13 @@ fn model_header_path(storage_path: &str) -> String {
 /// entry offset 4 names the storage in lowercase hex (`#00000a`); the decimal
 /// spelling and the low half of the flags word are fallbacks for writers whose
 /// IDs never reach 10 or whose entries are laid out the older way.
-fn model_storage_candidates(entry: &V8ModelIndexEntry) -> Vec<String> {
+fn model_storage_candidates(entry: &V8ModelIndexEntry) -> [String; 3] {
     let legacy_storage = entry.raw_number as u16;
-    let mut candidates = Vec::with_capacity(3);
-    for candidate in [
-        format!("{MODEL_STORAGE_PREFIX}{:06x}", entry.storage_index),
-        format!("{MODEL_STORAGE_PREFIX}{:06}", entry.storage_index),
+    [
+        format!("{MODEL_STORAGE_PREFIX}{:06x}", entry.flags),
+        format!("{MODEL_STORAGE_PREFIX}{:06}", entry.flags),
         format!("{MODEL_STORAGE_PREFIX}{legacy_storage:06}"),
-    ] {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
+    ]
 }
 
 /// Scan the object pages of one model storage, or return `None` when the
@@ -1128,6 +1135,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, Write};
+
     use super::test_support::{dgn_with_objects, zlib, MODEL_ID};
     use super::*;
 
@@ -1282,6 +1291,41 @@ mod tests {
                     Some(2)
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn fallbacks_do_not_claim_another_entries_model_storage() {
+        let bytes = dgn_with_models(
+            &[("#000000", 1), ("#000002", 2)],
+            &[(0, 9, "deleted"), (0, 0, "first"), (0, 2, "second")],
+        );
+        assert_eq!(
+            scanned_models(&bytes),
+            vec![
+                ("first".to_owned(), "/Dgn-Md/#000000".to_owned(), Some(1)),
+                ("second".to_owned(), "/Dgn-Md/#000002".to_owned(), Some(2)),
+            ]
+        );
+        // A decimal spelling must not take the canonical hex path of ID 16.
+        let bytes = dgn_with_models(
+            &[("#000010", 16), ("#000001", 10)],
+            &[(1, 10, "legacy"), (0, 16, "hex")],
+        );
+        assert_eq!(scanned_models(&bytes)[0].1, "/Dgn-Md/#000001");
+        assert_eq!(scanned_models(&bytes)[1].1, "/Dgn-Md/#000010");
+    }
+
+    #[test]
+    fn storage_paths_use_the_full_model_id() {
+        let bytes = dgn_with_models(&[("#010000", 65536)], &[(0, 65536, "large")]);
+        assert_eq!(
+            scanned_models(&bytes),
+            vec![(
+                "large".to_owned(),
+                "/Dgn-Md/#010000".to_owned(),
+                Some(65536)
+            )]
         );
     }
 

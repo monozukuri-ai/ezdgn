@@ -219,8 +219,12 @@ pub(crate) fn decode_model_metadata(
 /// A model-index entry marks a 3D model with bit 16 of its flags word; the
 /// header flag is the fallback for storages the index does not name.
 fn model_dimension(type_and_flags: u32, entry: &V8ModelIndexEntry) -> V8Dimension {
-    let indexed_as_2d = !entry.raw_bytes.is_empty() && entry.raw_number & MODEL_INDEX_3D_FLAG == 0;
-    if indexed_as_2d || type_and_flags & MODEL_DIMENSION_2D_FLAG != 0 {
+    let is_2d = if entry.raw_bytes.is_empty() {
+        type_and_flags & MODEL_DIMENSION_2D_FLAG != 0
+    } else {
+        entry.raw_number & MODEL_INDEX_3D_FLAG == 0
+    };
+    if is_2d {
         V8Dimension::Two
     } else {
         V8Dimension::Three
@@ -331,6 +335,13 @@ mod tests {
             V8Dimension::Three
         );
         assert_eq!(model_dimension(0, &index_entry(0, &[])), V8Dimension::Three);
+        assert_eq!(
+            model_dimension(
+                MODEL_DIMENSION_2D_FLAG,
+                &index_entry(MODEL_INDEX_3D_FLAG, &entry_bytes)
+            ),
+            V8Dimension::Three
+        );
         assert_eq!(
             model_dimension(MODEL_DIMENSION_2D_FLAG, &index_entry(0, &[])),
             V8Dimension::Two

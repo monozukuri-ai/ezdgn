@@ -62,6 +62,8 @@ pub enum V8TextEncoding {
     Utf8,
     Windows1252,
     EscapedWindows1252,
+    Utf16Le,
+    Utf16Be,
 }
 
 impl V8TextEncoding {
@@ -71,6 +73,8 @@ impl V8TextEncoding {
             Self::Utf8 => "utf-8",
             Self::Windows1252 => "windows-1252",
             Self::EscapedWindows1252 => "v8-escaped-windows-1252",
+            Self::Utf16Le => "utf-16-le",
+            Self::Utf16Be => "utf-16-be",
         }
     }
 }
@@ -636,6 +640,51 @@ fn decode_point_string(
     })
 }
 
+/// `FF FE` / `FE FF` + UTF-16 text, as some producers store V8 strings (production
+/// drawings in Latvian, Czech and English, 2026). The payload must be an even number
+/// of bytes apart from a trailing NUL, decode without unpaired surrogates and contain
+/// no control characters other than tab and line ends; a code page string that merely
+/// begins with those two bytes fails that test and stays on the code page path.
+fn utf16_byte_order(raw: &[u8]) -> Option<V8TextEncoding> {
+    let encoding = match raw.get(..2)? {
+        [0xff, 0xfe] => V8TextEncoding::Utf16Le,
+        [0xfe, 0xff] => V8TextEncoding::Utf16Be,
+        _ => return None,
+    };
+    decode_utf16_payload(&raw[2..], encoding).map(|_| encoding)
+}
+
+fn decode_utf16_payload(body: &[u8], encoding: V8TextEncoding) -> Option<String> {
+    let body = if body.len() % 2 == 1 {
+        if body.last() != Some(&0) {
+            return None;
+        }
+        &body[..body.len() - 1]
+    } else {
+        body
+    };
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|pair| {
+            let bytes = [pair[0], pair[1]];
+            if encoding == V8TextEncoding::Utf16Be {
+                u16::from_be_bytes(bytes)
+            } else {
+                u16::from_le_bytes(bytes)
+            }
+        })
+        .collect();
+    let text = String::from_utf16(&units).ok()?;
+    let text = text.trim_end_matches('\0');
+    if text
+        .chars()
+        .any(|c| c < ' ' && !matches!(c, '\t' | '\n' | '\r'))
+    {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
 fn decode_text(
     raw: &V8RawObject,
     common: &V8CommonHeader,
@@ -681,17 +730,23 @@ fn decode_text(
     let (encoding, decoded_bytes) = if let Some(bytes) = raw_text.strip_prefix(&[0xff, 0xfe, 1, 0])
     {
         (V8TextEncoding::EscapedWindows1252, bytes)
+    } else if let Some(encoding) = utf16_byte_order(raw_text) {
+        (encoding, &raw_text[2..])
     } else if std::str::from_utf8(raw_text).is_ok() {
         (V8TextEncoding::Utf8, raw_text)
     } else {
         (V8TextEncoding::Windows1252, raw_text)
     };
-    let text = if encoding == V8TextEncoding::Utf8 {
-        std::str::from_utf8(decoded_bytes)
+    let text = match encoding {
+        V8TextEncoding::Utf8 => std::str::from_utf8(decoded_bytes)
             .unwrap_or_default()
-            .to_owned()
-    } else {
-        decode_windows_1252(decoded_bytes)
+            .to_owned(),
+        V8TextEncoding::Utf16Le | V8TextEncoding::Utf16Be => {
+            decode_utf16_payload(decoded_bytes, encoding).unwrap_or_default()
+        }
+        V8TextEncoding::Windows1252 | V8TextEncoding::EscapedWindows1252 => {
+            decode_windows_1252(decoded_bytes)
+        }
     };
     let width_multiplier_raw = finite_f64(primary, 0x70, raw, "text width multiplier")?;
     let height_multiplier_raw = finite_f64(primary, 0x78, raw, "text height multiplier")?;
@@ -1789,5 +1844,54 @@ mod tests {
         };
         assert_eq!(origin.uor.as_array(), [1000.0, 2000.0, 3000.0]);
         assert_eq!(transform.len(), SHARED_CELL_TRANSFORM_VALUES.len());
+    }
+}
+
+#[cfg(test)]
+mod utf16_text_tests {
+    use super::{decode_utf16_payload, utf16_byte_order, V8TextEncoding};
+
+    fn marked(mark: [u8; 2], text: &str, big_endian: bool) -> Vec<u8> {
+        let mut out = mark.to_vec();
+        for unit in text.encode_utf16() {
+            out.extend(if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn byte_order_marked_utf16_is_recognised() {
+        let latvian = marked([0xff, 0xfe], "Pārskata plāns", false);
+        assert_eq!(utf16_byte_order(&latvian), Some(V8TextEncoding::Utf16Le));
+        assert_eq!(
+            decode_utf16_payload(&latvian[2..], V8TextEncoding::Utf16Le).as_deref(),
+            Some("Pārskata plāns")
+        );
+        let mut czech = marked([0xff, 0xfe], "Čerpací šachta", false);
+        czech.push(0); // a trailing NUL is tolerated
+        assert_eq!(utf16_byte_order(&czech), Some(V8TextEncoding::Utf16Le));
+        assert_eq!(
+            decode_utf16_payload(&czech[2..], V8TextEncoding::Utf16Le).as_deref(),
+            Some("Čerpací šachta")
+        );
+        let plan = marked([0xfe, 0xff], "Plan", true);
+        assert_eq!(utf16_byte_order(&plan), Some(V8TextEncoding::Utf16Be));
+        assert_eq!(
+            decode_utf16_payload(&plan[2..], V8TextEncoding::Utf16Be).as_deref(),
+            Some("Plan")
+        );
+    }
+
+    #[test]
+    fn code_page_bytes_that_merely_start_with_ff_fe_are_not_utf16() {
+        assert_eq!(utf16_byte_order(&[0xff, 0xfe, 0xe4, 0x04, b'A', b'B', b'C']), None); // odd
+        assert_eq!(utf16_byte_order(&[0xff, 0xfe, b'A', b'B', 0x07, 0x00]), None); // control
+        assert_eq!(utf16_byte_order(&[0xff, 0xfe, 1, 0, b'm', b'y']), None); // escaped layout
+        assert_eq!(utf16_byte_order(b"plain"), None);
+        assert_eq!(utf16_byte_order(&[0xff]), None);
     }
 }

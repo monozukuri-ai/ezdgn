@@ -1888,8 +1888,14 @@ mod utf16_text_tests {
 
     #[test]
     fn code_page_bytes_that_merely_start_with_ff_fe_are_not_utf16() {
-        assert_eq!(utf16_byte_order(&[0xff, 0xfe, 0xe4, 0x04, b'A', b'B', b'C']), None); // odd
-        assert_eq!(utf16_byte_order(&[0xff, 0xfe, b'A', b'B', 0x07, 0x00]), None); // control
+        assert_eq!(
+            utf16_byte_order(&[0xff, 0xfe, 0xe4, 0x04, b'A', b'B', b'C']),
+            None
+        ); // odd
+        assert_eq!(
+            utf16_byte_order(&[0xff, 0xfe, b'A', b'B', 0x07, 0x00]),
+            None
+        ); // control
         assert_eq!(utf16_byte_order(&[0xff, 0xfe, 1, 0, b'm', b'y']), None); // escaped layout
         assert_eq!(utf16_byte_order(b"plain"), None);
         assert_eq!(utf16_byte_order(&[0xff]), None);

@@ -69,7 +69,10 @@ instead, which is how MicroStation and GDAL group components. When the declared
 end is a record boundary and only encloses records of the kinds that container
 holds (a writer that left the bit clear on B-spline poles and weights), those
 records are kept as its components. Such headers are listed in
-`Drawing.repaired_containers`. In V8, a single element with malformed geometry (for example a line
+`Drawing.repaired_containers`. A complex chain or shape header whose declared
+element count matches the records nested anywhere beneath it rather than its
+direct components (some writers count the header, pole and knot records of a
+contained B-spline curve individually) is accepted as written. In V8, a single element with malformed geometry (for example a line
 string with one vertex) becomes an unknown element instead of rejecting its
 model, and an attribute boundary past the end of its object is read as "no
 attributes". The per-object size limit defaults to 16 MiB; objects are slices

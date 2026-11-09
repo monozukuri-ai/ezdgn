@@ -818,6 +818,62 @@ fn rejects_phase_four_component_count_mismatches() {
 }
 
 #[test]
+fn accepts_component_counts_that_include_nested_records() {
+    // 複合シェイプの中の B-spline 曲線は見出し(型27)と極・節の複数レコードになる。
+    // 書き手によっては numelems を直下の部品数ではなく入れ子を含む全記録数で書く。
+    // 全長が合っていれば、その数え方の宣言も受け入れる(ここでは入れ子を複合チェーンで表す)
+    let inner = synthetic_record(3, 2, &[0; 16], true, &[]);
+    let chain_size = 48 + inner.len();
+    let mut chain_body = vec![0; 4];
+    chain_body[..2].copy_from_slice(&u16::try_from((chain_size - 38) / 2).unwrap().to_le_bytes());
+    chain_body[2..4].copy_from_slice(&1_u16.to_le_bytes());
+    let chain = synthetic_record(12, 2, &chain_body, true, &[0; 8]);
+    let outer = synthetic_record(3, 2, &[0; 16], true, &[]);
+    let group_size = 48 + chain_size + outer.len();
+    let shape_header = |declared: u16| {
+        let mut body = vec![0; 4];
+        body[..2].copy_from_slice(&u16::try_from((group_size - 38) / 2).unwrap().to_le_bytes());
+        body[2..4].copy_from_slice(&declared.to_le_bytes());
+        synthetic_record(14, 2, &body, false, &[0; 8])
+    };
+
+    // 直下の部品数(チェーン + 線 = 2)でも、入れ子を含む全記録数(3)でも読める
+    for declared in [2_u16, 3] {
+        let data = with_synthetic_records(&[
+            shape_header(declared),
+            chain.clone(),
+            inner.clone(),
+            outer.clone(),
+        ]);
+        let document = read_v7_2d(&data, ScanOptions::default()).unwrap();
+        assert!(matches!(
+            document.elements[11].data,
+            ElementData2D::ComplexShape(_)
+        ));
+        assert_eq!(
+            document.elements[11].child_indices,
+            [12, 14],
+            "declared {declared}"
+        );
+        assert_eq!(document.elements[12].child_indices, [13]);
+        assert_eq!(document.elements[13].parent_index, Some(12));
+        assert_eq!(document.elements[14].parent_index, Some(11));
+        assert!(document.repaired_containers.is_empty());
+    }
+
+    // どちらの数え方とも合わない宣言は従来どおり誤り
+    let data = with_synthetic_records(&[shape_header(4), chain, inner, outer]);
+    assert!(matches!(
+        read_v7_2d(&data, ScanOptions::default()),
+        Err(DgnError::ComplexElementCountMismatch {
+            declared: 4,
+            actual: 2,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn reads_deleted_complex_headers_that_span_their_components() {
     // 本番の V7 図面5件: MicroStation は複合要素を削除すると見出しに削除ビットを立て、
     // words-to-follow を部品ごと覆う長さに伸ばす。部品数を数えてファイル全体が落ちていた

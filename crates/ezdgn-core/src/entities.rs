@@ -1352,6 +1352,13 @@ fn build_hierarchy(
             if repaired[index] {
                 continue;
             }
+            // 入れ子の記録まで数えた宣言。複合シェイプ/チェーンの中の B-spline 曲線は
+            // 見出し(型27)と極・節(型21/26)の複数レコードになり、その全部を「要素」として
+            // 数える書き手がある。全長(totlength)は合っている(合わなければ上で境界の
+            // 誤りになる)ので、直下の部品数だけでなく入れ子を含めた全記録数とも比べる
+            if *declared == descendant_count(&children, index) {
+                continue;
+            }
             return Err(DgnError::ComplexElementCountMismatch {
                 offset: elements[index].raw.offset,
                 element_type: elements[index].raw.header.element_type,
@@ -1435,6 +1442,18 @@ fn plausible_component(kind: ContainerKind, element_type: u8) -> bool {
             BSPLINE_POLE | BSPLINE_SURFACE_BOUNDARY | BSPLINE_KNOT | BSPLINE_WEIGHT
         ),
     }
+}
+
+/// Number of records nested anywhere beneath `index` (its components, their
+/// components, and so on), as some writers count a complex header's elements.
+fn descendant_count(children: &[Vec<usize>], index: usize) -> usize {
+    let mut pending = children[index].clone();
+    let mut count = 0;
+    while let Some(child) = pending.pop() {
+        count += 1;
+        pending.extend_from_slice(&children[child]);
+    }
+    count
 }
 
 /// End offset the header declares for its description, validated against the

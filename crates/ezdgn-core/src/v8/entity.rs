@@ -260,6 +260,29 @@ impl V8ElementData {
     }
 }
 
+impl V8ElementData {
+    /// The stored orientation quaternion `(w, x, y, z)` of a 3D text,
+    /// ellipse or arc, exactly as stored.
+    ///
+    /// A 3D ellipse or arc stores the four values alone. A 3D text stores
+    /// two other values first, so the quaternion is the last four of its six
+    /// `orientation` values. A 2D element has a rotation angle and no
+    /// quaternion.
+    #[must_use]
+    pub fn quaternion(&self) -> Option<[f64; 4]> {
+        let values = match self {
+            Self::Text { orientation, .. } if orientation.len() == 6 => &orientation[2..],
+            Self::Ellipse { orientation, .. } | Self::Arc { orientation, .. }
+                if orientation.len() == 4 =>
+            {
+                &orientation[..]
+            }
+            _ => return None,
+        };
+        <[f64; 4]>::try_from(values).ok()
+    }
+}
+
 /// One semantic graphical element paired with all retained raw representations.
 #[derive(Debug, Clone)]
 pub struct V8Element {
@@ -1803,6 +1826,67 @@ mod tests {
             }));
             assert!(outcome.is_ok(), "panic after mutation at {offset}");
         }
+    }
+
+    /// A stored-3D type-17 text: `extents` at 0x80, `quaternion` at 0x90,
+    /// origin at 0xb0, editable-field word at 0xc8, payload at 0xca.
+    fn text_3d_record(extents: [f64; 2], quaternion: [f64; 4], text: &[u8]) -> Vec<u8> {
+        let size = (0xca + text.len() + 1) & !1;
+        let mut record = vec![0; size];
+        write_u32(&mut record, 0, 0x1000_0011);
+        write_u32(&mut record, 4, (size / 2) as u32);
+        write_u32(&mut record, 8, (size / 2) as u32);
+        write_u32(&mut record, 0x0c, 64);
+        write_u64(&mut record, 0x10, 700);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        write_u32(&mut record, 0x28, 0x0000_0800);
+        record[0x6e..0x70].copy_from_slice(&(text.len() as u16).to_le_bytes());
+        write_f64(&mut record, 0x70, 1000.0);
+        write_f64(&mut record, 0x78, 1000.0);
+        write_f64(&mut record, 0x80, extents[0]);
+        write_f64(&mut record, 0x88, extents[1]);
+        for (index, value) in quaternion.iter().enumerate() {
+            write_f64(&mut record, 0x90 + index * 8, *value);
+        }
+        for (index, value) in [10.0, 20.0, 30.0].iter().enumerate() {
+            write_f64(&mut record, 0xb0 + index * 8, *value);
+        }
+        record[0xca..0xca + text.len()].copy_from_slice(text);
+        record
+    }
+
+    #[test]
+    fn a_3d_text_exposes_its_stored_quaternion() {
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let dgn = dgn_with_objects(
+            &model_header(),
+            &[
+                text_3d_record([400.0, 60.0], [half, 0.0, 0.0, -half], b"UP"),
+                shared_cell_record(0, [1.0, 2.0, 0.0]),
+            ],
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        let elements = &document.models[0].elements;
+        let V8ElementData::Text {
+            text,
+            orientation,
+            rotation_radians,
+            origin,
+            ..
+        } = &elements[0].data
+        else {
+            panic!("expected a text, got {}", elements[0].kind());
+        };
+        assert_eq!(text, "UP");
+        assert_eq!(
+            (origin.uor.x, origin.uor.y, origin.uor.z),
+            (10.0, 20.0, 30.0)
+        );
+        assert_eq!(*rotation_radians, None);
+        // the six stored values stay as they were: two extents, then w, x, y, z
+        assert_eq!(orientation, &[400.0, 60.0, half, 0.0, 0.0, -half]);
+        assert_eq!(elements[0].data.quaternion(), Some([half, 0.0, 0.0, -half]));
+        assert_eq!(elements[1].data.quaternion(), None);
     }
 
     #[test]

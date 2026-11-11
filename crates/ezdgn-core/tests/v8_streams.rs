@@ -188,6 +188,36 @@ fn scans_real_model_index_graphics_names_and_auxiliary_records() {
 }
 
 #[test]
+fn stored_3d_texts_ellipses_and_arcs_expose_a_quaternion() {
+    let document = read_v8(V8, V8ScanOptions::default()).unwrap();
+    let mut texts = Vec::new();
+    let mut curves = 0;
+    for element in &document.models[0].elements {
+        let stored_3d = element.common.stored_dimension == V8Dimension::Three;
+        match &element.data {
+            V8ElementData::Text { orientation, .. } => {
+                assert_eq!(element.data.quaternion().is_some(), stored_3d);
+                if stored_3d {
+                    assert_eq!(orientation.len(), 6);
+                    texts.push(element.data.quaternion().unwrap());
+                }
+            }
+            V8ElementData::Ellipse { orientation, .. } | V8ElementData::Arc { orientation, .. } => {
+                assert_eq!(element.data.quaternion().is_some(), stored_3d);
+                if stored_3d {
+                    curves += 1;
+                    assert_eq!(element.data.quaternion().unwrap()[..], orientation[..]);
+                }
+            }
+            _ => assert_eq!(element.data.quaternion(), None),
+        }
+    }
+    // the fixture's two 3D texts are not turned: the scalar part comes first
+    assert_eq!(texts, [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]);
+    assert!(curves > 0);
+}
+
+#[test]
 fn decodes_real_model_metadata_primitives_text_and_hierarchy() {
     let document = read_v8(V8, V8ScanOptions::default()).unwrap();
     assert_eq!(document.models.len(), 1);

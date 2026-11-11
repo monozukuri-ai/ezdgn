@@ -86,7 +86,8 @@ tag data remains raw unless independently characterized.
 
 Every layout that this log adds on 2026-11-10 was also run on 90 real-world
 production files held by a contributor (85 2D files and five 3D files
-converted from DWG): the auxiliary entries and the item instances.
+converted from DWG): the auxiliary entries, the item instances, and the
+stored quaternion of 3D text.
 
 These files are highly confidential. They cannot be shared, they are not
 part of this repository, and no byte, name or text from them is recorded
@@ -96,8 +97,9 @@ Most rules have public evidence too, from the checked-in fixture or from the
 two public files above. These rules have none:
 
 - item data: the `fb` UTF-16 string form, and bytes `0x80` and above in the
-  `fa` form; and
-- auxiliary entries: bit 31 of the length word being set.
+  `fa` form;
+- auxiliary entries: bit 31 of the length word being set; and
+- 3D text: the order of the four quaternion values for a text that is turned.
 
 Each of them is listed in `FORMAT_NOTES.md` under "Rules that rest on
 confidential files", with how the rule was found, the counts, and the

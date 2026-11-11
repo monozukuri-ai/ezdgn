@@ -213,6 +213,27 @@ more. The semantic model retains both raw multipliers and both converted
 distances. This conversion reproduces the checked-in GDAL oracle's
 `s:1.000000g` labels and the independently observed public text-node fixture.
 
+A stored-3D type-17 text holds two finite `f64` values at `0x80` and `0x88`,
+a unit quaternion in scalar-first order `(w, x, y, z)` at `0x90`, and its
+origin at `0xb0`. The six values from `0x80` are kept together as the text's
+`orientation`; `quaternion` returns the last four. The two 3D texts of the
+checked-in fixture hold `(1, 0, 0, 0)`. That is the only public evidence, and
+it shows no more than a text that is not turned. The order of the four values
+for a turned text rests on confidential files (see
+"Rules that rest on confidential files" below). In five such files all
+1,875 3D texts hold a unit quaternion there. Only the first and the last of
+the four values are ever not zero, which is a turn about Z when the scalar
+comes first: 1,713 texts are not turned, 157 are turned by a quarter turn and
+5 by a half turn. For the 149 turned texts of three or more characters, the
+local X axis given by the first row of the quaternion's rotation matrix (the
+rule the V7 reader uses for 3D elements) points up for 140, down for 4 and
+left for 5. In all 149 the stored origin lies at the end of the stored range
+where such a text starts: the low Y end, the high Y end and the high X end.
+The 144 quarter turns tell this rule from its transpose, which swaps up and
+down; the 5 half turns do not. The meaning of the two values at `0x80` and
+`0x88` is unresolved. The reader returns the quaternion as stored, computes
+nothing from it, and does not turn it into an angle.
+
 The type-17 text payload starts right after the fixed header (editable-field
 word at `0xa8` for 2D, `0xc8` for 3D; payload at `0xaa` / `0xca`), its byte
 length being the `u16` at `0x6e`. The object may be padded to an even or a
@@ -520,6 +541,7 @@ Each rule can be taken out, and its form left raw, if that is preferred.
 | Item data: the `fb` string form holds UTF-16LE units | Read as UTF-16LE, the string equals the text of a text element in the same file | 11 strings in 11 of 140 instances; each holds a character above U+00FF; 11 of 11 equal a text element | `one_byte_strings_are_code_points_and_wide_strings_are_utf16` |
 | Item data: a byte `0x80` or above in the `fa` form is one code point | Read as one code point per byte, the string equals the text of a text element in the same file; the writer uses the `fb` form for a character that a Windows-1252 byte could hold | 36 strings in 36 of 140 instances (`81` in 19, `bd` in 16, `be` in 1); 36 of 36 equal a text element | the same test |
 | Auxiliary entries: bit 31 of the length word is a flag and not part of the length | A check of structure only, not against other decoded data: with the bit masked off the lengths split every record with no byte left over, and every item entry decodes; with the bit kept each length is longer than its record. What the flag means is not known | set in 1,024 of 1,024 entries of 783 records; all 140 item entries among them decode | `splits_entries_and_keeps_every_header_word` |
+| 3D text: the four values are a quaternion with the scalar first | Only the first and the last value are ever not zero, which is a turn about Z when the scalar is first; the turn was compared with the end of the stored range at which the stored origin lies | 1,875 of 1,875 are unit quaternions; 1,713 not turned, 157 quarter turns, 5 half turns; 149 of the 149 turned texts of three or more characters have the origin at the end that the row rule gives, and 144 of them tell the rule from its transpose | `a_3d_text_exposes_its_stored_quaternion`: the values come back in stored order; the reader computes nothing from them |
 
 ## Deliberately unresolved semantics
 

@@ -227,3 +227,27 @@ def test_mesh_cli_payload_preserves_faces_and_coordinates(mesh_document: ezdgn.V
         {"point_indices": [0, 1, 2], "visible_edges": [True, True, False]},
         {"point_indices": [0, 3, 1], "visible_edges": [True, True, True]},
     ]
+
+
+def test_stored_3d_elements_expose_their_quaternion() -> None:
+    document = ezdgn.read_v8(V8)
+    texts = []
+    curves = 0
+    for element in document.models[0].elements:
+        data = element.data
+        stored_3d = element.common.stored_dimension == 3
+        if element.kind == "TEXT":
+            assert (data.quaternion is not None) == stored_3d
+            if stored_3d:
+                assert data.quaternion == data.orientation[2:]
+                texts.append(data.quaternion)
+        elif element.kind in {"ELLIPSE", "ARC"}:
+            assert (data.quaternion is not None) == stored_3d
+            if stored_3d:
+                curves += 1
+                assert data.quaternion == data.orientation
+        else:
+            assert data.quaternion is None
+    # the fixture's two 3D texts are not turned: the scalar part comes first
+    assert texts == [(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)]
+    assert curves > 0

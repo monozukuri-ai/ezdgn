@@ -437,6 +437,23 @@ class V8ElementData:
         return math.degrees(self.rotation_radians)
 
     @property
+    def quaternion(self) -> tuple[float, float, float, float] | None:
+        """The stored orientation quaternion ``(w, x, y, z)`` of a 3D element.
+
+        A 3D ellipse or arc stores the four values alone. A 3D text stores two
+        other values first, so the quaternion is the last four of its six
+        ``orientation`` values. A 2D element has ``rotation_radians`` and no
+        quaternion.
+        """
+
+        values = self.orientation
+        if self.kind == "TEXT" and len(values) == 6:
+            values = values[2:]
+        elif not (self.kind in {"ELLIPSE", "ARC"} and len(values) == 4):
+            return None
+        return (values[0], values[1], values[2], values[3])
+
+    @property
     def start_angle_degrees(self) -> float | None:
         if self.start_angle_radians is None:
             return None

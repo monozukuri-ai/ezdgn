@@ -41,6 +41,10 @@ public, non-committed V8 files on 2026-07-29:
 | `f34bbb1b408b` | 3,840,000 | `Default` / `Master Model`, 2D, 10 UOR/master, `m` / `m` | 66,053 | 66,053 | 18 lines, 66,035 line strings, 66,053 associated auxiliary records |
 | `8439e6d3a182` | 847,360 | `Default` / `Master Model`, 2D, 10 UOR/master, `m` / `m` | 33,335 | 12,623 | 6,904 text-node headers, 12,623 text children, 13,808 unknown raw objects |
 
+Since the tag decoder (2026-11-10) the 13,808 objects of the second file are
+read as tag elements. They stay outside the feature view, so its entity count
+is unchanged.
+
 These files broaden structural coverage but do not make their application
 schemas part of the supported semantic contract. Full hashes and acquisition
 links are in `PROVENANCE.md`.
@@ -202,6 +206,7 @@ The decoder maps standard element types as follows:
 | 34 | shared-cell definition header in the named pages: component count, range values, matrix, linked name |
 | 35 | shared-cell instance, origin, transform, linked name when present; the origin is the last three doubles of the record whether or not the 3D flag is set |
 | 36 | bounded dimension anchor |
+| 37 | tag element stored as 2D: tag ID, value type, value bytes, text or integer value, tag set and host element IDs, origin when it lies inside the stored range |
 
 An unrecognized object carrying a header role becomes `UnknownComplex` with a
 bounded child count; any other unrecognized object becomes `Unknown`. Both
@@ -591,6 +596,177 @@ of the text) and the meaning of the constants at `0x00`, `0x09`, `0x11` and
 bytes; the public file is read by an optional test when it is present, and the
 five confidential files are not included in the regression fixtures.
 
+## Tag elements and tag sets
+
+A tag is a type-37 graphical object. It holds one value for one definition of
+a tag set, and it can be attached to a host element. These fields were at the
+same place in every 2D tag seen, from two different writers:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0xa0` | two `f64` | XY in UOR: the origin of the host when the tag has one, otherwise the placement point of the tag |
+| `0xb8` | two `f64` | XY step from the first pair to the placement point; zero in a tag without a host |
+| `0xd0` | `u16` | tag ID: the definition of the tag set that the tag fills |
+| `0xd2` | `u16` | value type: 1 is 8-bit text, 3 is a 32-bit integer |
+| `0x138` | `u32` | byte length of the value |
+| `0x13c` | `u32` | 0 from one writer and 1252 from the other; read as a Windows code page number |
+| `0x140` | bytes | the value: text with its closing zero byte, or four little-endian bytes |
+
+One writer ends the primary bytes after the value, padded to an even length;
+the other stores 10 or 11 more bytes. The words at `0x9a`, `0x130` and `0x134`
+and the bytes from `0x120` to `0x130` differ between the two writers and are
+not read. The two `f64` at `0xf0` are not zero in any tag and one tag holds a
+quarter turn at `0x100`; they are not decoded.
+
+Two linkages of kind `0x56d0` (first four bytes `nn 10 d0 56`) hold element
+IDs:
+
+| Linkage | Bytes | Fixed bytes | Element ID |
+| --- | ---: | --- | --- |
+| tag set | 24 | `17 27 00 00 00 02 01 00` at `+0x04` | `u64` at `+0x0c`: the named object that holds the tag set |
+| host | 56 | `10 27 01 00` at `+0x04` and `01 00 07 00 00 00 00 00 00 00` at `+0x0a` | `u64` at `+0x14`: the element the tag is attached to |
+
+The two bytes at `+0x08` of the host linkage are `00 0a` from one writer and
+`02 09` from the other and are not compared.
+
+A tag set is a type-39 object in the named object pages:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x28` | 8 bytes | `74 65 53 74 81 0f 00 00` (`teSt`, then `81 0f 00 00`) |
+| `0x30` | `u32` | differs from set to set; unresolved |
+| `0x34` | `u32` | byte length of the definitions |
+| `0x38` | `u32` | the same length again |
+| `0x3c` | bytes | the definitions, then at most one zero byte of padding |
+
+The name of the set is the property linkage with ID 1. One definition is, in
+this order:
+
+| Part | Meaning |
+| --- | --- |
+| 8-bit text, `00` | name of the tag |
+| `u16` | tag ID |
+| 8-bit text, `00` | prompt; can be empty |
+| `u16` | value type, 1 or 3 |
+| two `u16` | differ between the two writers; skipped |
+| `00` | zero in every definition seen |
+| default | 8-bit text and `00` for type 1; four bytes for type 3 |
+
+Evidence:
+
+- The public tree label file in `PROVENANCE.md` holds 13,808 tags in one 2D
+  model. All have the standalone role: none is a component of a complex
+  element, though each is attached to a host by a linkage (see below). There
+  are 6,904 text values and 6,904 integer values (1 to
+  58), and all decode. Its one tag set has two definitions, `Species` (ID 1,
+  text) and `Tree Count` (ID 2, integer). Every tag names that set, and its
+  tag ID is defined there with its value type. Every tag has a host linkage
+  to a text-node header of the model, two tags for each of the 6,904 text
+  nodes. The pair at `0xa0` equals the origin of the host in all 13,808 tags;
+  the pair at `0xb8` is `(0, -10)` in the text tags and `(0, -20)` in the
+  integer tags. The stored range of every tag in this file is the single
+  point `(0, 0)`, so the file cannot confirm the placement point.
+- In 85 confidential real-world 2D files, from another writer, 14
+  files hold 678 tags in their models and 526 more are components of
+  shared-cell definitions. 1,194 hold text and all decode; 18 of these values
+  hold bytes above `0x7f`, all from `0xa0` to `0xff`, and every tag with text
+  stores 1252 at `0x13c`. The other 10 hold value type 5 with 28 or 51 value
+  bytes, other bytes in their linkages and no tag set; their value is not
+  decoded. Each of the 1,194 names a tag set and a tag ID that is defined
+  there as text. 182 tags have a host linkage, each to a shared-cell instance
+  of the same model, and their pair at `0xa0` equals the origin of that
+  instance within 2 UOR. For these 182 the sum of the two pairs is inside the
+  stored range of the tag and the first pair alone is not. The 1,012 text
+  tags without a host hold zero at `0xb8`. The sum of the two pairs is inside
+  the stored range of all 1,204 tags.
+- The same files hold 91 objects with the tag-set code in 18 files. 89 decode,
+  with 671 definitions, all text, and tag IDs from 1 upward in stored order;
+  12 sets repeat a name. 92 of their strings hold bytes above `0x7f`, all from
+  `0xa0` to `0xff`. Two objects do not match the layout and stay raw: the
+  first definition of each holds 5 where a definition has its value type,
+  which is the value type that is not decoded in the 10 tags above, and the
+  byte before its default is not zero.
+- Five confidential real-world 3D files hold no tag and no tag set.
+- The checked-in fixture holds one type-37 object (element ID 93). It is
+  stored as 3D, has no linkage, and holds 3 at `0xd2`, 4 at `0x138` and four
+  zero bytes at `0x140`, where its primary bytes end. That agrees with the
+  layout above, but it is one object with tag ID 0 in a file without a tag
+  set. Tags are therefore read in 2D only and this object stays unknown.
+
+The decoder accepts only what was observed:
+
+- A type-37 object is a tag when it is stored as 2D, does not have the header
+  role, and its declared value fits the primary bytes and is not longer than
+  the string limit of the reader (`max_string_bytes`). Any other type-37
+  object stays unknown, exactly as it was before tags were read. A type-37
+  object never makes a read fail. That an object with the header role is not
+  a tag is a choice and not an observation: none of the 15,013 type-37
+  objects seen has that role (13,808 in the public file and one in the
+  fixture are standalone; in the confidential files 480 are standalone and
+  724 are components).
+- A text value is decoded when the value type is 1, the last byte is zero, no
+  other byte is zero, and either every byte is ASCII or the word at `0x13c`
+  is 1252; the bytes are then read as Windows-1252. An integer value is
+  decoded when the value type is 3 and the value is four bytes; it is read as
+  signed, and no value with the high bit set was seen. Every other value
+  keeps its bytes and has no decoded value. This is not an error.
+- The tag set ID and the host ID are read only from a linkage with the length
+  and the fixed bytes above.
+- The origin is the sum of the two pairs. It is reported only when it lies
+  inside the stored range of the tag, corners included.
+- A tag set is decoded only when the code, the two equal lengths, the padding
+  and every definition match. A definition with another value type, or a byte
+  that is not zero before the default, leaves the whole set undecoded and raw.
+  Its strings have no code page word and are read as Windows-1252. This
+  reading rests on the confidential files alone: the one tag set of the
+  public file holds no byte above `0x7f`.
+- Every length comes from the file, so each is held to a limit. A tag set
+  with more than 1,048,576 definition bytes is not decoded. One call for all
+  tag sets of a document reads at most 1,048,576 bytes in sum. A tag-set
+  object costs the definition bytes it declares plus its attribute bytes,
+  which hold its name. An object that cannot decode within the limit is
+  passed over and costs nothing: its two stored sizes differ, they declare
+  more than the limit, its primary bytes do not end with the declared
+  definition bytes, or its own cost is over the limit. The first other
+  object that would pass the sum ends the call, and it and the objects after
+  it are not listed. The smallest definition is 12 bytes, so one call returns
+  at most 87,381 definitions. The name linkage of a set is read with the
+  default limits of the reader. The largest tag set seen holds 1,256
+  definition bytes and 30 definitions, the largest total in one file is 4,652
+  bytes, and the longest tag value is 189 bytes; these three figures are from
+  the confidential real-world files (the tag set of the public file holds 80
+  bytes).
+
+What each part rests on:
+
+- The public file and the real-world files together: the tag ID, the value
+  type, the value length and position, text values, both linkages, the first
+  pair as the origin of the host, and the tag-set layout with text
+  definitions.
+- The public file alone: integer values, integer definitions and their
+  defaults, and a text node as host.
+- The real-world files alone: bytes above `0x7f` and the code page word, the
+  bytes after the value, empty text values, empty prompts, tags inside
+  shared-cell definitions, tags without a host, a shared-cell instance as
+  host, and the origin as the sum of the two pairs inside the stored range.
+- Constructed test bytes alone: negative integers, the corners of the range,
+  the limits, and every refusal listed above.
+
+A reviewer can reproduce the first two groups from the public file. The
+parts that rest on the real-world files alone cannot be reproduced without
+those files, which are confidential. They are listed in
+"Rules that rest on confidential files" below, with the counts and
+the constructed test for each, so that each can be taken out, and its form
+left raw, if that is preferred.
+
+Tag sets are decoded on request and not when a document is read. A tag is not
+part of the feature view. The reader does not join a tag to its definition or
+to its host, and it does not draw a tag. Value type 5, the two skipped words
+of a definition, the word at `0x30` of a tag set, the writer-specific words of
+a tag, and tags stored as 3D are unresolved. The tag tests use constructed
+bytes; the public file is read by an optional test when it is present, and
+the real-world files are not included in the regression fixtures.
+
 ## Rules that rest on confidential files
 
 Some rules above have no public evidence. Their evidence is a set of 90
@@ -601,10 +777,12 @@ repository, and a reviewer cannot reproduce the counts below.
 Each rule was found in the same way as the rules with public evidence: the
 bytes of lawfully held files were read, a rule was stated, and it was counted
 where the rule holds and where it does not. Most rules were also checked
-against something that the reader already decodes in the same file. A row
-that has no such check says so. The table gives the check, the counts, and
-the constructed test that covers the rule. The tests use made-up bytes only.
-Each rule can be taken out, and its form left raw, if that is preferred.
+against something that the reader already decodes in the same file. Five
+rows have no such check, and they say so: three are checks of structure
+alone, and two rest on a code page number alone. The table gives the check,
+the counts, and the constructed test that covers the rule. The tests use
+made-up bytes only. Each rule can be taken out, and its form left raw, if
+that is preferred.
 
 | Rule | How it was found | Counts | Constructed test |
 | --- | --- | --- | --- |
@@ -614,6 +792,12 @@ Each rule can be taken out, and its form left raw, if that is preferred.
 | 3D text: the four values are a quaternion with the scalar first | Only the first and the last value are ever not zero, which is a turn about Z when the scalar is first; the turn was compared with the end of the stored range at which the stored origin lies | 1,875 of 1,875 are unit quaternions; 1,713 not turned, 157 quarter turns, 5 half turns; 149 of the 149 turned texts of three or more characters have the origin at the end that the row rule gives, and 144 of them tell the rule from its transpose | `a_3d_text_exposes_its_stored_quaternion`: the values come back in stored order; the reader computes nothing from them |
 | Shared-cell instance: the nine matrix values are stored by rows | `origin + M * p` over the vertices of the matched definition was compared with the range that the instance stores, by rows and by columns | 2,376 instances checked; 2,319 matrices cannot tell the order (2,311 fit, 8 do not); of the 57 that can, 47 fit by rows, 0 by columns and 10 neither way | `an_instance_places_a_definition_point_with_its_matrix_by_rows` |
 | Shared-cell definitions: an instance repeats the six range values of its definition, and definitions can share a name | The six values of each instance were compared with those of every definition of that name in the file | 2,874 of 2,953 instances match one definition (one matches two equal ones); 79 name no definition of their file; the checked-in fixture shows one matching pair | `shared_cell_definitions_hold_their_components_in_their_own_space` |
+| Tags: a text byte above `0x7f` is Windows-1252 when the word at `0x13c` is 1252 | The word was read in every tag, and 1252 is the number of that code page. The bytes seen do not test the rule: from `0xa0` to `0xff`, Windows-1252, Latin-1 and one code point for each byte give the same character. No byte from `0x80` to `0x9f`, where they differ, was seen | 1,194 of 1,194 text tags store 1252; 18 values hold such a byte, all from `0xa0` to `0xff` | `decodes_tag_values_of_the_two_observed_types` |
+| Tags: bytes can follow the value, and a text value can be empty | A check of structure only, not against other decoded data: the value length at `0x138` was compared with the primary size in every tag | 10 or 11 bytes follow the value in every text tag of that writer; 674 of 1,194 text values are empty | the same test |
+| Tag sets: a string byte above `0x7f` is Windows-1252 | A choice, not a finding. A tag set holds no code page number; Windows-1252 is taken because the tags of the same files store 1252. The bytes seen do not test it: from `0xa0` to `0xff`, Windows-1252, Latin-1 and one code point for each byte give the same character, and no byte from `0x80` to `0x9f` was seen | 92 strings in 89 decoded sets hold such a byte, all from `0xa0` to `0xff`; the public tag set holds none | `decodes_the_definitions_of_a_tag_set` |
+| Tag sets: a prompt can be empty | A check of structure only, not against other decoded data: the definitions of every tag set were decoded to the declared length | 55 of 671 definitions | `decodes_the_definitions_of_a_tag_set` |
+| Tags: a tag can be a component of a shared-cell definition, can have no host, and can have a shared-cell instance as host | The host linkage of every tag was looked up among the elements of its model | 526 tags in definitions; 1,012 text tags without a host; 182 with a shared-cell instance as host, found in the same model | `tags_are_read_with_their_value_their_set_and_their_host` |
+| Tags: the origin is the sum of the pairs at `0xa0` and `0xb8` | The sum was compared with the stored range of the tag | inside the range in 1,204 of 1,204 tags; for the 182 tags with a host the first pair alone is outside it | `the_placement_is_the_sum_of_the_two_stored_pairs`, `a_tag_origin_is_given_only_inside_the_stored_range` |
 
 ## Deliberately unresolved semantics
 

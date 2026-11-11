@@ -1081,6 +1081,30 @@ pub(crate) mod test_support {
         encoder.finish().unwrap()
     }
 
+    /// A zlib stream of stored blocks, written by hand. Its bytes depend on
+    /// the input alone, not on the version of a compression library.
+    pub(crate) fn zlib_stored(bytes: &[u8]) -> Vec<u8> {
+        const BLOCK: usize = 0xffff;
+        let mut stream = vec![0x78, 0x01];
+        let blocks = bytes.len().div_ceil(BLOCK).max(1);
+        for index in 0..blocks {
+            let block = &bytes[index * BLOCK..bytes.len().min((index + 1) * BLOCK)];
+            let length = u16::try_from(block.len()).unwrap();
+            stream.push(u8::from(index + 1 == blocks));
+            stream.extend(length.to_le_bytes());
+            stream.extend((!length).to_le_bytes());
+            stream.extend(block);
+        }
+        // Adler-32 of the input, high byte first
+        let (mut low, mut high) = (1_u32, 0_u32);
+        for byte in bytes {
+            low = (low + u32::from(*byte)) % 65_521;
+            high = (high + low) % 65_521;
+        }
+        stream.extend((high << 16 | low).to_be_bytes());
+        stream
+    }
+
     /// A single model whose header stream holds `model_header` and whose one
     /// graphical page holds `objects`, each already framed as a complete record.
     pub(crate) fn dgn_with_objects(model_header: &[u8], objects: &[Vec<u8>]) -> Vec<u8> {
@@ -1118,7 +1142,7 @@ pub(crate) mod test_support {
         auxiliary: &[Vec<u8>],
         named: &[Vec<u8>],
     ) -> Vec<u8> {
-        build_dgn(model_header, objects, auxiliary, named, &[])
+        build_dgn(model_header, objects, auxiliary, named, &[], false)
     }
 
     /// Like [`dgn_with_pages`] without graphical auxiliary records, with one
@@ -1129,7 +1153,19 @@ pub(crate) mod test_support {
         named: &[Vec<u8>],
         named_auxiliary: &[Vec<u8>],
     ) -> Vec<u8> {
-        build_dgn(model_header, objects, &[], named, named_auxiliary)
+        build_dgn(model_header, objects, &[], named, named_auxiliary, false)
+    }
+
+    /// Like [`dgn_with_pages`], with bytes that depend on the input alone:
+    /// the streams are stored, not deflated, and the storages carry a fixed
+    /// time, not the time of the build. A checked-in file is made with this.
+    pub(crate) fn reproducible_dgn_with_pages(
+        model_header: &[u8],
+        objects: &[Vec<u8>],
+        auxiliary: &[Vec<u8>],
+        named: &[Vec<u8>],
+    ) -> Vec<u8> {
+        build_dgn(model_header, objects, auxiliary, named, &[], true)
     }
 
     fn build_dgn(
@@ -1138,19 +1174,30 @@ pub(crate) mod test_support {
         auxiliary: &[Vec<u8>],
         named: &[Vec<u8>],
         named_auxiliary: &[Vec<u8>],
+        reproducible: bool,
     ) -> Vec<u8> {
+        let zlib: fn(&[u8]) -> Vec<u8> = if reproducible { zlib_stored } else { zlib };
         let cursor = Cursor::new(Vec::new());
         let mut cfb = cfb::CompoundFile::create_with_version(cfb::Version::V3, cursor).unwrap();
-        for storage in [
+        let mut storages = vec![
             "/Dgn-Md",
             "/Dgn-Md/#000000",
             "/Dgn-Md/#000000/Dgn^G",
             "/Dgn^Ix",
-        ] {
+        ];
+        if !named.is_empty() {
+            storages.push("/Dgn^Nm");
+        }
+        if !auxiliary.is_empty() {
+            storages.push("/Dgn-Md/#000000/Dgn^GA");
+        }
+        if !named_auxiliary.is_empty() {
+            storages.push("/Dgn^NmA");
+        }
+        for storage in &storages {
             cfb.create_storage(storage).unwrap();
         }
         if !named.is_empty() {
-            cfb.create_storage("/Dgn^Nm").unwrap();
             let count = u32::try_from(named.len()).unwrap();
             let mut inflated = Vec::new();
             for object in named {
@@ -1167,18 +1214,13 @@ pub(crate) mod test_support {
             page_stream.write_all(&page).unwrap();
             drop(page_stream);
         }
-        for (records, storage, path) in [
-            (
-                auxiliary,
-                "/Dgn-Md/#000000/Dgn^GA",
-                "/Dgn-Md/#000000/Dgn^GA/$1",
-            ),
-            (named_auxiliary, "/Dgn^NmA", "/Dgn^NmA/$1"),
+        for (records, path) in [
+            (auxiliary, "/Dgn-Md/#000000/Dgn^GA/$1"),
+            (named_auxiliary, "/Dgn^NmA/$1"),
         ] {
             if records.is_empty() {
                 continue;
             }
-            cfb.create_storage(storage).unwrap();
             let count = u32::try_from(records.len()).unwrap();
             let mut page = Vec::new();
             page.extend(count.to_le_bytes());
@@ -1232,6 +1274,17 @@ pub(crate) mod test_support {
         let mut page_stream = cfb.create_stream("/Dgn-Md/#000000/Dgn^G/$1").unwrap();
         page_stream.write_all(&page).unwrap();
         drop(page_stream);
+        if reproducible {
+            // The container library stamps each storage with the clock (the
+            // root and the streams have no time). One fixed time takes the
+            // clock out of the bytes.
+            for storage in &storages {
+                cfb.set_created_time(storage, std::time::UNIX_EPOCH)
+                    .unwrap();
+                cfb.set_modified_time(storage, std::time::UNIX_EPOCH)
+                    .unwrap();
+            }
+        }
         cfb.into_inner().into_inner()
     }
 }

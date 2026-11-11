@@ -23,11 +23,17 @@ from ._core import (
     V8_ITEM_INSTANCE_ENTRY_TYPE,
     V8_MAX_AUXILIARY_ENTRIES,
     V8_MAX_ITEM_BYTES,
+    V8_MAX_TAG_SET_BYTES,
+    V8_TAG_SET_CODE,
+    V8_TAG_VALUE_INTEGER,
+    V8_TAG_VALUE_TEXT,
     DgnLimitError,
 )
 from ._core import decode_v8_auxiliary_payload as _decode_v8_auxiliary_payload
 from ._core import decode_v8_item_instance_data as _decode_v8_item_instance_data
 from ._core import decode_v8_item_instances_data as _decode_v8_item_instances_data
+from ._core import decode_v8_tag_set_data as _decode_v8_tag_set_data
+from ._core import decode_v8_tag_sets_data as _decode_v8_tag_sets_data
 from ._core import inspect_v8_cfb as _inspect_v8_cfb
 from ._core import read_v8_document as _read_v8_document
 from ._core import read_v8_shared_cells as _read_v8_shared_cells
@@ -494,6 +500,28 @@ class V8ElementData:
 
 
 @dataclass(frozen=True, slots=True)
+class V8TagData(V8ElementData):
+    """The data of a ``TAG`` element: one value for one definition of a tag set.
+
+    ``value`` is a ``str`` for a text value and an ``int`` for an integer
+    value; it is ``None`` for a value the reader does not decode, and
+    ``value_bytes`` always holds the stored bytes. ``tag_set_element_id`` is
+    the element ID of the tag set and ``tag_id`` the definition in it.
+    ``host_element_id`` is the element the tag is attached to. ``origin`` is
+    given only when the stored point lies inside the stored range of the tag.
+    Only a ``TAG`` element has these fields, so the other elements of a
+    document stay as small as before.
+    """
+
+    tag_id: int | None = None
+    value_type: int | None = None
+    value_bytes: bytes | None = None
+    value: str | int | None = None
+    tag_set_element_id: int | None = None
+    host_element_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class V8Element:
     index: int
     raw: V8RawObject
@@ -538,6 +566,7 @@ class V8Element:
             "UNKNOWN",
             "UNKNOWN_COMPLEX",
             "SHARED_CELL_DEFINITION",
+            "TAG",
             "BSPLINE_POLE",
             "TEXT_NODE",
             "MATRIX_HEADER",
@@ -782,6 +811,125 @@ def _decode_name(payload: bytes) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class V8TagDefinition:
+    """One tag definition of a tag set.
+
+    ``tag_id`` is the number a tag element stores to name this definition.
+    ``value_type`` is ``V8_TAG_VALUE_TEXT`` or ``V8_TAG_VALUE_INTEGER`` and
+    ``default`` is a ``str`` or an ``int`` to match.
+    """
+
+    name: str
+    tag_id: int
+    prompt: str
+    value_type: int
+    default: str | int
+
+
+@dataclass(frozen=True, slots=True)
+class V8TagSet:
+    """One tag set: a named object that holds the definitions of its tags.
+
+    ``element_id`` is the element ID of the named object; a ``TAG`` element
+    refers to it with the ``tag_set_element_id`` of its ``V8TagData``.
+    """
+
+    element_id: int
+    name: str
+    definitions: tuple[V8TagDefinition, ...]
+
+    def definition(self, tag_id: int) -> V8TagDefinition | None:
+        """Return the first definition with this tag ID."""
+
+        return next((item for item in self.definitions if item.tag_id == tag_id), None)
+
+
+TAG_SET_ELEMENT_TYPE = 39
+
+
+def _iter_tag_set_objects(raw: V8RawDocument) -> Iterator[V8RawObject]:
+    # The code is read from the raw bytes when the primary part covers it:
+    # eight bytes for each object, and no copy of its primary bytes.
+    return (
+        item
+        for page in raw.named_pages
+        for item in page.objects
+        if item.element_type == TAG_SET_ELEMENT_TYPE
+        and item.attribute_words * 2 >= 0x30
+        and item.raw_bytes[0x28:0x30] == V8_TAG_SET_CODE
+    )
+
+
+def tag_set_objects(raw: V8RawDocument) -> tuple[V8RawObject, ...]:
+    """The named objects that carry the tag-set code, decodable or not."""
+
+    return tuple(_iter_tag_set_objects(raw))
+
+
+def decode_tag_set(item: V8RawObject) -> V8TagSet | None:
+    """Decode a named object that holds a tag set.
+
+    Returns ``None`` for another object and for bytes that do not match the
+    observed layout exactly; the object keeps its ``raw_bytes`` either way.
+    """
+
+    if item.element_type != TAG_SET_ELEMENT_TYPE or item.element_id is None:
+        return None
+    row = cast(
+        "dict[str, Any] | None",
+        _decode_v8_tag_set_data(
+            item.element_id, item.primary_bytes, item.attribute_bytes
+        ),
+    )
+    return None if row is None else _tag_set_from_core(row)
+
+
+def _tag_set_from_core(row: dict[str, Any]) -> V8TagSet:
+    return V8TagSet(
+        element_id=row["element_id"],
+        name=row["name"],
+        definitions=tuple(
+            V8TagDefinition(
+                name=definition["name"],
+                tag_id=definition["tag_id"],
+                prompt=definition["prompt"],
+                value_type=definition["value_type"],
+                default=definition["default"],
+            )
+            for definition in row["definitions"]
+        ),
+    )
+
+
+def tag_sets(raw: V8RawDocument) -> tuple[V8TagSet, ...]:
+    """Decode the tag sets of a scanned document, in stored order.
+
+    A tag set that does not match the observed layout is not listed; it stays
+    among ``tag_set_objects(raw)``. One call reads at most
+    ``V8_MAX_TAG_SET_BYTES`` bytes in sum. An object costs the definition
+    bytes it declares plus its attribute bytes, which hold its name. An object
+    that cannot decode within the limit is passed over and costs nothing: its
+    two stored sizes differ, they declare more than the limit, its primary
+    bytes do not end with the declared definition bytes, or its own cost is
+    over the limit. The first other object that would pass the sum ends
+    the call, and it and the objects after it are not listed. The core applies
+    this limit; this function has no second copy of it.
+    """
+
+    rows = cast(
+        "list[dict[str, Any]]",
+        _decode_v8_tag_sets_data(
+            [
+                (item.element_id, item.primary_bytes, item.attribute_bytes)
+                for item in tag_set_objects(raw)
+                if item.element_id is not None
+            ]
+        ),
+    )
+    return tuple(_tag_set_from_core(row) for row in rows)
+
+
+@dataclass(frozen=True, slots=True)
 class V8Document:
     raw: V8RawDocument
     models: tuple[V8Model, ...]
@@ -802,6 +950,66 @@ class V8Document:
         for item in self.levels:
             if item.level_id == level_id:
                 return item
+        return None
+
+    @property
+    def tag_sets(self) -> tuple[V8TagSet, ...]:
+        """The tag sets of the document, decoded on each access.
+
+        Every access decodes every tag set again, so read it once and keep
+        the result. ``tag_sets_by_id()`` gives the same sets as a mapping.
+        """
+
+        return tag_sets(self.raw)
+
+    def tag_sets_by_id(self) -> dict[int, V8TagSet]:
+        """The decodable tag sets by element ID, for the lookup of many tags.
+
+        One call decodes every tag set once, like ``tag_sets``. Keep the
+        mapping and look each tag up with
+        ``mapping.get(element.data.tag_set_element_id)``. When more than one
+        tag-set object has an element ID, the mapping holds the first one
+        that decodes, as ``tag_set()`` returns it.
+
+        There is one difference from ``tag_set()``. This call has the limit
+        of ``tag_sets`` for all sets together, so a set that the limit
+        leaves out is not in the mapping, and ``tag_set()`` can still
+        return it.
+        """
+
+        result: dict[int, V8TagSet] = {}
+        for item in self.tag_sets:
+            result.setdefault(item.element_id, item)
+        return result
+
+    def tag_set(self, element_id: int | None) -> V8TagSet | None:
+        """The tag set a tag's ``tag_set_element_id`` refers to, if decodable.
+
+        One call walks the named objects once and returns the first tag-set
+        object with this element ID that decodes. It does not decode the
+        sets with another ID, and nothing is kept between calls. To look up
+        the sets of many tags, build the mapping once with
+        ``tag_sets_by_id()`` and do not call this for each tag.
+
+        The cost of one call: every object with this ID is decoded in turn
+        until one decodes. A file with K objects of one ID that each fail at
+        their last byte costs K decodes of up to ``V8_MAX_TAG_SET_BYTES``
+        each. That is in line with the size of the file, and there is no
+        other limit.
+
+        The result is the set that ``tag_sets_by_id()`` holds for this ID,
+        with one difference: each set is decoded alone here, with the limit
+        of one set, so a set that the limit of one ``tag_sets`` call leaves
+        out of the mapping is still returned.
+        """
+
+        if element_id is None:
+            return None
+        for item in _iter_tag_set_objects(self.raw):
+            if item.element_id == element_id:
+                decoded = decode_tag_set(item)
+                if decoded is not None:
+                    return decoded
         return None
 
     def __iter__(self) -> Iterator[V8Model]:
@@ -1181,6 +1389,19 @@ def _common_from_core(row: dict[str, Any]) -> V8CommonHeader:
 
 
 def _element_data_from_core(row: dict[str, Any]) -> V8ElementData:
+    if row["kind"] == "TAG":
+        return V8TagData(
+            kind="TAG",
+            origin=(
+                _point_from_core(row["origin"]) if row["origin"] is not None else None
+            ),
+            tag_id=row["tag_id"],
+            value_type=row["value_type"],
+            value_bytes=row["value_bytes"],
+            value=row["value"],
+            tag_set_element_id=row["tag_set_element_id"],
+            host_element_id=row["host_element_id"],
+        )
     return V8ElementData(
         kind=row["kind"],
         vertices=tuple(_point_from_core(item) for item in row.get("vertices", ())),
@@ -1336,21 +1557,32 @@ __all__ = [
     "V8RawObject",
     "V8ScanLimits",
     "V8SharedCellDefinition",
+    "V8TagData",
+    "V8TagDefinition",
+    "V8TagSet",
     "LEVEL_TABLE_ELEMENT_TYPE",
     "LEVEL_TABLE_KIND",
     "NAME_LINKAGE_SIGNATURE",
     "SYMBOLOGY_BY_CELL",
     "SYMBOLOGY_BY_LEVEL",
+    "TAG_SET_ELEMENT_TYPE",
     "V8_ITEM_INSTANCE_ENTRY_TYPE",
     "V8_MAX_AUXILIARY_ENTRIES",
     "V8_MAX_ITEM_BYTES",
+    "V8_MAX_TAG_SET_BYTES",
+    "V8_TAG_SET_CODE",
+    "V8_TAG_VALUE_INTEGER",
+    "V8_TAG_VALUE_TEXT",
     "decode_auxiliary_entries",
     "decode_item_instance",
     "decode_item_instances",
+    "decode_tag_set",
     "inspect_v8_container",
     "level_table",
     "read_v8",
     "read_v8_shared_cell_definitions",
     "read_v8file",
     "scan_v8_objects",
+    "tag_set_objects",
+    "tag_sets",
 ]

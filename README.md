@@ -28,7 +28,7 @@ stable ABI (`abi3`) with a Python 3.10 minimum.
 | V7/ISFF 2D read | Native entities, hierarchy, metadata, linkages, and raw records |
 | V7/ISFF 2D write | Standalone or custom-seed creation of common primitives |
 | V7/ISFF 3D | Signature, raw record, and common-header inspection only |
-| V8 DGN read | Native 2D/3D models, common geometry, hierarchy, linkages, auxiliary data, item instances, and lossless raw objects |
+| V8 DGN read | Native 2D/3D models, common geometry, hierarchy, linkages, auxiliary data, item instances, tags, and lossless raw objects |
 | V8 DGN write/edit | Not supported |
 
 The V7 reader decodes line, line string, shape, curve, ellipse, arc, text,
@@ -281,6 +281,34 @@ instances and the number of item entries that this limit left raw.
 `ezdgn inspect --entities --json` writes each string of an instance once, in
 `strings`, and gives the class name and each name and value as a position in
 that list.
+
+A tag is a `TAG` element. It is not part of `entities`; find tags in
+`model.elements`:
+
+```python
+tag_sets = document.tag_sets_by_id()
+for element in document.models[0].elements:
+    if element.kind == "TAG":
+        data = element.data
+        tag_set = tag_sets.get(data.tag_set_element_id)
+        definition = tag_set.definition(data.tag_id) if tag_set else None
+        print(definition.name if definition else data.tag_id, data.value)
+```
+
+The `data` of a `TAG` element is a `V8TagData`, a `V8ElementData` with the
+tag fields. `data.value` is a `str` or an `int`, or `None` for a value type
+the reader does not decode; `data.value_bytes` always holds the stored bytes.
+`data.host_element_id` is the element ID of the element the tag is attached
+to, or `None`. `data.origin` is given only when the stored point lies inside
+the stored range of the tag. `document.tag_sets` decodes the tag sets when it
+is read (`V8TagSet`: `name`, `element_id` and the `definitions` with their
+`name`, `tag_id`, `prompt`, `value_type` and `default`); a tag set that does
+not match the recorded layout is not listed and stays among
+`ezdgn.v8.tag_set_objects(document.raw)`. Each read of `document.tag_sets`
+and each call of `document.tag_sets_by_id()` decodes every tag set again, so
+keep the result. `document.tag_set(element_id)` decodes one tag set on each
+call; use the mapping for the tags of a whole model. Only tags stored as 2D
+are decoded.
 
 Malformed structure raises `InvalidDgnError`; configured resource ceilings
 raise `DgnLimitError`. The complete clean-room boundary, evidence ledger, and

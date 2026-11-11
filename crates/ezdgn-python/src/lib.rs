@@ -2,15 +2,16 @@
 
 use ezdgn_core::{
     decode_common_header, decode_design_settings, decode_v8_auxiliary_entries, decode_v8_item_data,
-    decode_v8_item_instances, detect_format, inspect_v8_container, read_v7_2d, read_v8,
+    decode_v8_item_instances, decode_v8_tag_set_data as core_decode_v8_tag_set_data,
+    decode_v8_tag_set_parts, detect_format, inspect_v8_container, read_v7_2d, read_v8,
     read_v8_shared_cell_definitions as core_read_v8_shared_cell_definitions, scan_records,
     scan_v8_objects as core_scan_v8_objects, write_v7_2d, CommonElementHeader, DesignSettings,
     DgnError as CoreDgnError, ElementData2D, LinkageData, MasterPoint, Point2, RawPoint,
     RecordScan, ScanOptions, V7Document2D, V7ElementStyle, V7WriteOptions, V8AuxiliaryEntry,
     V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element, V8ElementData,
     V8ItemInstance, V8ItemValue, V8Linkage, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point,
-    V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions,
-    WritableElement2D,
+    V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions, V8TagSet,
+    V8TagValue, WritableElement2D,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -366,6 +367,57 @@ fn decode_v8_item_instances_data(
         result.append(strings.instance_dict(item)?)?;
     }
     Ok((result.unbind(), decoded.over_limit))
+}
+
+/// Decode a tag set from the primary and attribute bytes of its named
+/// object, or return `None` when they do not match the observed layout.
+#[pyfunction]
+fn decode_v8_tag_set_data(
+    py: Python<'_>,
+    element_id: u64,
+    primary: &[u8],
+    attributes: &[u8],
+) -> PyResult<Option<Py<PyDict>>> {
+    core_decode_v8_tag_set_data(element_id, primary, attributes)
+        .map(|set| Ok(v8_tag_set_dict(py, &set)?.unbind()))
+        .transpose()
+}
+
+/// Decode the tag sets among the given named objects, each as its element
+/// ID, primary bytes and attribute bytes, under the byte limit of one call.
+#[pyfunction]
+fn decode_v8_tag_sets_data(
+    py: Python<'_>,
+    objects: Vec<(u64, Bound<'_, PyBytes>, Bound<'_, PyBytes>)>,
+) -> PyResult<Py<PyList>> {
+    let sets = decode_v8_tag_set_parts(
+        objects
+            .iter()
+            .map(|(id, primary, attributes)| (*id, primary.as_bytes(), attributes.as_bytes())),
+    );
+    let result = PyList::empty(py);
+    for set in &sets {
+        result.append(v8_tag_set_dict(py, set)?)?;
+    }
+    Ok(result.unbind())
+}
+
+fn v8_tag_set_dict<'py>(py: Python<'py>, set: &V8TagSet) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("element_id", set.element_id)?;
+    result.set_item("name", &set.name)?;
+    let definitions = PyList::empty(py);
+    for definition in &set.definitions {
+        let value = PyDict::new(py);
+        value.set_item("name", &definition.name)?;
+        value.set_item("tag_id", definition.tag_id)?;
+        value.set_item("prompt", &definition.prompt)?;
+        value.set_item("value_type", definition.value_type)?;
+        set_v8_tag_value(&value, "default", Some(&definition.default))?;
+        definitions.append(value)?;
+    }
+    result.set_item("definitions", definitions)?;
+    Ok(result)
 }
 
 #[pyfunction]
@@ -883,6 +935,19 @@ impl<'py> ItemStrings<'py> {
     }
 }
 
+fn set_v8_tag_value(
+    target: &Bound<'_, PyDict>,
+    key: &str,
+    value: Option<&V8TagValue>,
+) -> PyResult<()> {
+    match value {
+        Some(V8TagValue::Text(text)) => target.set_item(key, text),
+        Some(V8TagValue::Integer(number)) => target.set_item(key, *number),
+        // no value, or a value type that this binding does not know yet
+        _ => target.set_item(key, target.py().None()),
+    }
+}
+
 fn v8_model_metadata_dict<'py>(
     py: Python<'py>,
     metadata: &V8ModelMetadata,
@@ -1113,6 +1178,26 @@ fn v8_element_data_dict<'py>(
             Some(point) => result.set_item("anchor", v8_point_row(*point))?,
             None => result.set_item("anchor", py.None())?,
         },
+        V8ElementData::Tag {
+            tag_id,
+            value_type,
+            value_bytes,
+            value,
+            tag_set_element_id,
+            host_element_id,
+            origin,
+        } => {
+            result.set_item("tag_id", *tag_id)?;
+            result.set_item("value_type", *value_type)?;
+            result.set_item("value_bytes", PyBytes::new(py, value_bytes.as_ref()))?;
+            set_v8_tag_value(&result, "value", value.as_ref())?;
+            result.set_item("tag_set_element_id", *tag_set_element_id)?;
+            result.set_item("host_element_id", *host_element_id)?;
+            match origin {
+                Some(point) => result.set_item("origin", v8_point_row(*point))?,
+                None => result.set_item("origin", py.None())?,
+            }
+        }
         V8ElementData::Mesh {
             child_count,
             style,
@@ -1758,15 +1843,24 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(decode_v8_auxiliary_payload, module)?)?;
     module.add_function(wrap_pyfunction!(decode_v8_item_instance_data, module)?)?;
     module.add_function(wrap_pyfunction!(decode_v8_item_instances_data, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_tag_set_data, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_tag_sets_data, module)?)?;
     module.add(
         "V8_ITEM_INSTANCE_ENTRY_TYPE",
         ezdgn_core::V8_ITEM_INSTANCE_ENTRY_TYPE,
+    )?;
+    module.add(
+        "V8_TAG_SET_CODE",
+        PyBytes::new(py, &ezdgn_core::V8_TAG_SET_CODE),
     )?;
     module.add(
         "V8_MAX_AUXILIARY_ENTRIES",
         ezdgn_core::V8_MAX_AUXILIARY_ENTRIES,
     )?;
     module.add("V8_MAX_ITEM_BYTES", ezdgn_core::V8_MAX_ITEM_BYTES)?;
+    module.add("V8_MAX_TAG_SET_BYTES", ezdgn_core::V8_MAX_TAG_SET_BYTES)?;
+    module.add("V8_TAG_VALUE_TEXT", ezdgn_core::V8_TAG_VALUE_TEXT)?;
+    module.add("V8_TAG_VALUE_INTEGER", ezdgn_core::V8_TAG_VALUE_INTEGER)?;
     module.add_function(wrap_pyfunction!(scan_v7_records, module)?)?;
     module.add_function(wrap_pyfunction!(read_v7_design_settings, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_v7_headers, module)?)?;

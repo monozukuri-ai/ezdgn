@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
         max_hierarchy_depth: 128,
     };
     if let Ok(document) = read_v8(data, options) {
+        let _ = document.tag_sets();
         for element in document.models.iter().flat_map(|model| &model.elements) {
             let _ = element.decode_item_instances();
         }

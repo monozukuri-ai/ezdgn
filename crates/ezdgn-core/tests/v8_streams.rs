@@ -2,11 +2,13 @@ use std::collections::BTreeSet;
 
 use ezdgn_core::{
     decode_v8_item_instance, read_v8, read_v8_stream, read_v8_streams, scan_v8_objects, DgnError,
-    V8Dimension, V8ElementData, V8ObjectRole, V8Point3, V8ReadOptions, V8ScanOptions,
+    V8Dimension, V8ElementData, V8ObjectRole, V8Point3, V8ReadOptions, V8ScanOptions, V8TagValue,
 };
 use sha2::{Digest, Sha256};
 
 const V8: &[u8] = include_bytes!("../../../tests/data/dgn/v8/test_dgnv8.dgn");
+/// Written by the test builder of this repository from made-up values.
+const CONSTRUCTED_TAGS: &[u8] = include_bytes!("../../../tests/data/dgn/v8/constructed_tags.dgn");
 
 const STREAMS: &[(&str, usize, &str)] = &[
     (
@@ -265,6 +267,25 @@ fn the_fixture_shared_cell_instance_finds_and_places_its_definition() {
 }
 
 #[test]
+fn the_fixture_holds_no_tag_set_and_its_one_3d_type_37_object_stays_unknown() {
+    let document = read_v8(V8, V8ScanOptions::default()).unwrap();
+    assert!(document.tag_sets().is_empty());
+    assert_eq!(document.raw.tag_set_objects().count(), 0);
+    let objects = document.models[0]
+        .elements
+        .iter()
+        .filter(|element| element.raw.element_type == 37)
+        .collect::<Vec<_>>();
+    assert_eq!(objects.len(), 1);
+    // Tag elements are read in 2D only. This object is stored as 3D, names
+    // no tag set and no host, and holds tag ID 0.
+    let object = objects[0];
+    assert_eq!(object.common.stored_dimension, V8Dimension::Three);
+    assert_eq!((object.kind(), object.linkages.len()), ("UNKNOWN", 0));
+    assert_eq!(object.raw.primary_bytes()[0xd0..0xd4], [0, 0, 3, 0]);
+}
+
+#[test]
 fn stored_3d_texts_ellipses_and_arcs_expose_a_quaternion() {
     let document = read_v8(V8, V8ScanOptions::default()).unwrap();
     let mut texts = Vec::new();
@@ -429,4 +450,45 @@ fn enforces_v8_semantic_resource_limits() {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[test]
+fn the_constructed_tag_file_holds_the_tags_its_builder_wrote() {
+    let document = read_v8(CONSTRUCTED_TAGS, V8ScanOptions::default()).unwrap();
+    let elements = &document.models[0].elements;
+    assert_eq!(
+        elements
+            .iter()
+            .map(|element| element.kind())
+            .collect::<Vec<_>>(),
+        [
+            "SHARED_CELL_INSTANCE",
+            "TAG",
+            "TAG",
+            "TAG",
+            "UNKNOWN",
+            "UNKNOWN_COMPLEX",
+            "UNKNOWN"
+        ]
+    );
+    let V8ElementData::Tag {
+        tag_id,
+        value,
+        tag_set_element_id,
+        host_element_id,
+        origin,
+        ..
+    } = &elements[1].data
+    else {
+        panic!("expected a tag");
+    };
+    assert_eq!(*tag_id, 1);
+    assert_eq!(*value, Some(V8TagValue::Text("Oak".to_owned())));
+    assert_eq!(*host_element_id, Some(elements[0].common.element_id));
+    let origin = origin.as_ref().unwrap();
+    assert_eq!((origin.uor.x, origin.uor.y), (960.0, -100.0));
+    let sets = document.tag_sets();
+    assert_eq!(sets.len(), 1);
+    assert_eq!(Some(sets[0].element_id), *tag_set_element_id);
+    assert_eq!(sets[0].definition(1).unwrap().name, "Variety");
 }

@@ -22,6 +22,8 @@ GDAL distribution の一般 license は MIT style であり、取得時点の全
 | `v8/test_dgnv8_ref.csv` | `autotest/ogr/data/dgnv8/test_dgnv8_ref.csv` | 25,507 | `09f765e0aa8dc06bb1d0da4ed86f060dc0a839d480b3dc67e54841ecceec6433` | GDAL/ODA が出力した V8 sample の期待値 |
 | `LICENSE.GDAL.txt` | `LICENSE.TXT` | 21,841 | `1dae3468e81d00da56e2936f74d33b8b3ad09d726437f19ce209a5dabea41f77` | upstream license |
 
+`v8/constructed_tags.dgn`（7,680 bytes、SHA-256 `407f7dd8f5093646d4f27735d92b45c13319e08c8b1471a49d09e693160f2261`）は GDAL 由来の file ではない。この repository の test builder（`crates/ezdgn-core/src/v8/entity.rs` の `write_the_constructed_tag_fixture`）が作り物の値から書き出した合成 file であり、実在の図面の data を含まない。license はこの repository のものに従う。byte 列は builder の入力だけで決まる（stream は無圧縮の stored block、storage の時刻は固定値）。既定の test は builder の出力と、この file を byte 単位で比較する。詳細は [`docs/v8/PROVENANCE.md`](../../../docs/v8/PROVENANCE.md) の "Constructed tag file" に記録している。
+
 `SHA256SUMS` は license file 自身を除く test artifact を検証する。上流 file への直接リンクは固定 commit を使う。
 
 - [V7 data directory](https://github.com/OSGeo/gdal/tree/18e7cceb43a0dd58be474c9fdd5384baa3cde7c9/autotest/ogr/data/dgn)

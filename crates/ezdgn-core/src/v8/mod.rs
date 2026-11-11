@@ -4,20 +4,27 @@
 //! remain separate layers. Unknown objects retain their exact bytes instead of
 //! being discarded or flattened.
 
+mod auxiliary;
 mod compression;
 mod container;
 mod entity;
+mod item;
 mod linkage;
 mod metadata;
 mod raw;
 mod stream;
 
+pub use auxiliary::{decode_v8_auxiliary_entries, V8AuxiliaryEntry, V8_MAX_AUXILIARY_ENTRIES};
 pub use container::{
     inspect_v8_container, V8CfbEntry, V8CfbEntryKind, V8ContainerInfo, DEFAULT_MAX_CFB_ENTRIES,
 };
 pub use entity::{
     read_v8, V8CommonHeader, V8Document, V8Element, V8ElementData, V8MeshFace, V8Model, V8Point,
     V8PointOrientation, V8TextEncoding,
+};
+pub use item::{
+    decode_v8_item_data, decode_v8_item_instance, decode_v8_item_instances, V8ItemInstance,
+    V8ItemInstances, V8ItemValue, V8_ITEM_INSTANCE_ENTRY_TYPE, V8_MAX_ITEM_BYTES,
 };
 pub use linkage::{decode_v8_linkages, V8Linkage, V8_PROPERTY_LINKAGE_KIND};
 pub use metadata::{V8Dimension, V8ModelMetadata, V8Point3, V8Range3, V8Range3I64};

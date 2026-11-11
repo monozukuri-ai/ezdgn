@@ -213,6 +213,8 @@ pub struct V8AuxiliaryRecord {
     pub kind: u32,
     pub reserved: u32,
     pub element_id: u64,
+    /// Number of entries in the payload, kept under its historical name.
+    /// See [`V8AuxiliaryRecord::entries`].
     pub flags: u32,
     bytes: Arc<[u8]>,
     byte_range: Range<usize>,
@@ -228,6 +230,11 @@ impl V8AuxiliaryRecord {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.bytes[self.payload_range.clone()]
+    }
+
+    /// The shared page bytes and the payload position within them.
+    pub(super) fn shared_payload(&self) -> (Arc<[u8]>, Range<usize>) {
+        (Arc::clone(&self.bytes), self.payload_range.clone())
     }
 }
 
@@ -1077,6 +1084,29 @@ pub(crate) mod test_support {
     /// A single model whose header stream holds `model_header` and whose one
     /// graphical page holds `objects`, each already framed as a complete record.
     pub(crate) fn dgn_with_objects(model_header: &[u8], objects: &[Vec<u8>]) -> Vec<u8> {
+        dgn_with_objects_and_auxiliary(model_header, objects, &[])
+    }
+
+    /// One auxiliary record: the 28-byte header and the payload.
+    pub(crate) fn auxiliary_record(element_id: u64, entry_count: u32, payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend(super::AUXILIARY_MAGIC.to_le_bytes());
+        record.extend(u32::try_from(payload.len()).unwrap().to_le_bytes());
+        record.extend(170_u32.to_le_bytes());
+        record.extend(0_u32.to_le_bytes());
+        record.extend(element_id.to_le_bytes());
+        record.extend(entry_count.to_le_bytes());
+        record.extend(payload);
+        record
+    }
+
+    /// Like [`dgn_with_objects`], with one graphical auxiliary page that
+    /// holds `auxiliary` records when the slice is not empty.
+    pub(crate) fn dgn_with_objects_and_auxiliary(
+        model_header: &[u8],
+        objects: &[Vec<u8>],
+        auxiliary: &[Vec<u8>],
+    ) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut cfb = cfb::CompoundFile::create_with_version(cfb::Version::V3, cursor).unwrap();
         for storage in [
@@ -1086,6 +1116,19 @@ pub(crate) mod test_support {
             "/Dgn^Ix",
         ] {
             cfb.create_storage(storage).unwrap();
+        }
+        if !auxiliary.is_empty() {
+            cfb.create_storage("/Dgn-Md/#000000/Dgn^GA").unwrap();
+            let count = u32::try_from(auxiliary.len()).unwrap();
+            let mut page = Vec::new();
+            page.extend(count.to_le_bytes());
+            page.extend(2_u32.to_le_bytes());
+            page.extend(1_u32.to_le_bytes());
+            page.extend(count.to_le_bytes());
+            page.extend(zlib(&auxiliary.concat()));
+            let mut page_stream = cfb.create_stream("/Dgn-Md/#000000/Dgn^GA/$1").unwrap();
+            page_stream.write_all(&page).unwrap();
+            drop(page_stream);
         }
         let mut file_header = cfb.create_stream("/Dgn~H").unwrap();
         file_header.write_all(b"header").unwrap();

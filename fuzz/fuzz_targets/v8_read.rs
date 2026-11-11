@@ -21,5 +21,9 @@ fuzz_target!(|data: &[u8]| {
         max_vertices: 100_000,
         max_hierarchy_depth: 128,
     };
-    let _ = read_v8(data, options);
+    if let Ok(document) = read_v8(data, options) {
+        for element in document.models.iter().flat_map(|model| &model.elements) {
+            let _ = element.decode_item_instances();
+        }
+    }
 });

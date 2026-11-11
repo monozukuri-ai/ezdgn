@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use ezdgn_core::{
-    read_v8, read_v8_stream, read_v8_streams, scan_v8_objects, DgnError, V8Dimension,
-    V8ElementData, V8ObjectRole, V8ReadOptions, V8ScanOptions,
+    decode_v8_item_instance, read_v8, read_v8_stream, read_v8_streams, scan_v8_objects, DgnError,
+    V8Dimension, V8ElementData, V8ObjectRole, V8ReadOptions, V8ScanOptions,
 };
 use sha2::{Digest, Sha256};
 
@@ -157,6 +157,31 @@ fn scans_real_model_index_graphics_names_and_auxiliary_records() {
     assert_eq!(raw.named_pages[0].objects.len(), 25);
     assert_eq!(raw.named_auxiliary_pages.len(), 1);
     assert_eq!(raw.named_auxiliary_pages[0].records.len(), 1);
+    // The one auxiliary record of the fixture holds one entry: an 8-byte
+    // prefix (3, inflated size 192) and a zlib stream. The entry count is
+    // the header word exposed as `flags`.
+    let record = &raw.named_auxiliary_pages[0].records[0];
+    assert_eq!(
+        (record.kind, record.flags, record.payload().len()),
+        (170, 1, 122)
+    );
+    let entries = record.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!((entry.index, entry.offset), (0, 0));
+    assert_eq!(
+        (entry.type_id, entry.type_major(), entry.type_minor()),
+        (0x5709_0000, 0x5709, 0)
+    );
+    assert_eq!(
+        (entry.entry_id, entry.size_word, entry.reserved),
+        (0, 102, 0)
+    );
+    assert!(!entry.size_flag());
+    assert_eq!(entry.data().len(), 102);
+    assert_eq!(entry.data()[..10], [3, 0, 0, 0, 0xc0, 0, 0, 0, 0x78, 0x9c]);
+    assert_eq!(record.payload()[118..], [1, 0, 0, 0]);
+    assert!(decode_v8_item_instance(entry).is_none());
     assert_eq!(raw.graphical_object_count(), 58);
     assert_eq!(raw.total_object_count(), 83);
     assert_eq!(raw.total_inflated_bytes, 31_942);

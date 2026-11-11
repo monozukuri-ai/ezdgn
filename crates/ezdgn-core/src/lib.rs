@@ -44,17 +44,20 @@ pub use record::{
 };
 pub use settings::{decode_design_settings, DesignSettings, MasterPoint, RawPoint};
 pub use v8::{
-    decode_v8_linkages, inspect_v8_container, read_v8, read_v8_stream, read_v8_streams,
-    scan_v8_objects, V8AuxiliaryPage, V8AuxiliaryRecord, V8CfbEntry, V8CfbEntryKind,
-    V8CommonHeader, V8ContainerInfo, V8Dimension, V8Document, V8Element, V8ElementData, V8Linkage,
-    V8MeshFace, V8Model, V8ModelIndexEntry, V8ModelMetadata, V8ObjectFamily, V8ObjectPage,
-    V8ObjectRole, V8PageHeader, V8Point, V8Point3, V8PointOrientation, V8Range3, V8Range3I64,
-    V8RawDocument, V8RawModel, V8RawObject, V8ReadOptions, V8ScanOptions, V8Stream, V8StreamSet,
-    V8TextEncoding, DEFAULT_MAX_CFB_ENTRIES, DEFAULT_MAX_CFB_STREAM_SIZE_BYTES,
-    DEFAULT_MAX_CFB_TOTAL_STREAM_BYTES, DEFAULT_MAX_V8_HIERARCHY_DEPTH,
-    DEFAULT_MAX_V8_INFLATED_STREAM_BYTES, DEFAULT_MAX_V8_MODELS, DEFAULT_MAX_V8_OBJECTS,
-    DEFAULT_MAX_V8_OBJECT_SIZE_BYTES, DEFAULT_MAX_V8_PAGES, DEFAULT_MAX_V8_STRING_BYTES,
-    DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES, DEFAULT_MAX_V8_VERTICES, V8_PROPERTY_LINKAGE_KIND,
+    decode_v8_auxiliary_entries, decode_v8_item_data, decode_v8_item_instance,
+    decode_v8_item_instances, decode_v8_linkages, inspect_v8_container, read_v8, read_v8_stream,
+    read_v8_streams, scan_v8_objects, V8AuxiliaryEntry, V8AuxiliaryPage, V8AuxiliaryRecord,
+    V8CfbEntry, V8CfbEntryKind, V8CommonHeader, V8ContainerInfo, V8Dimension, V8Document,
+    V8Element, V8ElementData, V8ItemInstance, V8ItemInstances, V8ItemValue, V8Linkage, V8MeshFace,
+    V8Model, V8ModelIndexEntry, V8ModelMetadata, V8ObjectFamily, V8ObjectPage, V8ObjectRole,
+    V8PageHeader, V8Point, V8Point3, V8PointOrientation, V8Range3, V8Range3I64, V8RawDocument,
+    V8RawModel, V8RawObject, V8ReadOptions, V8ScanOptions, V8Stream, V8StreamSet, V8TextEncoding,
+    DEFAULT_MAX_CFB_ENTRIES, DEFAULT_MAX_CFB_STREAM_SIZE_BYTES, DEFAULT_MAX_CFB_TOTAL_STREAM_BYTES,
+    DEFAULT_MAX_V8_HIERARCHY_DEPTH, DEFAULT_MAX_V8_INFLATED_STREAM_BYTES, DEFAULT_MAX_V8_MODELS,
+    DEFAULT_MAX_V8_OBJECTS, DEFAULT_MAX_V8_OBJECT_SIZE_BYTES, DEFAULT_MAX_V8_PAGES,
+    DEFAULT_MAX_V8_STRING_BYTES, DEFAULT_MAX_V8_TOTAL_INFLATED_BYTES, DEFAULT_MAX_V8_VERTICES,
+    V8_ITEM_INSTANCE_ENTRY_TYPE, V8_MAX_AUXILIARY_ENTRIES, V8_MAX_ITEM_BYTES,
+    V8_PROPERTY_LINKAGE_KIND,
 };
 pub use writer::{write_v7_2d, V7ElementStyle, V7WriteOptions, WritableElement2D};
 

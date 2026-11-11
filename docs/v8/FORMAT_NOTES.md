@@ -103,7 +103,8 @@ An inflated auxiliary page instead repeats a 28-byte record header plus its
 payload. The confirmed fields are magic `0x0000a11b` at `+0x00`, payload length
 at `+0x04`, kind at `+0x08`, a retained reserved value at `+0x0c`, element ID at
 `+0x10`, and flags at `+0x18`. Auxiliary records are associated by element ID
-but remain independently indexed and byte-exact.
+but remain independently indexed and byte-exact. The payload layout is
+described under [Auxiliary record payload entries](#auxiliary-record-payload-entries).
 
 ## Model index and model header
 
@@ -290,11 +291,241 @@ the color index on the MicroStation file and was 0 on the DWG conversion;
 `0x28`, `0x2c` and `0x60` vary by file and remain unresolved. Element headers
 use `0xffffffff` (ByLevel) and `0xfffffffe` (ByCell) in their symbology words.
 
+## Auxiliary record payload entries
+
+The payload of an auxiliary record is a sequence of entries. The record header
+word at `+0x18`, which the raw model exposes under its historical name `flags`,
+is the entry count; the word at `+0x08` (`kind`) was 170 in every record seen.
+Each entry is a 16-byte little-endian header followed by its data:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x00` | `u32` | type word: the high half groups related entry types, the low half numbers the types of one group |
+| `0x04` | `u32` | entry ID, which tells entries of one type on one element apart |
+| `0x08` | `u32` | data length in the low 31 bits; bit 31 is a writer flag |
+| `0x0c` | `u32` | zero in every entry seen |
+| `0x10` | bytes | data |
+
+The four bytes `01 00 00 00` follow the last entry and end the payload. A
+record without entries is those four bytes alone.
+
+This layout splits every auxiliary record of the files observed, with no byte
+left over:
+
+| Source | Records | Entries | Entries per record | Bit 31 of the length word |
+| --- | ---: | ---: | --- | --- |
+| checked-in fixture | 1 | 1 | 1 | clear |
+| public water mains file (`f34bbb1b408b`) | 66,062 | 132,118 | 1, 2, 4 | clear |
+| 90 confidential real-world files | 783 | 1,024 | 0 to 8 | set |
+
+The table counts every auxiliary record of a file. In the public file 66,053
+records are on the graphical elements, with the 132,106 item entries that
+`PROVENANCE.md` reports, and 9 records are on named objects, with 12 entries
+of other types.
+
+The fixture's one record is on a named object: type word `0x57090000`, entry
+ID 0, 102 data bytes that begin `03 00 00 00 c0 00 00 00 78 9c` (a `u32` 3, the
+inflated size 192, then a zlib stream). The meaning of bit 31 is unresolved;
+the length is correct with the bit masked off in all three sources. That the
+bit can be set rests on confidential files alone (see
+"Rules that rest on confidential files" below). Entry data
+other than the item instances below is not interpreted. A payload that does
+not hold exactly the declared number of entries followed by the closing word
+is not split at all and stays a raw payload. The entry count comes from the
+file and an entry can be an empty header, so a payload that declares more than
+65,536 entries is not split either. The largest count seen in one record is 4
+in the public files and 8 in the confidential files.
+
+## Item instances
+
+An entry with type word `0x56ff0000` on a graphical element holds one item
+instance: the values of one item type (item class) for that element. The data
+is a small XML element in a tokenized binary form:
+
+| Offset | Bytes | Meaning |
+| ---: | --- | --- |
+| `0x00` | `00 00 01 01 15` | constant |
+| `0x05` | `u32` | element ID of the named object that holds the schema text |
+| `0x09` | `01` | constant |
+| `0x0a` | `42 45 43 58 4d 4c 00` | `BECXML` and a zero byte |
+| `0x11` | `ff 0a 0d` | constant |
+| `0x14` | `01 00 00 03 00 00 30` | constant |
+| `0x1b` | `u8` | string count |
+| `0x1c` | | string table, then the token stream to the end of the data |
+
+A string table entry is `fa`, a `u8` length and that many bytes, one byte for
+each character with the byte value as the code point; or `fb`, a `u8` count of
+UTF-16 code units and that many little-endian units. Equal strings share one
+entry, and the entries are in the order of first use. A token is one byte,
+followed by a `u8` string number where it names a string:
+
+| Token | Operand | Meaning |
+| ---: | --- | --- |
+| `03` | string | start of the root element; the string is the item class name |
+| `05` | string | attribute name of the root element |
+| `11` | string | value of the attribute or property just named |
+| `06` | | end of the root attributes |
+| `02` | string | start of a property element; the string is the property name |
+| `04` | | end of the open element |
+
+Every instance observed is `03 class (05 name 11 value)+ 06 (02 name 11 value
+04)* 04`: a root element with attributes, then one child element with one text
+value for each property, and nothing after the closing `04`. An empty value is
+a reference to the empty string, not a missing `11`. A made-up instance
+`<Pump instanceId="" xmlns="Lib.01.00"><Tag>P-101</Tag></Pump>` with schema
+holder 42 is stored as:
+
+```text
+00 00 01 01 15  2a 00 00 00  01  42 45 43 58 4d 4c 00  ff 0a 0d
+01 00 00 03 00 00 30  07
+fa 04 "Pump"  fa 0a "instanceId"  fa 00  fa 05 "xmlns"
+fa 09 "Lib.01.00"  fa 03 "Tag"  fa 05 "P-101"
+03 00  05 01 11 02  05 03 11 04  06  02 05 11 06 04  04
+```
+
+The public water mains file listed in `PROVENANCE.md` carries two instances on
+each of its 66,053 elements, 132,106 in total, and every one decodes with this
+layout: entry ID 1 is class `WaterMain` with the properties `GaugeMM`,
+`LiningMaterial` and `Material`, entry ID 2 is class `Metadata` with
+`InstallationDate`. The root attributes are `instanceId` (empty) and `xmlns`
+(`DgnCustomItemTypes_Default__x0020__Library.01.00`) in all of them. The
+`u32` at `0x05` is the element ID of a named object of type 39 whose bytes hold
+`fLMX` at `0x28`, `01 00 ff 56` at `0x2c`, and the schema as UTF-16LE XML text
+(`<ECSchema schemaName="DgnCustomItemTypes_Default__x0020__Library"
+version="01.00" ...>`). The `xmlns` value is that schema's name and version,
+the root name is an `ECClass` `typeName` of it, and the property names are the
+`propertyName` values of that class in the same order. The schema's
+`displayLabel` is `Default Library`, so `__x0020__` in a stored name stands for
+a space; names are returned as stored. Every property in that schema has
+`typeName="string"`, and values such as `150` and `1986-01-01` are stored as
+text. In that file the entry ID equals the `ID` the schema records for the
+class.
+
+Five confidential real-world files (drawings converted from DWG, with block
+attributes turned into item instances) agree: 140 instances on
+shared-cell instances, all decoded, each with the same two root attributes and
+with the properties of a class in a schema held by a type-39 object (15
+properties in 139 instances, one in the other). In those 140 instances the
+first property value equals the text that the file draws next to the cell.
+They also give the only evidence for three parts of the layout. A reviewer
+cannot reproduce these three from public files; how each was found is in
+"Rules that rest on confidential files" below:
+
+- the `fb` UTF-16 string form (11 strings in 11 instances), used where a
+  string has a character above U+00FF (U+0192 in those files). Each of the 11
+  strings equals the text of a text element in the same file;
+- bytes `0x80` and above in the `fa` form (36 strings in 36 instances: `81` in
+  19, `bd` in 16, `be` in 1), read as the code points U+0081, U+00BD and
+  U+00BE. Each of the 36 strings equals the text of a text element in the
+  same file, and the writer used the `fb` form for U+0192, which a
+  Windows-1252 byte could have held, so the `fa` form is taken as one code
+  point per byte and not as a code page. No other byte from `0x80` to `0x9f`
+  was seen in the `fa` form; and
+- bit 31 of the entry length word being set (in all 140 item entries, and in
+  all 1,024 entries of those files).
+
+In those files the entry ID was 1 for a class whose schema `ID` is not 1 in 34
+instances, so the entry ID is exposed but is not treated as the class ID.
+
+The decoder accepts only what was observed and decodes nothing else:
+
+- the constants above must match byte for byte;
+- the string count, each string length and each string number must be below
+  `0x80` (the largest values seen were 23 strings, a length of 66 and string
+  number 22); a larger byte may belong to a wider encoding that was not seen;
+- a string tag other than `fa` and `fb`, invalid UTF-16, a string number
+  outside the table, any other token, a root without attributes, a property
+  without exactly one value, a nested element, or any byte after the closing
+  token leaves the entry undecoded;
+- a table string is never copied. A string number can name a long table
+  string any number of times: one attribute is four stored bytes and can name
+  762 bytes of text. The table is therefore decoded once, and the class name,
+  each name and each value is a reference to one of its strings (a shared
+  handle in Rust, one `str` object in Python). The memory of a decoded
+  instance is then at most a fixed multiple of its stored bytes, whatever the
+  string numbers are. The worked worst case, on a 64-bit target, in the
+  bytes that the decoder requests:
+
+  | Part of an instance | Stored bytes | Rust, bytes | CPython 3.12, bytes |
+  |---|---:|---:|---:|
+  | one attribute (two string numbers) | 4 | 32: two handles | 64: one pair of two references and its place in the list |
+  | one property | 5 | 32 | 64 |
+  | the class name | 2 | 16: one handle | 8: one reference |
+  | an empty table string | 2 | 16: the two counters of its block | 0: the shared empty string |
+  | a table string of one wide character | 4 | 19 | 60 |
+  | the longest table string, 127 wide units | 256 | 397 | 312 |
+  | head, signature, counts and marks | 30 | 72: the fixed part | 216 at most: the fixed part |
+
+  That is at most 8 requested bytes for one stored byte in Rust and at most
+  16 in Python. These figures, and the tests, count requested bytes: the
+  sizes that the decoder asks the allocator for. An allocator rounds a block
+  up and keeps its own bookkeeping, and that overhead can add up to about 2
+  times for small blocks (a block of 16 bytes takes a chunk of 32 bytes in
+  glibc). The Rust tests assert the 8. The Python tests assert 32, to leave
+  room for other builds; a run in Python on nine constructed shapes gave 1.3
+  to 15.7 (the script of that run is not in the repository). On a 32-bit
+  target the Rust number is 4 (worked out, not run);
+- one call returns at most 1,048,576 stored bytes of item data as decoded
+  instances, so one call returns at most 8 MiB of requested bytes in Rust
+  and 16 MiB of objects in Python. The data of each returned instance
+  counts. An item entry whose data is larger than what the call has left is
+  not read, and the call reports how many entries it left raw for that
+  reason; such an entry is counted also when it is damaged, because the call
+  does not look at its data. The entries after it are still read. An entry
+  that fits and does not match the layout is read up to the byte where it
+  fails and is then dropped: it costs nothing of the limit, it hides no
+  entry after it, and its memory is free again before the next entry is
+  read. One call therefore reads every item entry of the element that fits,
+  in time in line with the stored bytes. One entry decoded alone has the
+  same limit. The largest item data seen on one element is 388 stored bytes
+  in the public file (408 in the confidential files); and
+- the sum over a document needs no second limit. For one read, an auxiliary
+  record belongs to one element, so the item data of all elements together
+  is at most the inflated bytes of the file, which
+  `max_total_inflated_bytes` holds. A caller that keeps the item data of
+  every element of one read holds at most 8 times (Rust) or 16 times
+  (Python) those bytes, as requested bytes.
+  `ezdgn inspect --entities --json` writes each string of an instance once
+  and gives every use as a position in that list, so its output and its
+  memory follow the same rule. In a test with 1,160 elements whose item data
+  names 154 bytes of text for each stored byte, a run gave under 4 bytes of
+  output and under 33 bytes of peak memory for each stored byte; the test
+  asserts 8 and 64.
+
+An undecoded entry is not an error: the element is read as before and the
+entry keeps its exact bytes. The schema text of the type-39 object is not
+decoded by the reader; the remaining words of that object (`0x30` to the start
+of the text) and the meaning of the constants at `0x00`, `0x09`, `0x11` and
+`0x14` of the instance data are unresolved. The item tests use constructed
+bytes; the public file is read by an optional test when it is present, and the
+five confidential files are not included in the regression fixtures.
+
+## Rules that rest on confidential files
+
+Some rules above have no public evidence. Their evidence is a set of 90
+real-world production files, 85 2D files and five 3D files, that are highly
+confidential. They cannot be shared. No byte, name or text of them is in this
+repository, and a reviewer cannot reproduce the counts below.
+
+Each rule was found in the same way as the rules with public evidence: the
+bytes of lawfully held files were read, a rule was stated, and it was counted
+where the rule holds and where it does not. Most rules were also checked
+against something that the reader already decodes in the same file. A row
+that has no such check says so. The table gives the check, the counts, and
+the constructed test that covers the rule. The tests use made-up bytes only.
+Each rule can be taken out, and its form left raw, if that is preferred.
+
+| Rule | How it was found | Counts | Constructed test |
+| --- | --- | --- | --- |
+| Item data: the `fb` string form holds UTF-16LE units | Read as UTF-16LE, the string equals the text of a text element in the same file | 11 strings in 11 of 140 instances; each holds a character above U+00FF; 11 of 11 equal a text element | `one_byte_strings_are_code_points_and_wide_strings_are_utf16` |
+| Item data: a byte `0x80` or above in the `fa` form is one code point | Read as one code point per byte, the string equals the text of a text element in the same file; the writer uses the `fb` form for a character that a Windows-1252 byte could hold | 36 strings in 36 of 140 instances (`81` in 19, `bd` in 16, `be` in 1); 36 of 36 equal a text element | the same test |
+| Auxiliary entries: bit 31 of the length word is a flag and not part of the length | A check of structure only, not against other decoded data: with the bit masked off the lengths split every record with no byte left over, and every item entry decodes; with the bit kept each length is longer than its record. What the flag means is not known | set in 1,024 of 1,024 entries of 783 records; all 140 item entries among them decode | `splits_entries_and_keeps_every_header_word` |
+
 ## Deliberately unresolved semantics
 
-The parser does not infer product-specific XAttributes, custom schemas, Item
-Types, full dimensions, or complete B-spline/surface definitions from names or
-isolated byte patterns. Those bytes remain accessible through raw objects,
-linkages, and auxiliary records. New semantic mappings require another
-controlled observation and a malformed-input regression before this ledger is
-expanded.
+The parser does not infer other product-specific XAttributes, custom schemas,
+typed Item Type values, full dimensions, or complete B-spline/surface
+definitions from names or isolated byte patterns. Those bytes remain
+accessible through raw objects, linkages, and auxiliary records. New semantic
+mappings require another controlled observation and a malformed-input
+regression before this ledger is expanded.

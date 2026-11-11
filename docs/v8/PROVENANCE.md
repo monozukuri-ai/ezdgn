@@ -86,8 +86,9 @@ tag data remains raw unless independently characterized.
 
 Every layout that this log adds on 2026-11-10 was also run on 90 real-world
 production files held by a contributor (85 2D files and five 3D files
-converted from DWG): the auxiliary entries, the item instances, and the
-stored quaternion of 3D text.
+converted from DWG): the auxiliary entries, the item instances, the stored
+quaternion of 3D text, and the shared-cell definitions with the match and
+the placement of an instance.
 
 These files are highly confidential. They cannot be shared, they are not
 part of this repository, and no byte, name or text from them is recorded
@@ -98,8 +99,11 @@ two public files above. These rules have none:
 
 - item data: the `fb` UTF-16 string form, and bytes `0x80` and above in the
   `fa` form;
-- auxiliary entries: bit 31 of the length word being set; and
-- 3D text: the order of the four quaternion values for a text that is turned.
+- auxiliary entries: bit 31 of the length word being set;
+- 3D text: the order of the four quaternion values for a text that is turned;
+  and
+- shared cells: the row order of the nine matrix values of an instance, and
+  the match by name and range values where definitions share a name.
 
 Each of them is listed in `FORMAT_NOTES.md` under "Rules that rest on
 confidential files", with how the rule was found, the counts, and the

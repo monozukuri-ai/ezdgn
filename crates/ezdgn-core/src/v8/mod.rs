@@ -19,8 +19,9 @@ pub use container::{
     inspect_v8_container, V8CfbEntry, V8CfbEntryKind, V8ContainerInfo, DEFAULT_MAX_CFB_ENTRIES,
 };
 pub use entity::{
-    read_v8, V8CommonHeader, V8Document, V8Element, V8ElementData, V8MeshFace, V8Model, V8Point,
-    V8PointOrientation, V8TextEncoding,
+    decode_v8_shared_cell_definitions, read_v8, read_v8_shared_cell_definitions, V8CommonHeader,
+    V8Document, V8Element, V8ElementData, V8MeshFace, V8Model, V8Point, V8PointOrientation,
+    V8SharedCellDefinition, V8TextEncoding,
 };
 pub use item::{
     decode_v8_item_data, decode_v8_item_instance, decode_v8_item_instances, V8ItemInstance,

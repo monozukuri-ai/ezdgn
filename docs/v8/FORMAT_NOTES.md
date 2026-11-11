@@ -199,6 +199,7 @@ The decoder maps standard element types as follows:
 | 17 | text |
 | 21 / 27 | B-spline pole sequence / curve header |
 | 22 | point string with per-point orientation |
+| 34 | shared-cell definition header in the named pages: component count, range values, matrix, linked name |
 | 35 | shared-cell instance, origin, transform, linked name when present; the origin is the last three doubles of the record whether or not the 3D flag is set |
 | 36 | bounded dimension anchor |
 
@@ -311,6 +312,72 @@ and the only other weights in that file are explicit 0 and 2. `0x4c` repeated
 the color index on the MicroStation file and was 0 on the DWG conversion;
 `0x28`, `0x2c` and `0x60` vary by file and remain unresolved. Element headers
 use `0xffffffff` (ByLevel) and `0xfffffffe` (ByCell) in their symbology words.
+
+## Shared-cell definitions
+
+A shared-cell definition is a type-34 header object in the named object pages
+(`/Dgn^Nm`), followed by its components: the objects with the component role up
+to the next object that is not a component. The primary part of the header is
+`0x100` bytes in every definition seen:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x68` | `u32` | declared component count |
+| `0x70` | six `f64` | range of the definition in its own space: low XYZ, then high XYZ |
+| `0xa0` | nine `f64` | a 3x3 matrix by rows; the identity in every definition seen |
+| `0xe8` | three `f64` | zero in every definition seen |
+
+The name is the property linkage with ID 1, as for an instance. The components
+are ordinary graphical objects (lines, shapes, texts, text nodes, arcs,
+ellipses, cells, and shared-cell instances of other definitions) with
+coordinates in the definition's own space.
+
+A type-35 instance repeats its definition in the fifteen values it stores from
+`0x70`: the first six equal the definition's six range values bit for bit, and
+the last nine are a 3x3 matrix `M` by rows. The instance places a definition
+point `p` at `origin + M * p`, in UOR; `place_definition_point` returns that
+point. One file can hold several definitions with one name and different
+ranges, so an instance is matched by the name and the six values together,
+and the six values are compared bit for bit.
+
+Evidence:
+
+- The checked-in fixture has one definition, `Named definition`, with one
+  component: a circle of radius 1 UOR at the definition origin, range
+  `(-1, -1, 0)` to `(1, 1, 0)`. Its one instance has `M` = 10,000 times the
+  identity and origin `(0, 1e4, 2e4)`. `origin + M * p` for the range
+  corners gives `(-1e4, 0)` and `(1e4, 2e4)`, the range the instance
+  stores. This matrix is diagonal, so the fixture shows the placement but
+  not the order of the nine values.
+- In 90 confidential real-world files (see
+  "Rules that rest on confidential files" below), all 30,757 type-34
+  headers decode with this layout and every one of their 438,312 components
+  has a parent. Of 2,953 instances, 2,874 match a definition by name and
+  range values (one matches two equal definitions) and 79 have no definition
+  with their name in the file. For the 2,376 matched instances whose
+  definition holds only lines, line strings and shapes, `origin + M * p` over
+  the component vertices reproduces the stored instance range within 1% for
+  2,358; the other 18 are unresolved. The order of the nine values rests on
+  these files alone: 2,319 of the 2,376 matrices are symmetric in their XY
+  part and give the same points by rows and by columns, and 57 are not. Of
+  those 57, 47 reproduce the range by rows, none does by columns, and 10 do
+  neither way.
+- The two public sample files in `PROVENANCE.md` hold no definition.
+
+The reader returns the definitions with their components in definition space.
+It does not copy or transform components into the model, and it does not
+resolve ByCell symbology. A header with another primary size, a type-34 object
+without the header role, and a run whose hierarchy cannot be built are not
+read as definitions and stay raw. A value among the fifteen that is not
+finite also leaves the run raw; it is not an error. Definitions are read only
+from the named pages: a type-34 header in the graphical pages of a model is
+the unknown complex element with its child count that it was before
+definitions were read, whatever its values are. A component that follows
+after the declared child counts of the run are used up has no parent; it and
+the components after it are not listed with the definition and stay raw. The
+reader gives no count of the components that it leaves out in this way. No
+definition seen holds such a component. The values at `0xa0` and `0xe8` of the
+header, and the 79 instances without a definition, are unresolved.
 
 ## Auxiliary record payload entries
 
@@ -500,12 +567,15 @@ The decoder accepts only what was observed and decodes nothing else:
   in time in line with the stored bytes. One entry decoded alone has the
   same limit. The largest item data seen on one element is 388 stored bytes
   in the public file (408 in the confidential files); and
-- the sum over a document needs no second limit. For one read, an auxiliary
-  record belongs to one element, so the item data of all elements together
-  is at most the inflated bytes of the file, which
-  `max_total_inflated_bytes` holds. A caller that keeps the item data of
-  every element of one read holds at most 8 times (Rust) or 16 times
-  (Python) those bytes, as requested bytes.
+- the sum over a document needs no second limit. For one read, and for one
+  shared-cell definitions call, an auxiliary record belongs to one element,
+  so the item data of all elements of that result together is at most the
+  inflated bytes of the file, which `max_total_inflated_bytes` holds. A
+  caller that keeps the item data of every element of one read holds at
+  most 8 times (Rust) or 16 times (Python) those bytes, as requested bytes.
+  Each shared-cell definitions call builds its result anew. A caller that
+  asks for the definitions once for each of M models and keeps every result
+  holds the definitions, and the item data it decodes from them, M times.
   `ezdgn inspect --entities --json` writes each string of an instance once
   and gives every use as a position in that list, so its output and its
   memory follow the same rule. In a test with 1,160 elements whose item data
@@ -542,6 +612,8 @@ Each rule can be taken out, and its form left raw, if that is preferred.
 | Item data: a byte `0x80` or above in the `fa` form is one code point | Read as one code point per byte, the string equals the text of a text element in the same file; the writer uses the `fb` form for a character that a Windows-1252 byte could hold | 36 strings in 36 of 140 instances (`81` in 19, `bd` in 16, `be` in 1); 36 of 36 equal a text element | the same test |
 | Auxiliary entries: bit 31 of the length word is a flag and not part of the length | A check of structure only, not against other decoded data: with the bit masked off the lengths split every record with no byte left over, and every item entry decodes; with the bit kept each length is longer than its record. What the flag means is not known | set in 1,024 of 1,024 entries of 783 records; all 140 item entries among them decode | `splits_entries_and_keeps_every_header_word` |
 | 3D text: the four values are a quaternion with the scalar first | Only the first and the last value are ever not zero, which is a turn about Z when the scalar is first; the turn was compared with the end of the stored range at which the stored origin lies | 1,875 of 1,875 are unit quaternions; 1,713 not turned, 157 quarter turns, 5 half turns; 149 of the 149 turned texts of three or more characters have the origin at the end that the row rule gives, and 144 of them tell the rule from its transpose | `a_3d_text_exposes_its_stored_quaternion`: the values come back in stored order; the reader computes nothing from them |
+| Shared-cell instance: the nine matrix values are stored by rows | `origin + M * p` over the vertices of the matched definition was compared with the range that the instance stores, by rows and by columns | 2,376 instances checked; 2,319 matrices cannot tell the order (2,311 fit, 8 do not); of the 57 that can, 47 fit by rows, 0 by columns and 10 neither way | `an_instance_places_a_definition_point_with_its_matrix_by_rows` |
+| Shared-cell definitions: an instance repeats the six range values of its definition, and definitions can share a name | The six values of each instance were compared with those of every definition of that name in the file | 2,874 of 2,953 instances match one definition (one matches two equal ones); 79 name no definition of their file; the checked-in fixture shows one matching pair | `shared_cell_definitions_hold_their_components_in_their_own_space` |
 
 ## Deliberately unresolved semantics
 

@@ -16,7 +16,7 @@ The reader is a bounded, read-only pipeline:
 6. decode model metadata, standard graphical elements, hierarchy, linkages,
    and auxiliary-record associations;
 7. decode on request, and not when a document is read, the entries of an
-   auxiliary record and item instances; and
+   auxiliary record, item instances, and shared-cell definitions; and
 8. expose the result through Rust, Python, CLI inspection, and an explicit XY
    plotting adapter.
 
@@ -37,6 +37,9 @@ The semantic model currently covers:
 - property and unknown linkages with exact bytes;
 - the entries of an auxiliary-record payload with their type word, entry ID
   and exact data;
+- shared-cell definitions from the named object pages, on request, with their
+  components and hierarchy in definition space, and the match of an instance
+  to its definition;
 - item instances on graphical elements: the item class name, the stored root
   attributes, and each property name with its text value, for the one stored
   layout recorded in `FORMAT_NOTES.md`; and
@@ -56,7 +59,9 @@ This milestone does not support:
 - V8 creation, writing, editing, or round-trip serialization;
 - complete dimension annotation semantics;
 - full B-spline knot/weight/surface semantics;
-- shared-cell definition lookup and transformed instance expansion;
+- transformed shared-cell instance expansion (the definitions and the
+  placement rule are available; the reader does not copy components into the
+  model) and ByCell symbology resolution;
 - product-specific custom objects, schema text, typed or converted Item Type
   values, item instance layouts other than the recorded one (nested elements,
   wider counts and lengths), business properties, or other XAttribute payload
@@ -92,6 +97,13 @@ Rust callers use `scan_v8_objects()` for the raw model and `read_v8()` for the
 semantic model. Python exposes the same operations plus `read_v8file()`.
 `open_document()` and `openfile()` dispatch between V7 and V8 without changing
 the legacy contracts.
+
+`V8ElementData::SharedCellDefinition` is a new variant of a public Rust enum:
+code that matches `V8ElementData` without a wildcard arm must add it.
+`DgnError::V8ModelIndexOutOfRange` is a new variant of the error enum in the
+same way. Nothing that `read_v8()` returned before changes: a shared-cell
+definition is returned only by the calls that read definitions, and a type-34
+header in a model is the unknown complex element it was.
 
 `read()`, `readfile()`, `scan_records()`, and `inspect_headers()` remain V7
 record APIs and intentionally reject V8/CFB input. This preserves existing V7

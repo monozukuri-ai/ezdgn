@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Literal, TypeAlias, cast
 
@@ -29,6 +30,7 @@ from ._core import decode_v8_item_instance_data as _decode_v8_item_instance_data
 from ._core import decode_v8_item_instances_data as _decode_v8_item_instances_data
 from ._core import inspect_v8_cfb as _inspect_v8_cfb
 from ._core import read_v8_document as _read_v8_document
+from ._core import read_v8_shared_cells as _read_v8_shared_cells
 from ._core import scan_v8_object_records as _scan_v8_object_records
 from .raw import DEFAULT_MAX_FILE_SIZE_BYTES, DgnSource, _read_all, _validate_limit
 
@@ -453,6 +455,31 @@ class V8ElementData:
             return None
         return (values[0], values[1], values[2], values[3])
 
+    def place_definition_point(self, point: Point3) -> Point3 | None:
+        """Place a point of a shared-cell definition with this instance.
+
+        ``point`` is in the definition's own space, in UOR. The result is
+        ``origin + M * point`` in the UOR of the model, where ``M`` is the 3x3
+        matrix that the last nine ``transform`` values hold by rows. Returns
+        ``None`` for another element kind and for an instance that does not
+        hold fifteen values.
+        """
+
+        if (
+            self.kind != "SHARED_CELL_INSTANCE"
+            or self.origin is None
+            or len(self.transform) != 15
+        ):
+            return None
+        matrix = self.transform[6:]
+        x, y, z = point
+        origin = self.origin.uor
+        return (
+            origin[0] + (matrix[0] * x + matrix[1] * y + matrix[2] * z),
+            origin[1] + (matrix[3] * x + matrix[4] * y + matrix[5] * z),
+            origin[2] + (matrix[6] * x + matrix[7] * y + matrix[8] * z),
+        )
+
     @property
     def start_angle_degrees(self) -> float | None:
         if self.start_angle_radians is None:
@@ -510,6 +537,7 @@ class V8Element:
         return self.kind not in {
             "UNKNOWN",
             "UNKNOWN_COMPLEX",
+            "SHARED_CELL_DEFINITION",
             "BSPLINE_POLE",
             "TEXT_NODE",
             "MATRIX_HEADER",
@@ -521,6 +549,57 @@ class V8Element:
         """Return the stable uppercase entity label used by ``query`` and CLI."""
 
         return self.kind
+
+
+@dataclass(frozen=True, slots=True)
+class V8SharedCellDefinition:
+    """One shared-cell definition: its header element, then its components.
+
+    The coordinates are in the definition's own space; the master values use
+    the scale of the model the definitions were read for, with no global
+    origin. ``index``, ``parent_index`` and ``child_indices`` of the elements
+    are positions in ``elements``. A shared-cell instance places a definition
+    point ``p`` at ``origin + M * p``, where ``M`` is the 3x3 matrix by rows
+    in the last nine of the instance's fifteen ``transform`` values.
+    """
+
+    name: str
+    elements: tuple[V8Element, ...]
+
+    @property
+    def header(self) -> V8Element | None:
+        return self.elements[0] if self.elements else None
+
+    @property
+    def range_values(self) -> tuple[float, ...] | None:
+        """The six stored range values: low XYZ, then high XYZ."""
+
+        header = self.header
+        if header is None or header.kind != "SHARED_CELL_DEFINITION":
+            return None
+        values = header.data.transform[:6]
+        return values if len(values) == 6 else None
+
+    def matches(self, instance: V8Element) -> bool:
+        """Whether a shared-cell instance refers to this definition.
+
+        An instance repeats the name and the six range values of its
+        definition. Both must be equal: one file can hold several definitions
+        with one name. The values are compared bit for bit, so ``-0.0`` does
+        not match ``0.0``.
+        """
+
+        data = instance.data
+        range_values = self.range_values
+        return (
+            data.kind == "SHARED_CELL_INSTANCE"
+            and data.name is not None
+            and data.name == self.name
+            and len(data.transform) == 15
+            and range_values is not None
+            and struct.pack("<6d", *range_values)
+            == struct.pack("<6d", *data.transform[:6])
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -786,6 +865,57 @@ def read_v8(
 
 
 read_v8file = read_v8
+
+
+def read_v8_shared_cell_definitions(
+    source: DgnSource,
+    *,
+    limits: V8ScanLimits | None = None,
+    model_index: int = 0,
+) -> tuple[V8SharedCellDefinition, ...]:
+    """Read the shared-cell definitions of a V8 file.
+
+    They are not part of ``read_v8()``: a file can hold many more definition
+    components than drawn elements. ``model_index`` selects the model whose
+    unit scale gives the master values. A ``model_index`` that is negative or
+    not a model of the document raises ``ValueError``. Each call reads the
+    file again and builds a new result: keep the result, and note that the
+    results of one call for each model hold the definitions once for each
+    model.
+    """
+
+    actual_limits = limits or V8ScanLimits()
+    if model_index < 0:
+        raise ValueError("model_index must not be negative")
+    data = _read_all(source, max_file_size=actual_limits.max_file_size)
+    rows = cast(
+        "list[dict[str, Any]]",
+        _read_v8_shared_cells(data, actual_limits._native_row(), model_index),
+    )
+    return tuple(
+        V8SharedCellDefinition(
+            name=row["name"],
+            elements=tuple(
+                V8Element(
+                    index=element["index"],
+                    raw=_raw_object_from_core(element["raw"]),
+                    common=_common_from_core(element["common"]),
+                    data=_element_data_from_core(element["data"]),
+                    parent_index=element["parent_index"],
+                    child_indices=tuple(element["child_indices"]),
+                    linkages=tuple(
+                        _linkage_from_core(item) for item in element["linkages"]
+                    ),
+                    auxiliary_records=tuple(
+                        _aux_record_from_core(item)
+                        for item in element["auxiliary_records"]
+                    ),
+                )
+                for element in row["elements"]
+            ),
+        )
+        for row in rows
+    )
 
 
 def _container_from_core(row: dict[str, Any]) -> V8ContainerInfo:
@@ -1205,6 +1335,7 @@ __all__ = [
     "V8RawModel",
     "V8RawObject",
     "V8ScanLimits",
+    "V8SharedCellDefinition",
     "LEVEL_TABLE_ELEMENT_TYPE",
     "LEVEL_TABLE_KIND",
     "NAME_LINKAGE_SIGNATURE",
@@ -1219,6 +1350,7 @@ __all__ = [
     "inspect_v8_container",
     "level_table",
     "read_v8",
+    "read_v8_shared_cell_definitions",
     "read_v8file",
     "scan_v8_objects",
 ]

@@ -238,6 +238,23 @@ per defined level: `level_id` as graphical headers store it, the user-visible
 `document.level(level_id)`. An element header that holds the ByLevel sentinel
 `0xffffffff` in its weight, color or style takes the value of its level.
 
+Shared-cell definitions are read on request, because a file can hold many
+more definition components than drawn elements:
+
+```python
+definitions = ezdgn.read_v8_shared_cell_definitions("drawing-v8.dgn")
+for element in document.models[0].elements:
+    if element.kind == "SHARED_CELL_INSTANCE":
+        definition = next((d for d in definitions if d.matches(element)), None)
+```
+
+A `V8SharedCellDefinition` has its `name` and its `elements`: the header, then
+the components with their hierarchy, in the definition's own coordinates. An
+instance places a definition point `p` at `origin + M * p`, where `M` is the
+3x3 matrix by rows in the last nine values of `element.data.transform`;
+`element.data.place_definition_point(p)` returns that point in UOR. The
+reader does not copy the components into the model.
+
 Item data that a file attaches to an element (Item Types, and block attributes
 of drawings converted from DWG) is available as `element.item_instances`:
 

@@ -32,6 +32,34 @@ used only to check externally visible feature geometry and attributes. It does
 not preserve every control object, native curve parameter, cell component, or
 complex-element relationship and therefore is not a source-semantic oracle.
 
+### Constructed tag file
+
+- Binary: `tests/data/dgn/v8/constructed_tags.dgn`, 7,680 bytes, SHA-256
+  `407f7dd8f5093646d4f27735d92b45c13319e08c8b1471a49d09e693160f2261`
+- Origin: written by this repository's own test builder from made-up values
+  (`write_the_constructed_tag_fixture` in
+  `crates/ezdgn-core/src/v8/entity.rs`). It is synthetic. It is not derived
+  from any real file, and it was not made or read by an authoring
+  application.
+- Content: one 2D model with a shared-cell instance, three tag elements, and
+  type-37 objects that are not read as tags; one tag set and one shared-cell
+  definition with a tag in the named pages.
+- Use: the Python tests and the stream tests read it, so that the path from
+  the Rust reader to the Python objects is tested for a tag in every test
+  run. The expected values are the inputs of the builder. It is not evidence
+  for any format rule.
+- Reproducible: the bytes depend on the input of the builder alone. Each
+  stream is a zlib stream of stored blocks that the builder writes by hand,
+  so no compression library takes part. Each storage carries the fixed time
+  1970-01-01 00:00:00 UTC, and the root and the streams carry no time, so no
+  clock takes part. The default test run builds the file in memory and
+  compares it byte for byte with the checked-in file
+  (`the_checked_in_tag_file_is_what_the_builder_writes_byte_for_byte`). The
+  layout of the container comes from the `cfb` crate at the version in
+  `Cargo.lock` (0.14.0). A later version of that crate can lay the same
+  content out in another way; that test then fails and says how to write the
+  file again.
+
 ### Public CFB structure
 
 The CFB container is read through the Rust `cfb` crate. Generic CFB sector,
@@ -54,6 +82,17 @@ inputs and are not redistributed by this repository.
   master/sub units `m` / `m`, 66,053 graphical objects and feature entities,
   comprising 18 lines and 66,035 line strings. All 66,053 associated auxiliary
   records remain addressable.
+- Item data observation (2026-11-10, same bytes and hash): each of the 66,053
+  records holds two entries of type `0x56ff0000`, and all 132,106 decode as
+  item instances (`WaterMain` and `Metadata`). The file holds nine more
+  auxiliary records, on named objects, with 12 entries of other types;
+  `FORMAT_NOTES.md` counts all 66,062 records and 132,118 entries. This file
+  is the public evidence for the entry layout and the item instance layout in
+  `FORMAT_NOTES.md`. It does not exercise the UTF-16 string form, one-byte
+  strings above `0x7f`, or a set bit 31 in the entry length word;
+  `FORMAT_NOTES.md` states the evidence for those.
+  `tests/python/test_v8_item_data.py` reads the file when
+  `EZDGN_PUBLIC_V8_DIR` names a folder that holds it and skips otherwise.
 
 #### Tree text-node labels with tags
 
@@ -65,11 +104,56 @@ inputs and are not redistributed by this repository.
   master/sub units `m` / `m`, 33,335 graphical objects, 6,904 text-node
   headers, 12,623 text children in the feature view, and 13,808 unknown raw
   objects.
+- Tag observation (2026-11-10, same bytes and hash): the 13,808 objects are
+  type-37 tag elements and all decode, 6,904 with a text value and 6,904 with
+  an integer value. The one tag set of the file decodes with two definitions,
+  and every tag names it, an ID defined in it, and a text-node header as its
+  host. This file is the public evidence for the tag element and tag set
+  layouts in `FORMAT_NOTES.md`. It does not exercise text bytes above `0x7f`,
+  tags without a host, tags inside shared-cell definitions, or the origin of
+  a tag; `FORMAT_NOTES.md` states the evidence for those.
+  `tests/python/test_v8_tags.py` reads the file when `EZDGN_PUBLIC_V8_DIR`
+  names a folder that holds it and skips otherwise.
 
 The descriptions and supplied application context are not treated as byte
 layout documentation. The files demonstrate that the model/page/object rules
-and text-node feature policy work beyond the GDAL baseline. Unknown custom or
-tag data remains raw unless independently characterized.
+and text-node feature policy work beyond the GDAL baseline. Unknown custom
+data remains raw unless independently characterized.
+
+### Real-world files that are not redistributed
+
+Every layout that this log adds on 2026-11-10 was also run on 90 real-world
+production files held by a contributor (85 2D files and five 3D files
+converted from DWG): the auxiliary entries, the item instances, the stored
+quaternion of 3D text, the shared-cell definitions with the match and the
+placement of an instance, and the tag elements and tag sets.
+
+These files are highly confidential. They cannot be shared, they are not
+part of this repository, and no byte, name or text from them is recorded
+here. Only counts are reported.
+
+Most rules have public evidence too, from the checked-in fixture or from the
+two public files above. These rules have none:
+
+- item data: the `fb` UTF-16 string form, and bytes `0x80` and above in the
+  `fa` form;
+- auxiliary entries: bit 31 of the length word being set;
+- 3D text: the order of the four quaternion values for a text that is turned;
+- shared cells: the row order of the nine matrix values of an instance, and
+  the match by name and range values where definitions share a name; and
+- tags: text bytes above `0x7f` with the code page word, bytes after the
+  value, empty values and prompts, tags in shared-cell definitions, tags
+  without a host or with a shared-cell instance as host, and the origin.
+
+Each of them is listed in `FORMAT_NOTES.md` under "Rules that rest on
+confidential files", with how the rule was found, the counts, and the
+constructed test that covers it. The method was the same as for the public
+files: read the bytes of lawfully held files, state a rule, and count where
+it holds and where it does not. Most rules were also checked against
+something that the reader already decodes in the same file; the table says
+which rows have no such check. A reviewer cannot reproduce those counts.
+Each such rule can be taken out, and its form left raw, if that is
+preferred.
 
 ### Repository observations
 

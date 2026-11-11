@@ -21,5 +21,15 @@ fuzz_target!(|data: &[u8]| {
         max_vertices: 100_000,
         max_hierarchy_depth: 128,
     };
-    let _ = read_v8(data, options);
+    if let Ok(document) = read_v8(data, options) {
+        let _ = document.tag_sets();
+        for element in document.models.iter().flat_map(|model| &model.elements) {
+            let _ = element.decode_item_instances();
+        }
+        if let Ok(definitions) = document.shared_cell_definitions(0, options) {
+            for element in definitions.iter().flat_map(|item| &item.elements) {
+                let _ = element.decode_item_instances();
+            }
+        }
+    }
 });

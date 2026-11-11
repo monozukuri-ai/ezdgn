@@ -97,6 +97,11 @@ pub enum DgnError {
     #[error("invalid V8 model index at byte offset {offset}: {context}")]
     InvalidV8ModelIndex { offset: usize, context: String },
 
+    /// The caller asked for a model that the document does not have. This
+    /// is a wrong argument; it says nothing about the input.
+    #[error("model index {index} is out of range: the document has {count} models")]
+    V8ModelIndexOutOfRange { index: usize, count: usize },
+
     /// A model header is absent or structurally inconsistent.
     #[error("invalid V8 model header {path}: {context}")]
     InvalidV8ModelHeader { path: String, context: String },
@@ -360,6 +365,13 @@ impl DgnError {
                 | Self::V8VertexLimitExceeded { .. }
                 | Self::V8HierarchyDepthLimitExceeded { .. }
         )
+    }
+
+    /// Returns true when the error is a wrong argument of the caller and
+    /// not a property of the input.
+    #[must_use]
+    pub const fn is_argument_error(&self) -> bool {
+        matches!(self, Self::V8ModelIndexOutOfRange { .. })
     }
 
     /// Returns true when a recognized family or dimension is outside the

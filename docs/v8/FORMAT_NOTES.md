@@ -41,6 +41,10 @@ public, non-committed V8 files on 2026-07-29:
 | `f34bbb1b408b` | 3,840,000 | `Default` / `Master Model`, 2D, 10 UOR/master, `m` / `m` | 66,053 | 66,053 | 18 lines, 66,035 line strings, 66,053 associated auxiliary records |
 | `8439e6d3a182` | 847,360 | `Default` / `Master Model`, 2D, 10 UOR/master, `m` / `m` | 33,335 | 12,623 | 6,904 text-node headers, 12,623 text children, 13,808 unknown raw objects |
 
+Since the tag decoder (2026-11-10) the 13,808 objects of the second file are
+read as tag elements. They stay outside the feature view, so its entity count
+is unchanged.
+
 These files broaden structural coverage but do not make their application
 schemas part of the supported semantic contract. Full hashes and acquisition
 links are in `PROVENANCE.md`.
@@ -103,7 +107,8 @@ An inflated auxiliary page instead repeats a 28-byte record header plus its
 payload. The confirmed fields are magic `0x0000a11b` at `+0x00`, payload length
 at `+0x04`, kind at `+0x08`, a retained reserved value at `+0x0c`, element ID at
 `+0x10`, and flags at `+0x18`. Auxiliary records are associated by element ID
-but remain independently indexed and byte-exact.
+but remain independently indexed and byte-exact. The payload layout is
+described under [Auxiliary record payload entries](#auxiliary-record-payload-entries).
 
 ## Model index and model header
 
@@ -198,8 +203,10 @@ The decoder maps standard element types as follows:
 | 17 | text |
 | 21 / 27 | B-spline pole sequence / curve header |
 | 22 | point string with per-point orientation |
+| 34 | shared-cell definition header in the named pages: component count, range values, matrix, linked name |
 | 35 | shared-cell instance, origin, transform, linked name when present; the origin is the last three doubles of the record whether or not the 3D flag is set |
 | 36 | bounded dimension anchor |
+| 37 | tag element stored as 2D: tag ID, value type, value bytes, text or integer value, tag set and host element IDs, origin when it lies inside the stored range |
 
 An unrecognized object carrying a header role becomes `UnknownComplex` with a
 bounded child count; any other unrecognized object becomes `Unknown`. Both
@@ -211,6 +218,27 @@ width and height multipliers. Their UOR distances are
 more. The semantic model retains both raw multipliers and both converted
 distances. This conversion reproduces the checked-in GDAL oracle's
 `s:1.000000g` labels and the independently observed public text-node fixture.
+
+A stored-3D type-17 text holds two finite `f64` values at `0x80` and `0x88`,
+a unit quaternion in scalar-first order `(w, x, y, z)` at `0x90`, and its
+origin at `0xb0`. The six values from `0x80` are kept together as the text's
+`orientation`; `quaternion` returns the last four. The two 3D texts of the
+checked-in fixture hold `(1, 0, 0, 0)`. That is the only public evidence, and
+it shows no more than a text that is not turned. The order of the four values
+for a turned text rests on confidential files (see
+"Rules that rest on confidential files" below). In five such files all
+1,875 3D texts hold a unit quaternion there. Only the first and the last of
+the four values are ever not zero, which is a turn about Z when the scalar
+comes first: 1,713 texts are not turned, 157 are turned by a quarter turn and
+5 by a half turn. For the 149 turned texts of three or more characters, the
+local X axis given by the first row of the quaternion's rotation matrix (the
+rule the V7 reader uses for 3D elements) points up for 140, down for 4 and
+left for 5. In all 149 the stored origin lies at the end of the stored range
+where such a text starts: the low Y end, the high Y end and the high X end.
+The 144 quarter turns tell this rule from its transpose, which swaps up and
+down; the 5 half turns do not. The meaning of the two values at `0x80` and
+`0x88` is unresolved. The reader returns the quaternion as stored, computes
+nothing from it, and does not turn it into an angle.
 
 The type-17 text payload starts right after the fixed header (editable-field
 word at `0xa8` for 2D, `0xc8` for 3D; payload at `0xaa` / `0xca`), its byte
@@ -290,11 +318,492 @@ the color index on the MicroStation file and was 0 on the DWG conversion;
 `0x28`, `0x2c` and `0x60` vary by file and remain unresolved. Element headers
 use `0xffffffff` (ByLevel) and `0xfffffffe` (ByCell) in their symbology words.
 
+## Shared-cell definitions
+
+A shared-cell definition is a type-34 header object in the named object pages
+(`/Dgn^Nm`), followed by its components: the objects with the component role up
+to the next object that is not a component. The primary part of the header is
+`0x100` bytes in every definition seen:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x68` | `u32` | declared component count |
+| `0x70` | six `f64` | range of the definition in its own space: low XYZ, then high XYZ |
+| `0xa0` | nine `f64` | a 3x3 matrix by rows; the identity in every definition seen |
+| `0xe8` | three `f64` | zero in every definition seen |
+
+The name is the property linkage with ID 1, as for an instance. The components
+are ordinary graphical objects (lines, shapes, texts, text nodes, arcs,
+ellipses, cells, and shared-cell instances of other definitions) with
+coordinates in the definition's own space.
+
+A type-35 instance repeats its definition in the fifteen values it stores from
+`0x70`: the first six equal the definition's six range values bit for bit, and
+the last nine are a 3x3 matrix `M` by rows. The instance places a definition
+point `p` at `origin + M * p`, in UOR; `place_definition_point` returns that
+point. One file can hold several definitions with one name and different
+ranges, so an instance is matched by the name and the six values together,
+and the six values are compared bit for bit.
+
+Evidence:
+
+- The checked-in fixture has one definition, `Named definition`, with one
+  component: a circle of radius 1 UOR at the definition origin, range
+  `(-1, -1, 0)` to `(1, 1, 0)`. Its one instance has `M` = 10,000 times the
+  identity and origin `(0, 1e4, 2e4)`. `origin + M * p` for the range
+  corners gives `(-1e4, 0)` and `(1e4, 2e4)`, the range the instance
+  stores. This matrix is diagonal, so the fixture shows the placement but
+  not the order of the nine values.
+- In 90 confidential real-world files (see
+  "Rules that rest on confidential files" below), all 30,757 type-34
+  headers decode with this layout and every one of their 438,312 components
+  has a parent. Of 2,953 instances, 2,874 match a definition by name and
+  range values (one matches two equal definitions) and 79 have no definition
+  with their name in the file. For the 2,376 matched instances whose
+  definition holds only lines, line strings and shapes, `origin + M * p` over
+  the component vertices reproduces the stored instance range within 1% for
+  2,358; the other 18 are unresolved. The order of the nine values rests on
+  these files alone: 2,319 of the 2,376 matrices are symmetric in their XY
+  part and give the same points by rows and by columns, and 57 are not. Of
+  those 57, 47 reproduce the range by rows, none does by columns, and 10 do
+  neither way.
+- The two public sample files in `PROVENANCE.md` hold no definition.
+
+The reader returns the definitions with their components in definition space.
+It does not copy or transform components into the model, and it does not
+resolve ByCell symbology. A header with another primary size, a type-34 object
+without the header role, and a run whose hierarchy cannot be built are not
+read as definitions and stay raw. A value among the fifteen that is not
+finite also leaves the run raw; it is not an error. Definitions are read only
+from the named pages: a type-34 header in the graphical pages of a model is
+the unknown complex element with its child count that it was before
+definitions were read, whatever its values are. A component that follows
+after the declared child counts of the run are used up has no parent; it and
+the components after it are not listed with the definition and stay raw. The
+reader gives no count of the components that it leaves out in this way. No
+definition seen holds such a component. The values at `0xa0` and `0xe8` of the
+header, and the 79 instances without a definition, are unresolved.
+
+## Auxiliary record payload entries
+
+The payload of an auxiliary record is a sequence of entries. The record header
+word at `+0x18`, which the raw model exposes under its historical name `flags`,
+is the entry count; the word at `+0x08` (`kind`) was 170 in every record seen.
+Each entry is a 16-byte little-endian header followed by its data:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x00` | `u32` | type word: the high half groups related entry types, the low half numbers the types of one group |
+| `0x04` | `u32` | entry ID, which tells entries of one type on one element apart |
+| `0x08` | `u32` | data length in the low 31 bits; bit 31 is a writer flag |
+| `0x0c` | `u32` | zero in every entry seen |
+| `0x10` | bytes | data |
+
+The four bytes `01 00 00 00` follow the last entry and end the payload. A
+record without entries is those four bytes alone.
+
+This layout splits every auxiliary record of the files observed, with no byte
+left over:
+
+| Source | Records | Entries | Entries per record | Bit 31 of the length word |
+| --- | ---: | ---: | --- | --- |
+| checked-in fixture | 1 | 1 | 1 | clear |
+| public water mains file (`f34bbb1b408b`) | 66,062 | 132,118 | 1, 2, 4 | clear |
+| 90 confidential real-world files | 783 | 1,024 | 0 to 8 | set |
+
+The table counts every auxiliary record of a file. In the public file 66,053
+records are on the graphical elements, with the 132,106 item entries that
+`PROVENANCE.md` reports, and 9 records are on named objects, with 12 entries
+of other types.
+
+The fixture's one record is on a named object: type word `0x57090000`, entry
+ID 0, 102 data bytes that begin `03 00 00 00 c0 00 00 00 78 9c` (a `u32` 3, the
+inflated size 192, then a zlib stream). The meaning of bit 31 is unresolved;
+the length is correct with the bit masked off in all three sources. That the
+bit can be set rests on confidential files alone (see
+"Rules that rest on confidential files" below). Entry data
+other than the item instances below is not interpreted. A payload that does
+not hold exactly the declared number of entries followed by the closing word
+is not split at all and stays a raw payload. The entry count comes from the
+file and an entry can be an empty header, so a payload that declares more than
+65,536 entries is not split either. The largest count seen in one record is 4
+in the public files and 8 in the confidential files.
+
+## Item instances
+
+An entry with type word `0x56ff0000` on a graphical element holds one item
+instance: the values of one item type (item class) for that element. The data
+is a small XML element in a tokenized binary form:
+
+| Offset | Bytes | Meaning |
+| ---: | --- | --- |
+| `0x00` | `00 00 01 01 15` | constant |
+| `0x05` | `u32` | element ID of the named object that holds the schema text |
+| `0x09` | `01` | constant |
+| `0x0a` | `42 45 43 58 4d 4c 00` | `BECXML` and a zero byte |
+| `0x11` | `ff 0a 0d` | constant |
+| `0x14` | `01 00 00 03 00 00 30` | constant |
+| `0x1b` | `u8` | string count |
+| `0x1c` | | string table, then the token stream to the end of the data |
+
+A string table entry is `fa`, a `u8` length and that many bytes, one byte for
+each character with the byte value as the code point; or `fb`, a `u8` count of
+UTF-16 code units and that many little-endian units. Equal strings share one
+entry, and the entries are in the order of first use. A token is one byte,
+followed by a `u8` string number where it names a string:
+
+| Token | Operand | Meaning |
+| ---: | --- | --- |
+| `03` | string | start of the root element; the string is the item class name |
+| `05` | string | attribute name of the root element |
+| `11` | string | value of the attribute or property just named |
+| `06` | | end of the root attributes |
+| `02` | string | start of a property element; the string is the property name |
+| `04` | | end of the open element |
+
+Every instance observed is `03 class (05 name 11 value)+ 06 (02 name 11 value
+04)* 04`: a root element with attributes, then one child element with one text
+value for each property, and nothing after the closing `04`. An empty value is
+a reference to the empty string, not a missing `11`. A made-up instance
+`<Pump instanceId="" xmlns="Lib.01.00"><Tag>P-101</Tag></Pump>` with schema
+holder 42 is stored as:
+
+```text
+00 00 01 01 15  2a 00 00 00  01  42 45 43 58 4d 4c 00  ff 0a 0d
+01 00 00 03 00 00 30  07
+fa 04 "Pump"  fa 0a "instanceId"  fa 00  fa 05 "xmlns"
+fa 09 "Lib.01.00"  fa 03 "Tag"  fa 05 "P-101"
+03 00  05 01 11 02  05 03 11 04  06  02 05 11 06 04  04
+```
+
+The public water mains file listed in `PROVENANCE.md` carries two instances on
+each of its 66,053 elements, 132,106 in total, and every one decodes with this
+layout: entry ID 1 is class `WaterMain` with the properties `GaugeMM`,
+`LiningMaterial` and `Material`, entry ID 2 is class `Metadata` with
+`InstallationDate`. The root attributes are `instanceId` (empty) and `xmlns`
+(`DgnCustomItemTypes_Default__x0020__Library.01.00`) in all of them. The
+`u32` at `0x05` is the element ID of a named object of type 39 whose bytes hold
+`fLMX` at `0x28`, `01 00 ff 56` at `0x2c`, and the schema as UTF-16LE XML text
+(`<ECSchema schemaName="DgnCustomItemTypes_Default__x0020__Library"
+version="01.00" ...>`). The `xmlns` value is that schema's name and version,
+the root name is an `ECClass` `typeName` of it, and the property names are the
+`propertyName` values of that class in the same order. The schema's
+`displayLabel` is `Default Library`, so `__x0020__` in a stored name stands for
+a space; names are returned as stored. Every property in that schema has
+`typeName="string"`, and values such as `150` and `1986-01-01` are stored as
+text. In that file the entry ID equals the `ID` the schema records for the
+class.
+
+Five confidential real-world files (drawings converted from DWG, with block
+attributes turned into item instances) agree: 140 instances on
+shared-cell instances, all decoded, each with the same two root attributes and
+with the properties of a class in a schema held by a type-39 object (15
+properties in 139 instances, one in the other). In those 140 instances the
+first property value equals the text that the file draws next to the cell.
+They also give the only evidence for three parts of the layout. A reviewer
+cannot reproduce these three from public files; how each was found is in
+"Rules that rest on confidential files" below:
+
+- the `fb` UTF-16 string form (11 strings in 11 instances), used where a
+  string has a character above U+00FF (U+0192 in those files). Each of the 11
+  strings equals the text of a text element in the same file;
+- bytes `0x80` and above in the `fa` form (36 strings in 36 instances: `81` in
+  19, `bd` in 16, `be` in 1), read as the code points U+0081, U+00BD and
+  U+00BE. Each of the 36 strings equals the text of a text element in the
+  same file, and the writer used the `fb` form for U+0192, which a
+  Windows-1252 byte could have held, so the `fa` form is taken as one code
+  point per byte and not as a code page. No other byte from `0x80` to `0x9f`
+  was seen in the `fa` form; and
+- bit 31 of the entry length word being set (in all 140 item entries, and in
+  all 1,024 entries of those files).
+
+In those files the entry ID was 1 for a class whose schema `ID` is not 1 in 34
+instances, so the entry ID is exposed but is not treated as the class ID.
+
+The decoder accepts only what was observed and decodes nothing else:
+
+- the constants above must match byte for byte;
+- the string count, each string length and each string number must be below
+  `0x80` (the largest values seen were 23 strings, a length of 66 and string
+  number 22); a larger byte may belong to a wider encoding that was not seen;
+- a string tag other than `fa` and `fb`, invalid UTF-16, a string number
+  outside the table, any other token, a root without attributes, a property
+  without exactly one value, a nested element, or any byte after the closing
+  token leaves the entry undecoded;
+- a table string is never copied. A string number can name a long table
+  string any number of times: one attribute is four stored bytes and can name
+  762 bytes of text. The table is therefore decoded once, and the class name,
+  each name and each value is a reference to one of its strings (a shared
+  handle in Rust, one `str` object in Python). The memory of a decoded
+  instance is then at most a fixed multiple of its stored bytes, whatever the
+  string numbers are. The worked worst case, on a 64-bit target, in the
+  bytes that the decoder requests:
+
+  | Part of an instance | Stored bytes | Rust, bytes | CPython 3.12, bytes |
+  |---|---:|---:|---:|
+  | one attribute (two string numbers) | 4 | 32: two handles | 64: one pair of two references and its place in the list |
+  | one property | 5 | 32 | 64 |
+  | the class name | 2 | 16: one handle | 8: one reference |
+  | an empty table string | 2 | 16: the two counters of its block | 0: the shared empty string |
+  | a table string of one wide character | 4 | 19 | 60 |
+  | the longest table string, 127 wide units | 256 | 397 | 312 |
+  | head, signature, counts and marks | 30 | 72: the fixed part | 216 at most: the fixed part |
+
+  That is at most 8 requested bytes for one stored byte in Rust and at most
+  16 in Python. These figures, and the tests, count requested bytes: the
+  sizes that the decoder asks the allocator for. An allocator rounds a block
+  up and keeps its own bookkeeping, and that overhead can add up to about 2
+  times for small blocks (a block of 16 bytes takes a chunk of 32 bytes in
+  glibc). The Rust tests assert the 8. The Python tests assert 32, to leave
+  room for other builds; a run in Python on nine constructed shapes gave 1.3
+  to 15.7 (the script of that run is not in the repository). On a 32-bit
+  target the Rust number is 4 (worked out, not run);
+- one call returns at most 1,048,576 stored bytes of item data as decoded
+  instances, so one call returns at most 8 MiB of requested bytes in Rust
+  and 16 MiB of objects in Python. The data of each returned instance
+  counts. An item entry whose data is larger than what the call has left is
+  not read, and the call reports how many entries it left raw for that
+  reason; such an entry is counted also when it is damaged, because the call
+  does not look at its data. The entries after it are still read. An entry
+  that fits and does not match the layout is read up to the byte where it
+  fails and is then dropped: it costs nothing of the limit, it hides no
+  entry after it, and its memory is free again before the next entry is
+  read. One call therefore reads every item entry of the element that fits,
+  in time in line with the stored bytes. One entry decoded alone has the
+  same limit. The largest item data seen on one element is 388 stored bytes
+  in the public file (408 in the confidential files); and
+- the sum over a document needs no second limit. For one read, and for one
+  shared-cell definitions call, an auxiliary record belongs to one element,
+  so the item data of all elements of that result together is at most the
+  inflated bytes of the file, which `max_total_inflated_bytes` holds. A
+  caller that keeps the item data of every element of one read holds at
+  most 8 times (Rust) or 16 times (Python) those bytes, as requested bytes.
+  Each shared-cell definitions call builds its result anew. A caller that
+  asks for the definitions once for each of M models and keeps every result
+  holds the definitions, and the item data it decodes from them, M times.
+  `ezdgn inspect --entities --json` writes each string of an instance once
+  and gives every use as a position in that list, so its output and its
+  memory follow the same rule. In a test with 1,160 elements whose item data
+  names 154 bytes of text for each stored byte, a run gave under 4 bytes of
+  output and under 33 bytes of peak memory for each stored byte; the test
+  asserts 8 and 64.
+
+An undecoded entry is not an error: the element is read as before and the
+entry keeps its exact bytes. The schema text of the type-39 object is not
+decoded by the reader; the remaining words of that object (`0x30` to the start
+of the text) and the meaning of the constants at `0x00`, `0x09`, `0x11` and
+`0x14` of the instance data are unresolved. The item tests use constructed
+bytes; the public file is read by an optional test when it is present, and the
+five confidential files are not included in the regression fixtures.
+
+## Tag elements and tag sets
+
+A tag is a type-37 graphical object. It holds one value for one definition of
+a tag set, and it can be attached to a host element. These fields were at the
+same place in every 2D tag seen, from two different writers:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0xa0` | two `f64` | XY in UOR: the origin of the host when the tag has one, otherwise the placement point of the tag |
+| `0xb8` | two `f64` | XY step from the first pair to the placement point; zero in a tag without a host |
+| `0xd0` | `u16` | tag ID: the definition of the tag set that the tag fills |
+| `0xd2` | `u16` | value type: 1 is 8-bit text, 3 is a 32-bit integer |
+| `0x138` | `u32` | byte length of the value |
+| `0x13c` | `u32` | 0 from one writer and 1252 from the other; read as a Windows code page number |
+| `0x140` | bytes | the value: text with its closing zero byte, or four little-endian bytes |
+
+One writer ends the primary bytes after the value, padded to an even length;
+the other stores 10 or 11 more bytes. The words at `0x9a`, `0x130` and `0x134`
+and the bytes from `0x120` to `0x130` differ between the two writers and are
+not read. The two `f64` at `0xf0` are not zero in any tag and one tag holds a
+quarter turn at `0x100`; they are not decoded.
+
+Two linkages of kind `0x56d0` (first four bytes `nn 10 d0 56`) hold element
+IDs:
+
+| Linkage | Bytes | Fixed bytes | Element ID |
+| --- | ---: | --- | --- |
+| tag set | 24 | `17 27 00 00 00 02 01 00` at `+0x04` | `u64` at `+0x0c`: the named object that holds the tag set |
+| host | 56 | `10 27 01 00` at `+0x04` and `01 00 07 00 00 00 00 00 00 00` at `+0x0a` | `u64` at `+0x14`: the element the tag is attached to |
+
+The two bytes at `+0x08` of the host linkage are `00 0a` from one writer and
+`02 09` from the other and are not compared.
+
+A tag set is a type-39 object in the named object pages:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| `0x28` | 8 bytes | `74 65 53 74 81 0f 00 00` (`teSt`, then `81 0f 00 00`) |
+| `0x30` | `u32` | differs from set to set; unresolved |
+| `0x34` | `u32` | byte length of the definitions |
+| `0x38` | `u32` | the same length again |
+| `0x3c` | bytes | the definitions, then at most one zero byte of padding |
+
+The name of the set is the property linkage with ID 1. One definition is, in
+this order:
+
+| Part | Meaning |
+| --- | --- |
+| 8-bit text, `00` | name of the tag |
+| `u16` | tag ID |
+| 8-bit text, `00` | prompt; can be empty |
+| `u16` | value type, 1 or 3 |
+| two `u16` | differ between the two writers; skipped |
+| `00` | zero in every definition seen |
+| default | 8-bit text and `00` for type 1; four bytes for type 3 |
+
+Evidence:
+
+- The public tree label file in `PROVENANCE.md` holds 13,808 tags in one 2D
+  model. All have the standalone role: none is a component of a complex
+  element, though each is attached to a host by a linkage (see below). There
+  are 6,904 text values and 6,904 integer values (1 to
+  58), and all decode. Its one tag set has two definitions, `Species` (ID 1,
+  text) and `Tree Count` (ID 2, integer). Every tag names that set, and its
+  tag ID is defined there with its value type. Every tag has a host linkage
+  to a text-node header of the model, two tags for each of the 6,904 text
+  nodes. The pair at `0xa0` equals the origin of the host in all 13,808 tags;
+  the pair at `0xb8` is `(0, -10)` in the text tags and `(0, -20)` in the
+  integer tags. The stored range of every tag in this file is the single
+  point `(0, 0)`, so the file cannot confirm the placement point.
+- In 85 confidential real-world 2D files, from another writer, 14
+  files hold 678 tags in their models and 526 more are components of
+  shared-cell definitions. 1,194 hold text and all decode; 18 of these values
+  hold bytes above `0x7f`, all from `0xa0` to `0xff`, and every tag with text
+  stores 1252 at `0x13c`. The other 10 hold value type 5 with 28 or 51 value
+  bytes, other bytes in their linkages and no tag set; their value is not
+  decoded. Each of the 1,194 names a tag set and a tag ID that is defined
+  there as text. 182 tags have a host linkage, each to a shared-cell instance
+  of the same model, and their pair at `0xa0` equals the origin of that
+  instance within 2 UOR. For these 182 the sum of the two pairs is inside the
+  stored range of the tag and the first pair alone is not. The 1,012 text
+  tags without a host hold zero at `0xb8`. The sum of the two pairs is inside
+  the stored range of all 1,204 tags.
+- The same files hold 91 objects with the tag-set code in 18 files. 89 decode,
+  with 671 definitions, all text, and tag IDs from 1 upward in stored order;
+  12 sets repeat a name. 92 of their strings hold bytes above `0x7f`, all from
+  `0xa0` to `0xff`. Two objects do not match the layout and stay raw: the
+  first definition of each holds 5 where a definition has its value type,
+  which is the value type that is not decoded in the 10 tags above, and the
+  byte before its default is not zero.
+- Five confidential real-world 3D files hold no tag and no tag set.
+- The checked-in fixture holds one type-37 object (element ID 93). It is
+  stored as 3D, has no linkage, and holds 3 at `0xd2`, 4 at `0x138` and four
+  zero bytes at `0x140`, where its primary bytes end. That agrees with the
+  layout above, but it is one object with tag ID 0 in a file without a tag
+  set. Tags are therefore read in 2D only and this object stays unknown.
+
+The decoder accepts only what was observed:
+
+- A type-37 object is a tag when it is stored as 2D, does not have the header
+  role, and its declared value fits the primary bytes and is not longer than
+  the string limit of the reader (`max_string_bytes`). Any other type-37
+  object stays unknown, exactly as it was before tags were read. A type-37
+  object never makes a read fail. That an object with the header role is not
+  a tag is a choice and not an observation: none of the 15,013 type-37
+  objects seen has that role (13,808 in the public file and one in the
+  fixture are standalone; in the confidential files 480 are standalone and
+  724 are components).
+- A text value is decoded when the value type is 1, the last byte is zero, no
+  other byte is zero, and either every byte is ASCII or the word at `0x13c`
+  is 1252; the bytes are then read as Windows-1252. An integer value is
+  decoded when the value type is 3 and the value is four bytes; it is read as
+  signed, and no value with the high bit set was seen. Every other value
+  keeps its bytes and has no decoded value. This is not an error.
+- The tag set ID and the host ID are read only from a linkage with the length
+  and the fixed bytes above.
+- The origin is the sum of the two pairs. It is reported only when it lies
+  inside the stored range of the tag, corners included.
+- A tag set is decoded only when the code, the two equal lengths, the padding
+  and every definition match. A definition with another value type, or a byte
+  that is not zero before the default, leaves the whole set undecoded and raw.
+  Its strings have no code page word and are read as Windows-1252. This
+  reading rests on the confidential files alone: the one tag set of the
+  public file holds no byte above `0x7f`.
+- Every length comes from the file, so each is held to a limit. A tag set
+  with more than 1,048,576 definition bytes is not decoded. One call for all
+  tag sets of a document reads at most 1,048,576 bytes in sum. A tag-set
+  object costs the definition bytes it declares plus its attribute bytes,
+  which hold its name. An object that cannot decode within the limit is
+  passed over and costs nothing: its two stored sizes differ, they declare
+  more than the limit, its primary bytes do not end with the declared
+  definition bytes, or its own cost is over the limit. The first other
+  object that would pass the sum ends the call, and it and the objects after
+  it are not listed. The smallest definition is 12 bytes, so one call returns
+  at most 87,381 definitions. The name linkage of a set is read with the
+  default limits of the reader. The largest tag set seen holds 1,256
+  definition bytes and 30 definitions, the largest total in one file is 4,652
+  bytes, and the longest tag value is 189 bytes; these three figures are from
+  the confidential real-world files (the tag set of the public file holds 80
+  bytes).
+
+What each part rests on:
+
+- The public file and the real-world files together: the tag ID, the value
+  type, the value length and position, text values, both linkages, the first
+  pair as the origin of the host, and the tag-set layout with text
+  definitions.
+- The public file alone: integer values, integer definitions and their
+  defaults, and a text node as host.
+- The real-world files alone: bytes above `0x7f` and the code page word, the
+  bytes after the value, empty text values, empty prompts, tags inside
+  shared-cell definitions, tags without a host, a shared-cell instance as
+  host, and the origin as the sum of the two pairs inside the stored range.
+- Constructed test bytes alone: negative integers, the corners of the range,
+  the limits, and every refusal listed above.
+
+A reviewer can reproduce the first two groups from the public file. The
+parts that rest on the real-world files alone cannot be reproduced without
+those files, which are confidential. They are listed in
+"Rules that rest on confidential files" below, with the counts and
+the constructed test for each, so that each can be taken out, and its form
+left raw, if that is preferred.
+
+Tag sets are decoded on request and not when a document is read. A tag is not
+part of the feature view. The reader does not join a tag to its definition or
+to its host, and it does not draw a tag. Value type 5, the two skipped words
+of a definition, the word at `0x30` of a tag set, the writer-specific words of
+a tag, and tags stored as 3D are unresolved. The tag tests use constructed
+bytes; the public file is read by an optional test when it is present, and
+the real-world files are not included in the regression fixtures.
+
+## Rules that rest on confidential files
+
+Some rules above have no public evidence. Their evidence is a set of 90
+real-world production files, 85 2D files and five 3D files, that are highly
+confidential. They cannot be shared. No byte, name or text of them is in this
+repository, and a reviewer cannot reproduce the counts below.
+
+Each rule was found in the same way as the rules with public evidence: the
+bytes of lawfully held files were read, a rule was stated, and it was counted
+where the rule holds and where it does not. Most rules were also checked
+against something that the reader already decodes in the same file. Five
+rows have no such check, and they say so: three are checks of structure
+alone, and two rest on a code page number alone. The table gives the check,
+the counts, and the constructed test that covers the rule. The tests use
+made-up bytes only. Each rule can be taken out, and its form left raw, if
+that is preferred.
+
+| Rule | How it was found | Counts | Constructed test |
+| --- | --- | --- | --- |
+| Item data: the `fb` string form holds UTF-16LE units | Read as UTF-16LE, the string equals the text of a text element in the same file | 11 strings in 11 of 140 instances; each holds a character above U+00FF; 11 of 11 equal a text element | `one_byte_strings_are_code_points_and_wide_strings_are_utf16` |
+| Item data: a byte `0x80` or above in the `fa` form is one code point | Read as one code point per byte, the string equals the text of a text element in the same file; the writer uses the `fb` form for a character that a Windows-1252 byte could hold | 36 strings in 36 of 140 instances (`81` in 19, `bd` in 16, `be` in 1); 36 of 36 equal a text element | the same test |
+| Auxiliary entries: bit 31 of the length word is a flag and not part of the length | A check of structure only, not against other decoded data: with the bit masked off the lengths split every record with no byte left over, and every item entry decodes; with the bit kept each length is longer than its record. What the flag means is not known | set in 1,024 of 1,024 entries of 783 records; all 140 item entries among them decode | `splits_entries_and_keeps_every_header_word` |
+| 3D text: the four values are a quaternion with the scalar first | Only the first and the last value are ever not zero, which is a turn about Z when the scalar is first; the turn was compared with the end of the stored range at which the stored origin lies | 1,875 of 1,875 are unit quaternions; 1,713 not turned, 157 quarter turns, 5 half turns; 149 of the 149 turned texts of three or more characters have the origin at the end that the row rule gives, and 144 of them tell the rule from its transpose | `a_3d_text_exposes_its_stored_quaternion`: the values come back in stored order; the reader computes nothing from them |
+| Shared-cell instance: the nine matrix values are stored by rows | `origin + M * p` over the vertices of the matched definition was compared with the range that the instance stores, by rows and by columns | 2,376 instances checked; 2,319 matrices cannot tell the order (2,311 fit, 8 do not); of the 57 that can, 47 fit by rows, 0 by columns and 10 neither way | `an_instance_places_a_definition_point_with_its_matrix_by_rows` |
+| Shared-cell definitions: an instance repeats the six range values of its definition, and definitions can share a name | The six values of each instance were compared with those of every definition of that name in the file | 2,874 of 2,953 instances match one definition (one matches two equal ones); 79 name no definition of their file; the checked-in fixture shows one matching pair | `shared_cell_definitions_hold_their_components_in_their_own_space` |
+| Tags: a text byte above `0x7f` is Windows-1252 when the word at `0x13c` is 1252 | The word was read in every tag, and 1252 is the number of that code page. The bytes seen do not test the rule: from `0xa0` to `0xff`, Windows-1252, Latin-1 and one code point for each byte give the same character. No byte from `0x80` to `0x9f`, where they differ, was seen | 1,194 of 1,194 text tags store 1252; 18 values hold such a byte, all from `0xa0` to `0xff` | `decodes_tag_values_of_the_two_observed_types` |
+| Tags: bytes can follow the value, and a text value can be empty | A check of structure only, not against other decoded data: the value length at `0x138` was compared with the primary size in every tag | 10 or 11 bytes follow the value in every text tag of that writer; 674 of 1,194 text values are empty | the same test |
+| Tag sets: a string byte above `0x7f` is Windows-1252 | A choice, not a finding. A tag set holds no code page number; Windows-1252 is taken because the tags of the same files store 1252. The bytes seen do not test it: from `0xa0` to `0xff`, Windows-1252, Latin-1 and one code point for each byte give the same character, and no byte from `0x80` to `0x9f` was seen | 92 strings in 89 decoded sets hold such a byte, all from `0xa0` to `0xff`; the public tag set holds none | `decodes_the_definitions_of_a_tag_set` |
+| Tag sets: a prompt can be empty | A check of structure only, not against other decoded data: the definitions of every tag set were decoded to the declared length | 55 of 671 definitions | `decodes_the_definitions_of_a_tag_set` |
+| Tags: a tag can be a component of a shared-cell definition, can have no host, and can have a shared-cell instance as host | The host linkage of every tag was looked up among the elements of its model | 526 tags in definitions; 1,012 text tags without a host; 182 with a shared-cell instance as host, found in the same model | `tags_are_read_with_their_value_their_set_and_their_host` |
+| Tags: the origin is the sum of the pairs at `0xa0` and `0xb8` | The sum was compared with the stored range of the tag | inside the range in 1,204 of 1,204 tags; for the 182 tags with a host the first pair alone is outside it | `the_placement_is_the_sum_of_the_two_stored_pairs`, `a_tag_origin_is_given_only_inside_the_stored_range` |
+
 ## Deliberately unresolved semantics
 
-The parser does not infer product-specific XAttributes, custom schemas, Item
-Types, full dimensions, or complete B-spline/surface definitions from names or
-isolated byte patterns. Those bytes remain accessible through raw objects,
-linkages, and auxiliary records. New semantic mappings require another
-controlled observation and a malformed-input regression before this ledger is
-expanded.
+The parser does not infer other product-specific XAttributes, custom schemas,
+typed Item Type values, full dimensions, or complete B-spline/surface
+definitions from names or isolated byte patterns. Those bytes remain
+accessible through raw objects, linkages, and auxiliary records. New semantic
+mappings require another controlled observation and a malformed-input
+regression before this ledger is expanded.

@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
 
 use ezdgn_core::{
-    read_v8, read_v8_stream, read_v8_streams, scan_v8_objects, DgnError, V8Dimension,
-    V8ElementData, V8ObjectRole, V8ReadOptions, V8ScanOptions,
+    decode_v8_item_instance, read_v8, read_v8_stream, read_v8_streams, scan_v8_objects, DgnError,
+    V8Dimension, V8ElementData, V8ObjectRole, V8Point3, V8ReadOptions, V8ScanOptions, V8TagValue,
 };
 use sha2::{Digest, Sha256};
 
 const V8: &[u8] = include_bytes!("../../../tests/data/dgn/v8/test_dgnv8.dgn");
+/// Written by the test builder of this repository from made-up values.
+const CONSTRUCTED_TAGS: &[u8] = include_bytes!("../../../tests/data/dgn/v8/constructed_tags.dgn");
 
 const STREAMS: &[(&str, usize, &str)] = &[
     (
@@ -157,9 +159,160 @@ fn scans_real_model_index_graphics_names_and_auxiliary_records() {
     assert_eq!(raw.named_pages[0].objects.len(), 25);
     assert_eq!(raw.named_auxiliary_pages.len(), 1);
     assert_eq!(raw.named_auxiliary_pages[0].records.len(), 1);
+    // The one auxiliary record of the fixture holds one entry: an 8-byte
+    // prefix (3, inflated size 192) and a zlib stream. The entry count is
+    // the header word exposed as `flags`.
+    let record = &raw.named_auxiliary_pages[0].records[0];
+    assert_eq!(
+        (record.kind, record.flags, record.payload().len()),
+        (170, 1, 122)
+    );
+    let entries = record.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!((entry.index, entry.offset), (0, 0));
+    assert_eq!(
+        (entry.type_id, entry.type_major(), entry.type_minor()),
+        (0x5709_0000, 0x5709, 0)
+    );
+    assert_eq!(
+        (entry.entry_id, entry.size_word, entry.reserved),
+        (0, 102, 0)
+    );
+    assert!(!entry.size_flag());
+    assert_eq!(entry.data().len(), 102);
+    assert_eq!(entry.data()[..10], [3, 0, 0, 0, 0xc0, 0, 0, 0, 0x78, 0x9c]);
+    assert_eq!(record.payload()[118..], [1, 0, 0, 0]);
+    assert!(decode_v8_item_instance(entry).is_none());
     assert_eq!(raw.graphical_object_count(), 58);
     assert_eq!(raw.total_object_count(), 83);
     assert_eq!(raw.total_inflated_bytes, 31_942);
+}
+
+#[test]
+fn the_fixture_shared_cell_instance_finds_and_places_its_definition() {
+    let document = read_v8(V8, V8ScanOptions::default()).unwrap();
+    let definitions = document
+        .shared_cell_definitions(0, V8ScanOptions::default())
+        .unwrap();
+    assert_eq!(definitions.len(), 1);
+    let definition = &definitions[0];
+    assert_eq!(definition.name, "Named definition");
+    assert_eq!(
+        definition
+            .elements
+            .iter()
+            .map(|element| (element.kind(), element.parent_index))
+            .collect::<Vec<_>>(),
+        [("SHARED_CELL_DEFINITION", None), ("ELLIPSE", Some(0))]
+    );
+    // a circle of radius 1 UOR at the definition origin
+    let V8ElementData::Ellipse {
+        center,
+        primary_axis_uor,
+        secondary_axis_uor,
+        primary_axis_master,
+        ..
+    } = &definition.elements[1].data
+    else {
+        panic!("expected an ellipse");
+    };
+    assert_eq!((center.uor.x, center.uor.y, center.uor.z), (0.0, 0.0, 0.0));
+    assert_eq!((*primary_axis_uor, *secondary_axis_uor), (1.0, 1.0));
+    assert_eq!(*primary_axis_master, 0.0001);
+
+    let instances = document.models[0]
+        .elements
+        .iter()
+        .filter(|element| element.kind() == "SHARED_CELL_INSTANCE")
+        .collect::<Vec<_>>();
+    assert_eq!(instances.len(), 1);
+    let instance = instances[0];
+    assert!(definition.matches(&instance.data));
+    let V8ElementData::SharedCellInstance { transform, .. } = &instance.data else {
+        unreachable!();
+    };
+    // The instance scales by 10,000. origin + M * p, applied to the two
+    // corners of the circle's box, gives the range the instance stores.
+    // This matrix is diagonal, so it does not show the order of the nine
+    // values; a constructed test covers that.
+    assert_eq!(
+        transform[6..],
+        [1e4, 0.0, 0.0, 0.0, 1e4, 0.0, 0.0, 0.0, 1e4]
+    );
+    let place = |x: f64, y: f64| {
+        let point = instance
+            .data
+            .place_definition_point(V8Point3::new(x, y, 0.0))
+            .unwrap();
+        (point.x, point.y)
+    };
+    let range = instance.common.range_uor;
+    assert_eq!(place(-1.0, -1.0), (-1e4, 0.0));
+    assert_eq!(place(1.0, 1.0), (1e4, 2e4));
+    assert_eq!(
+        place(-1.0, -1.0),
+        (range.low[0] as f64, range.low[1] as f64)
+    );
+    assert_eq!(
+        place(1.0, 1.0),
+        (range.high[0] as f64, range.high[1] as f64)
+    );
+    assert_eq!(
+        document
+            .shared_cell_definitions(1, V8ScanOptions::default())
+            .unwrap_err(),
+        DgnError::V8ModelIndexOutOfRange { index: 1, count: 1 }
+    );
+}
+
+#[test]
+fn the_fixture_holds_no_tag_set_and_its_one_3d_type_37_object_stays_unknown() {
+    let document = read_v8(V8, V8ScanOptions::default()).unwrap();
+    assert!(document.tag_sets().is_empty());
+    assert_eq!(document.raw.tag_set_objects().count(), 0);
+    let objects = document.models[0]
+        .elements
+        .iter()
+        .filter(|element| element.raw.element_type == 37)
+        .collect::<Vec<_>>();
+    assert_eq!(objects.len(), 1);
+    // Tag elements are read in 2D only. This object is stored as 3D, names
+    // no tag set and no host, and holds tag ID 0.
+    let object = objects[0];
+    assert_eq!(object.common.stored_dimension, V8Dimension::Three);
+    assert_eq!((object.kind(), object.linkages.len()), ("UNKNOWN", 0));
+    assert_eq!(object.raw.primary_bytes()[0xd0..0xd4], [0, 0, 3, 0]);
+}
+
+#[test]
+fn stored_3d_texts_ellipses_and_arcs_expose_a_quaternion() {
+    let document = read_v8(V8, V8ScanOptions::default()).unwrap();
+    let mut texts = Vec::new();
+    let mut curves = 0;
+    for element in &document.models[0].elements {
+        let stored_3d = element.common.stored_dimension == V8Dimension::Three;
+        match &element.data {
+            V8ElementData::Text { orientation, .. } => {
+                assert_eq!(element.data.quaternion().is_some(), stored_3d);
+                if stored_3d {
+                    assert_eq!(orientation.len(), 6);
+                    texts.push(element.data.quaternion().unwrap());
+                }
+            }
+            V8ElementData::Ellipse { orientation, .. } | V8ElementData::Arc { orientation, .. } => {
+                assert_eq!(element.data.quaternion().is_some(), stored_3d);
+                if stored_3d {
+                    curves += 1;
+                    assert_eq!(element.data.quaternion().unwrap()[..], orientation[..]);
+                }
+            }
+            _ => assert_eq!(element.data.quaternion(), None),
+        }
+    }
+    // the fixture's two 3D texts are not turned: the scalar part comes first
+    assert_eq!(texts, [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]);
+    assert!(curves > 0);
 }
 
 #[test]
@@ -297,4 +450,45 @@ fn enforces_v8_semantic_resource_limits() {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[test]
+fn the_constructed_tag_file_holds_the_tags_its_builder_wrote() {
+    let document = read_v8(CONSTRUCTED_TAGS, V8ScanOptions::default()).unwrap();
+    let elements = &document.models[0].elements;
+    assert_eq!(
+        elements
+            .iter()
+            .map(|element| element.kind())
+            .collect::<Vec<_>>(),
+        [
+            "SHARED_CELL_INSTANCE",
+            "TAG",
+            "TAG",
+            "TAG",
+            "UNKNOWN",
+            "UNKNOWN_COMPLEX",
+            "UNKNOWN"
+        ]
+    );
+    let V8ElementData::Tag {
+        tag_id,
+        value,
+        tag_set_element_id,
+        host_element_id,
+        origin,
+        ..
+    } = &elements[1].data
+    else {
+        panic!("expected a tag");
+    };
+    assert_eq!(*tag_id, 1);
+    assert_eq!(*value, Some(V8TagValue::Text("Oak".to_owned())));
+    assert_eq!(*host_element_id, Some(elements[0].common.element_id));
+    let origin = origin.as_ref().unwrap();
+    assert_eq!((origin.uor.x, origin.uor.y), (960.0, -100.0));
+    let sets = document.tag_sets();
+    assert_eq!(sets.len(), 1);
+    assert_eq!(Some(sets[0].element_id), *tag_set_element_id);
+    assert_eq!(sets[0].definition(1).unwrap().name, "Variety");
 }

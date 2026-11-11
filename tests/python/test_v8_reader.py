@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -227,3 +228,109 @@ def test_mesh_cli_payload_preserves_faces_and_coordinates(mesh_document: ezdgn.V
         {"point_indices": [0, 1, 2], "visible_edges": [True, True, False]},
         {"point_indices": [0, 3, 1], "visible_edges": [True, True, True]},
     ]
+
+
+def test_stored_3d_elements_expose_their_quaternion() -> None:
+    document = ezdgn.read_v8(V8)
+    texts = []
+    curves = 0
+    for element in document.models[0].elements:
+        data = element.data
+        stored_3d = element.common.stored_dimension == 3
+        if element.kind == "TEXT":
+            assert (data.quaternion is not None) == stored_3d
+            if stored_3d:
+                assert data.quaternion == data.orientation[2:]
+                texts.append(data.quaternion)
+        elif element.kind in {"ELLIPSE", "ARC"}:
+            assert (data.quaternion is not None) == stored_3d
+            if stored_3d:
+                curves += 1
+                assert data.quaternion == data.orientation
+        else:
+            assert data.quaternion is None
+    # the fixture's two 3D texts are not turned: the scalar part comes first
+    assert texts == [(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)]
+    assert curves > 0
+
+
+def test_shared_cell_definitions_are_read_on_request() -> None:
+    document = ezdgn.read_v8(V8)
+    (definition,) = ezdgn.read_v8_shared_cell_definitions(V8)
+    assert definition.name == "Named definition"
+    assert [
+        (item.index, item.kind, item.parent_index, item.child_indices)
+        for item in definition.elements
+    ] == [(0, "SHARED_CELL_DEFINITION", None, (1,)), (1, "ELLIPSE", 0, ())]
+    header = definition.header
+    assert header is not None and not header.is_drawable
+    assert header.data.child_count == 1
+    assert definition.range_values == header.data.transform[:6]
+    assert [round(value) for value in definition.range_values or ()] == [-1, -1, 0, 1, 1, 0]
+    # definition space: a circle of radius 1 UOR at the origin, no global origin
+    circle = definition.elements[1].data
+    assert circle.center == ezdgn.V8Point(uor=(0.0, 0.0, 0.0), master=(0.0, 0.0, 0.0))
+    assert (circle.primary_axis_uor, circle.primary_axis_master) == (1.0, 0.0001)
+
+    (instance,) = [
+        item for item in document.models[0].elements if item.kind == "SHARED_CELL_INSTANCE"
+    ]
+    assert definition.matches(instance)
+    assert not definition.matches(definition.elements[1])
+
+    # The name alone is not a match: the six range values must be equal too,
+    # bit for bit. The nine matrix values are not part of the match.
+    def changed(**fields: object) -> ezdgn.V8Element:
+        return dataclasses.replace(
+            instance, data=dataclasses.replace(instance.data, **fields)
+        )
+
+    values = instance.data.transform
+    assert values[2] == 0.0 and values[3] == 1.0
+    other_range = changed(transform=(*values[:3], 2.0, *values[4:]))
+    assert other_range.data.name == definition.name
+    assert not definition.matches(other_range)
+    other_zero = changed(transform=(*values[:2], -0.0, *values[3:]))
+    assert other_zero.data.transform == values
+    assert not definition.matches(other_zero)
+    assert definition.matches(changed(transform=(*values[:6], *([7.0] * 9))))
+    assert not definition.matches(changed(name=None))
+    assert not definition.matches(changed(name="Other definition"))
+    assert not definition.matches(changed(transform=values[:14]))
+    # origin + M * p for the corners of the circle's box is the stored range
+    matrix = instance.data.transform[6:]
+    assert matrix == (1e4, 0.0, 0.0, 0.0, 1e4, 0.0, 0.0, 0.0, 1e4)
+    low, high = instance.common.range_uor
+    assert instance.data.place_definition_point((-1.0, -1.0, 0.0)) == (-1e4, 0.0, 2e4)
+    assert instance.data.place_definition_point((1.0, 1.0, 0.0)) == (1e4, 2e4, 2e4)
+    assert instance.data.place_definition_point((-1.0, -1.0, 0.0))[:2] == low[:2]
+    assert instance.data.place_definition_point((1.0, 1.0, 0.0))[:2] == high[:2]
+    # The fixture's matrix is diagonal and does not show the order of the
+    # nine values. With nine different values each result is one row of the
+    # matrix times the point; by columns x would be 10 + 1 + 40 + 700.
+    turned = changed(
+        transform=(*values[:6], 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0),
+        origin=ezdgn.V8Point(uor=(10.0, 20.0, 30.0), master=(0.0, 0.0, 0.0)),
+    )
+    assert turned.data.place_definition_point((1.0, 10.0, 100.0)) == (
+        331.0,
+        674.0,
+        1017.0,
+    )
+    assert definition.elements[1].data.place_definition_point((1.0, 1.0, 1.0)) is None
+    assert changed(transform=values[:14]).data.place_definition_point((1.0, 1.0, 1.0)) is None
+    # the document itself is unchanged: no definition among its elements
+    assert all(
+        item.kind != "SHARED_CELL_DEFINITION"
+        for model in document.models
+        for item in model.elements
+    )
+
+    # a wrong model index is a wrong argument in both directions, and it is
+    # not an error of the ezdgn family: the file is not at fault
+    for wrong in (1, -1):
+        with pytest.raises(ValueError) as caught:
+            ezdgn.read_v8_shared_cell_definitions(V8, model_index=wrong)
+        assert not isinstance(caught.value, ezdgn.DgnError)
+    with pytest.raises(ezdgn.UnsupportedDgnError):
+        ezdgn.read_v8_shared_cell_definitions(V7)

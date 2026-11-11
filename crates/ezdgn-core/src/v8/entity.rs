@@ -3,13 +3,17 @@ use std::sync::Arc;
 
 use crate::DgnError;
 
+use super::item::{decode_v8_item_instances, V8ItemInstance, V8ItemInstances};
 use super::linkage::{decode_v8_linkages, decode_windows_1252, V8Linkage};
 use super::metadata::{
     decode_model_metadata, read_f64, read_i64, V8Dimension, V8ModelMetadata, V8Point3, V8Range3,
     V8Range3I64,
 };
 use super::raw::{read_u16, read_u32, read_u64};
-use super::{scan_v8_objects, V8AuxiliaryRecord, V8RawDocument, V8RawObject, V8ScanOptions};
+use super::tag::{decode_tag_fields, decode_v8_tag_sets, V8TagSet, V8TagValue};
+use super::{
+    scan_v8_objects, V8AuxiliaryRecord, V8ObjectRole, V8RawDocument, V8RawObject, V8ScanOptions,
+};
 
 const COMMON_HEADER_BYTES: usize = 0x68;
 /// Identification prefix (type/flags, attribute offset, size, level, element
@@ -19,6 +23,12 @@ const COMPONENT_PREFIX_BYTES: usize = 0x20;
 const ELEMENT_3D_FLAG: u32 = 0x0000_0800;
 /// A shared-cell instance stores a three-component origin even when its 3D flag is clear.
 const SHARED_CELL_ORIGIN_BYTES: usize = 24;
+const SHARED_CELL_DEFINITION_TYPE: u16 = 34;
+const SHARED_CELL_DEFINITION_BYTES: usize = 0x100;
+const SHARED_CELL_VALUES_OFFSET: usize = 0x70;
+const SHARED_CELL_VALUE_COUNT: usize = 15;
+const SHARED_CELL_RANGE_VALUES: usize = 6;
+const TAG_ELEMENT_TYPE: u16 = 37;
 const TEXT_MULTIPLIER_TO_UOR: f64 = 6.0 / 1000.0;
 
 /// Display and identity fields shared by standard V8 graphical objects.
@@ -167,6 +177,14 @@ pub enum V8ElementData {
         origin: V8Point,
         transform: Vec<f64>,
     },
+    /// Header of a shared-cell definition. `transform` holds the same
+    /// fifteen values as an instance: the six range values of the definition
+    /// (low XYZ, high XYZ) and a 3x3 matrix by rows.
+    SharedCellDefinition {
+        child_count: usize,
+        name: Option<String>,
+        transform: Vec<f64>,
+    },
     BSplineCurve {
         child_count: usize,
         properties_raw: u32,
@@ -177,6 +195,21 @@ pub enum V8ElementData {
     },
     Dimension {
         anchor: Option<V8Point>,
+    },
+    /// A tag: one value of a tag set, attached to a host element or free.
+    ///
+    /// `value` is decoded for text and integer values only; `value_bytes`
+    /// always holds the stored bytes. `tag_set_element_id` names the tag set
+    /// and `tag_id` the definition in it. `origin` is the stored placement
+    /// point, given only when it lies inside the element's own range.
+    Tag {
+        tag_id: u16,
+        value_type: u16,
+        value_bytes: Arc<[u8]>,
+        value: Option<V8TagValue>,
+        tag_set_element_id: Option<u64>,
+        host_element_id: Option<u64>,
+        origin: Option<V8Point>,
     },
     Mesh {
         child_count: usize,
@@ -217,9 +250,11 @@ impl V8ElementData {
             Self::ComplexShape { .. } => "COMPLEX_SHAPE",
             Self::Cell { .. } => "CELL",
             Self::SharedCellInstance { .. } => "SHARED_CELL_INSTANCE",
+            Self::SharedCellDefinition { .. } => "SHARED_CELL_DEFINITION",
             Self::BSplineCurve { .. } => "BSPLINE_CURVE",
             Self::BSplinePole { .. } => "BSPLINE_POLE",
             Self::Dimension { .. } => "DIMENSION",
+            Self::Tag { .. } => "TAG",
             Self::Mesh { .. } => "MESH",
             Self::MatrixHeader { .. } => "MATRIX_HEADER",
             Self::MatrixIntegerData { .. } => "MATRIX_INTEGER_DATA",
@@ -236,6 +271,7 @@ impl V8ElementData {
             | Self::ComplexChain { child_count }
             | Self::ComplexShape { child_count }
             | Self::Cell { child_count, .. }
+            | Self::SharedCellDefinition { child_count, .. }
             | Self::BSplineCurve { child_count, .. }
             | Self::Mesh { child_count, .. }
             | Self::MatrixHeader { child_count, .. }
@@ -250,12 +286,68 @@ impl V8ElementData {
             self,
             Self::Unknown
                 | Self::UnknownComplex { .. }
+                | Self::SharedCellDefinition { .. }
+                | Self::Tag { .. }
                 | Self::BSplinePole { .. }
                 | Self::TextNode { .. }
                 | Self::MatrixHeader { .. }
                 | Self::MatrixIntegerData { .. }
                 | Self::MatrixDoubleData { .. }
         )
+    }
+}
+
+impl V8ElementData {
+    /// The stored orientation quaternion `(w, x, y, z)` of a 3D text,
+    /// ellipse or arc, exactly as stored.
+    ///
+    /// A 3D ellipse or arc stores the four values alone. A 3D text stores
+    /// two other values first, so the quaternion is the last four of its six
+    /// `orientation` values. A 2D element has a rotation angle and no
+    /// quaternion.
+    #[must_use]
+    pub fn quaternion(&self) -> Option<[f64; 4]> {
+        let values = match self {
+            Self::Text { orientation, .. } if orientation.len() == 6 => &orientation[2..],
+            Self::Ellipse { orientation, .. } | Self::Arc { orientation, .. }
+                if orientation.len() == 4 =>
+            {
+                &orientation[..]
+            }
+            _ => return None,
+        };
+        <[f64; 4]>::try_from(values).ok()
+    }
+
+    /// Place a point of a shared-cell definition with this instance.
+    ///
+    /// `point` is in the definition's own space, in UOR. The result is
+    /// `origin + M * point` in the UOR of the model, where `M` is the 3x3
+    /// matrix that the last nine `transform` values hold by rows. Returns
+    /// `None` for another element kind and for an instance that does not
+    /// hold fifteen values.
+    #[must_use]
+    pub fn place_definition_point(&self, point: V8Point3) -> Option<V8Point3> {
+        let Self::SharedCellInstance {
+            origin, transform, ..
+        } = self
+        else {
+            return None;
+        };
+        if transform.len() != SHARED_CELL_VALUE_COUNT {
+            return None;
+        }
+        let matrix = &transform[SHARED_CELL_RANGE_VALUES..];
+        let row = |row: usize| {
+            matrix[3 * row] * point.x
+                + matrix[3 * row + 1] * point.y
+                + matrix[3 * row + 2] * point.z
+        };
+        Some(V8Point3::new(
+            origin.uor.x + row(0),
+            origin.uor.y + row(1),
+            origin.uor.z + row(2),
+        ))
     }
 }
 
@@ -281,6 +373,31 @@ impl V8Element {
     #[must_use]
     pub fn is_top_level(&self) -> bool {
         self.parent_index.is_none()
+    }
+
+    /// Item instances decoded from the auxiliary records, in stored order.
+    ///
+    /// They are decoded on each call and are not stored with the element. An
+    /// entry that does not match the observed layout is not listed and stays
+    /// available through `auxiliary_records`. One call returns at most
+    /// [`V8_MAX_ITEM_BYTES`](super::V8_MAX_ITEM_BYTES) stored bytes as
+    /// instances; use [`Self::decode_item_instances`] to learn whether that
+    /// limit left an entry out.
+    #[must_use]
+    pub fn item_instances(&self) -> Vec<V8ItemInstance> {
+        self.decode_item_instances().instances
+    }
+
+    /// The item instances of [`Self::item_instances`] together with the
+    /// number of item entries that the size limit of one call left raw.
+    #[must_use]
+    pub fn decode_item_instances(&self) -> V8ItemInstances {
+        decode_v8_item_instances(
+            self.auxiliary_records
+                .iter()
+                .filter_map(V8AuxiliaryRecord::entries)
+                .flatten(),
+        )
     }
 }
 
@@ -334,6 +451,202 @@ pub struct V8Document {
     pub models: Vec<V8Model>,
 }
 
+/// One shared-cell definition from the named object pages.
+///
+/// Its coordinates are in the definition's own space. The master values use
+/// the scale of the model the definitions were decoded for, with no global
+/// origin. A shared-cell instance places a definition point `p` at
+/// `origin + M * p`, where `M` is the 3x3 matrix by rows in the last nine of
+/// the instance's fifteen `transform` values.
+#[derive(Debug, Clone)]
+pub struct V8SharedCellDefinition {
+    /// Name from the definition's name linkage; empty when it has none.
+    pub name: String,
+    /// The definition header, then its components. `index`, `parent_index`
+    /// and `child_indices` are positions in this list.
+    pub elements: Vec<V8Element>,
+}
+
+impl V8SharedCellDefinition {
+    /// The definition header element.
+    #[must_use]
+    pub fn header(&self) -> Option<&V8Element> {
+        self.elements.first()
+    }
+
+    /// The six range values the header stores: low XYZ, then high XYZ.
+    #[must_use]
+    pub fn range_values(&self) -> Option<&[f64]> {
+        match &self.header()?.data {
+            V8ElementData::SharedCellDefinition { transform, .. } => {
+                transform.get(..SHARED_CELL_RANGE_VALUES)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a shared-cell instance refers to this definition.
+    ///
+    /// An instance repeats the name and the six range values of its
+    /// definition. Both must be equal: one file can hold several definitions
+    /// with one name. The values are compared bit for bit, so `-0.0` does
+    /// not match `0.0`.
+    #[must_use]
+    pub fn matches(&self, instance: &V8ElementData) -> bool {
+        let V8ElementData::SharedCellInstance {
+            name: Some(name),
+            transform,
+            ..
+        } = instance
+        else {
+            return false;
+        };
+        *name == self.name
+            && transform.len() == SHARED_CELL_VALUE_COUNT
+            && self.range_values().is_some_and(|range| {
+                range
+                    .iter()
+                    .zip(transform)
+                    .all(|(stored, repeated)| stored.to_bits() == repeated.to_bits())
+            })
+    }
+}
+
+/// Decode the shared-cell definitions of a scanned document.
+///
+/// A definition is a type-34 header in the named object pages followed by
+/// its components. `metadata` supplies the unit scale for the master values.
+/// A run that does not decode as a definition is skipped and stays raw;
+/// resource-limit errors are returned. Components that follow after the
+/// declared child counts are used up belong to no header: they are not part
+/// of the definition and stay raw. No count of them is given.
+pub fn decode_v8_shared_cell_definitions(
+    raw: &V8RawDocument,
+    metadata: &V8ModelMetadata,
+    options: V8ScanOptions,
+) -> Result<Vec<V8SharedCellDefinition>, DgnError> {
+    let mut local = metadata.clone();
+    local.global_origin_uor = V8Point3::new(0.0, 0.0, 0.0);
+    let mut auxiliary = HashMap::<u64, Vec<V8AuxiliaryRecord>>::new();
+    for record in raw
+        .named_auxiliary_pages
+        .iter()
+        .flat_map(|page| page.records.iter())
+    {
+        auxiliary
+            .entry(record.element_id)
+            .or_default()
+            .push(record.clone());
+    }
+    let objects = raw
+        .named_pages
+        .iter()
+        .flat_map(|page| page.objects.iter())
+        .collect::<Vec<_>>();
+    let mut definitions = Vec::new();
+    let mut start = 0usize;
+    while start < objects.len() {
+        let header = objects[start];
+        if header.element_type != SHARED_CELL_DEFINITION_TYPE || header.role != V8ObjectRole::Header
+        {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < objects.len() && objects[end].role.is_component() {
+            end += 1;
+        }
+        let run = objects[start..end].iter().copied();
+        match decode_objects(
+            run,
+            end - start,
+            &local,
+            options,
+            &mut auxiliary,
+            ObjectPages::Named,
+        ) {
+            Ok(mut elements) => {
+                // Once every declared child is placed, a further component
+                // has no parent. It and what follows are not components of
+                // this definition.
+                let members = elements
+                    .iter()
+                    .skip(1)
+                    .position(|element| element.parent_index.is_none())
+                    .map_or(elements.len(), |orphan| orphan + 1);
+                elements.truncate(members);
+                if let Some(V8ElementData::SharedCellDefinition { name, .. }) =
+                    elements.first().map(|element| &element.data)
+                {
+                    definitions.push(V8SharedCellDefinition {
+                        name: name.clone().unwrap_or_default(),
+                        elements,
+                    });
+                }
+            }
+            Err(DgnError::InvalidV8Geometry { .. } | DgnError::InvalidV8Hierarchy { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        start = end;
+    }
+    Ok(definitions)
+}
+
+/// Scan a V8 file and decode its shared-cell definitions with the unit scale
+/// of the model at `model_index`. An index that is not a model of the
+/// document is [`DgnError::V8ModelIndexOutOfRange`].
+pub fn read_v8_shared_cell_definitions(
+    input: &[u8],
+    options: V8ScanOptions,
+    model_index: usize,
+) -> Result<Vec<V8SharedCellDefinition>, DgnError> {
+    let raw = scan_v8_objects(input, options)?;
+    let model = raw
+        .models
+        .get(model_index)
+        .ok_or_else(|| missing_model(model_index, raw.models.len()))?;
+    let metadata = decode_model_metadata(model, options)?;
+    decode_v8_shared_cell_definitions(&raw, &metadata, options)
+}
+
+/// A wrong index is the caller's error. A document without any model has no
+/// right index: that is a property of the file.
+fn missing_model(index: usize, count: usize) -> DgnError {
+    if count == 0 {
+        return DgnError::InvalidV8ModelIndex {
+            offset: 0,
+            context: "the document has no model".to_owned(),
+        };
+    }
+    DgnError::V8ModelIndexOutOfRange { index, count }
+}
+
+impl V8Document {
+    /// The shared-cell definitions of the document, decoded on each call
+    /// with the unit scale of the model at `model_index`. An index that is
+    /// not a model of the document is [`DgnError::V8ModelIndexOutOfRange`].
+    /// Each call builds a new result: a caller that keeps the result of one
+    /// call for each model holds the definitions once for each model.
+    pub fn shared_cell_definitions(
+        &self,
+        model_index: usize,
+        options: V8ScanOptions,
+    ) -> Result<Vec<V8SharedCellDefinition>, DgnError> {
+        let model = self
+            .models
+            .get(model_index)
+            .ok_or_else(|| missing_model(model_index, self.models.len()))?;
+        decode_v8_shared_cell_definitions(&self.raw, &model.metadata, options)
+    }
+
+    /// The tag sets of the document, decoded on each call. A tag set that
+    /// does not match the observed layout is not listed and stays raw.
+    #[must_use]
+    pub fn tag_sets(&self) -> Vec<V8TagSet> {
+        decode_v8_tag_sets(&self.raw)
+    }
+}
+
 /// Scan and semantically decode supported V8 models and graphical elements.
 pub fn read_v8(input: &[u8], options: V8ScanOptions) -> Result<V8Document, DgnError> {
     let raw = scan_v8_objects(input, options)?;
@@ -363,15 +676,44 @@ fn decode_model_elements(
             .push(record.clone());
     }
 
-    let mut elements = Vec::with_capacity(model.graphical_objects().count());
-    for raw in model.graphical_objects() {
+    decode_objects(
+        model.graphical_objects(),
+        model.graphical_objects().count(),
+        metadata,
+        options,
+        &mut auxiliary,
+        ObjectPages::Graphical,
+    )
+}
+
+/// The pages a run of objects comes from. A shared-cell definition header
+/// is read as one only in the named pages; in the graphical pages of a model
+/// a type-34 header stays the unknown complex element it always was.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectPages {
+    Graphical,
+    Named,
+}
+
+/// Decode a run of raw objects into elements with their hierarchy. Records
+/// of `auxiliary` move to the element with the same element ID.
+fn decode_objects<'a>(
+    objects: impl Iterator<Item = &'a V8RawObject>,
+    count: usize,
+    metadata: &V8ModelMetadata,
+    options: V8ScanOptions,
+    auxiliary: &mut HashMap<u64, Vec<V8AuxiliaryRecord>>,
+    pages: ObjectPages,
+) -> Result<Vec<V8Element>, DgnError> {
+    let mut elements = Vec::with_capacity(count);
+    for raw in objects {
         let common = decode_common(raw, metadata)?;
         let linkages = decode_v8_linkages(
             raw.attribute_bytes(),
             options,
             &format!("element {}", common.element_id),
         )?;
-        let data = match decode_element(raw, &common, metadata, &linkages, options) {
+        let data = match decode_element(raw, &common, metadata, &linkages, options, pages) {
             Ok(data) => data,
             // Component records (B-spline knots/weights and other
             // writer-specific payloads shorter than a graphical element)
@@ -493,6 +835,7 @@ fn decode_element(
     metadata: &V8ModelMetadata,
     linkages: &[V8Linkage],
     options: V8ScanOptions,
+    pages: ObjectPages,
 ) -> Result<V8ElementData, DgnError> {
     match raw.element_type {
         2 => decode_cell(raw, common, metadata),
@@ -513,8 +856,20 @@ fn decode_element(
             .map(|vertices| V8ElementData::BSplinePole { vertices }),
         22 => decode_point_string(raw, common, metadata, options),
         27 => decode_bspline_header(raw),
+        SHARED_CELL_DEFINITION_TYPE
+            if pages == ObjectPages::Named
+                && raw.role.is_header()
+                && raw.primary_bytes().len() == SHARED_CELL_DEFINITION_BYTES =>
+        {
+            decode_shared_cell_definition(raw, linkages)
+        }
         35 => decode_shared_cell(raw, metadata, linkages),
         36 => decode_dimension(raw, common, metadata),
+        TAG_ELEMENT_TYPE
+            if !raw.role.is_header() && common.stored_dimension == V8Dimension::Two =>
+        {
+            Ok(decode_tag(raw, common, metadata, linkages, options))
+        }
         101 => decode_matrix_header(raw),
         102 => decode_matrix_values(raw, options, MATRIX_INTEGER_BYTES, |bytes, offset| {
             read_i32(bytes, offset).map(Ok)
@@ -925,12 +1280,8 @@ fn decode_shared_cell(
     let transform_bytes = origin_offset.saturating_sub(transform_start);
     let transform_count = transform_bytes / 8;
     let transform = read_f64_values(primary, transform_start, transform_count, raw)?;
-    let name = linkages
-        .iter()
-        .find(|linkage| linkage.property_id == Some(1))
-        .and_then(|linkage| linkage.property_text.clone());
     Ok(V8ElementData::SharedCellInstance {
-        name,
+        name: shared_cell_name(linkages),
         origin,
         transform,
     })
@@ -971,6 +1322,73 @@ fn decode_dimension(
         _ => None,
     };
     Ok(V8ElementData::Dimension { anchor })
+}
+
+/// A tag whose stored value does not fit the primary bytes, or is longer
+/// than the string limit, stays unknown, as it was before tags were read.
+/// This never fails: a type-37 object must not stop a file from being read.
+/// The placement point is kept only when it lies inside the stored range.
+fn decode_tag(
+    raw: &V8RawObject,
+    common: &V8CommonHeader,
+    metadata: &V8ModelMetadata,
+    linkages: &[V8Linkage],
+    options: V8ScanOptions,
+) -> V8ElementData {
+    let Some(tag) = decode_tag_fields(raw.primary_bytes(), linkages, options.max_string_bytes)
+    else {
+        return V8ElementData::Unknown;
+    };
+    let range = common.range_uor;
+    let origin = tag
+        .placement_uor
+        .filter(|point| {
+            (0..2).all(|axis| {
+                range.low[axis] as f64 <= point[axis] && point[axis] <= range.high[axis] as f64
+            })
+        })
+        .map(|point| {
+            let uor = V8Point3::new(point[0], point[1], 0.0);
+            V8Point {
+                uor,
+                master: metadata.to_master(uor),
+            }
+        });
+    V8ElementData::Tag {
+        tag_id: tag.tag_id,
+        value_type: tag.value_type,
+        value_bytes: tag.value_bytes,
+        value: tag.value,
+        tag_set_element_id: tag.tag_set_element_id,
+        host_element_id: tag.host_element_id,
+        origin,
+    }
+}
+
+fn decode_shared_cell_definition(
+    raw: &V8RawObject,
+    linkages: &[V8Linkage],
+) -> Result<V8ElementData, DgnError> {
+    let primary = raw.primary_bytes();
+    let child_count = count_at(raw, primary, COMMON_HEADER_BYTES)?;
+    let transform = read_f64_values(
+        primary,
+        SHARED_CELL_VALUES_OFFSET,
+        SHARED_CELL_VALUE_COUNT,
+        raw,
+    )?;
+    Ok(V8ElementData::SharedCellDefinition {
+        child_count,
+        name: shared_cell_name(linkages),
+        transform,
+    })
+}
+
+fn shared_cell_name(linkages: &[V8Linkage]) -> Option<String> {
+    linkages
+        .iter()
+        .find(|linkage| linkage.property_id == Some(1))
+        .and_then(|linkage| linkage.property_text.clone())
 }
 
 fn build_hierarchy(elements: &mut [V8Element], max_depth: usize) -> Result<(), DgnError> {
@@ -1394,7 +1812,17 @@ fn geometry_error(raw: &V8RawObject, context: impl Into<String>) -> DgnError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v8::raw::test_support::{dgn_with_objects, MODEL_ID};
+    use crate::v8::auxiliary::test_support::{entry, payload};
+    use crate::v8::item::test_support::{item_data, memory as item_memory, MEMORY_PER_STORED_BYTE};
+    use crate::v8::raw::test_support::{
+        auxiliary_record, dgn_with_named_pages, dgn_with_objects, dgn_with_objects_and_auxiliary,
+        dgn_with_pages, reproducible_dgn_with_pages, zlib_stored, MODEL_ID,
+    };
+    use crate::v8::tag::test_support::{
+        definition_bytes, host_linkage, tag_primary, tag_set_linkage, tag_set_primary, TagParts,
+    };
+    use crate::v8::V8_ITEM_INSTANCE_ENTRY_TYPE;
+    use crate::v8::{V8TagValue, V8_TAG_VALUE_INTEGER, V8_TAG_VALUE_TEXT};
 
     const MODEL_HEADER_TYPE: u32 = 66;
     const MODEL_HEADER_BYTES: usize = 0xe8;
@@ -1461,6 +1889,1519 @@ mod tests {
         let elements = &document.models[0].elements;
         assert_eq!(elements.len(), 1);
         elements[0].clone()
+    }
+
+    const SHARED_CELL_ELEMENT_ID: u64 = 602;
+    const ITEM_ATTRIBUTES: [(&str, &str); 2] = [
+        ("instanceId", ""),
+        ("xmlns", "Sample__x0020__Library.01.00"),
+    ];
+
+    fn read_with_auxiliary(records: &[Vec<u8>]) -> V8Document {
+        let dgn = dgn_with_objects_and_auxiliary(
+            &model_header(),
+            &[shared_cell_record(0, [1.0, 2.0, 0.0])],
+            records,
+        );
+        read_v8(&dgn, V8ScanOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn item_instances_are_decoded_from_the_auxiliary_record_of_their_element() {
+        let pump = item_data(
+            900,
+            "Pump",
+            &ITEM_ATTRIBUTES,
+            &[("Tag", "P-101"), ("Note", "")],
+        );
+        let history = item_data(
+            900,
+            "History",
+            &ITEM_ATTRIBUTES,
+            &[("Installed", "1986-01-01")],
+        );
+        let other = [3, 0, 0, 0, 9, 9];
+        let record = auxiliary_record(
+            SHARED_CELL_ELEMENT_ID,
+            3,
+            &payload(&[
+                entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &pump),
+                entry(0x5709_0000, 0, true, &other),
+                entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 2, true, &history),
+            ]),
+        );
+        let stray = auxiliary_record(
+            SHARED_CELL_ELEMENT_ID + 1,
+            1,
+            &payload(&[entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &pump)]),
+        );
+        let document = read_with_auxiliary(&[record, stray]);
+        let element = &document.models[0].elements[0];
+        assert_eq!(element.kind(), "SHARED_CELL_INSTANCE");
+        assert_eq!(element.auxiliary_records.len(), 1);
+        let entries = element.auxiliary_records[0].entries().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.type_id, entry.entry_id))
+                .collect::<Vec<_>>(),
+            [
+                (V8_ITEM_INSTANCE_ENTRY_TYPE, 1),
+                (0x5709_0000, 0),
+                (V8_ITEM_INSTANCE_ENTRY_TYPE, 2)
+            ]
+        );
+        assert_eq!(entries[0].data(), pump);
+        assert_eq!(entries[1].data(), other);
+
+        let items = element.item_instances();
+        assert_eq!(items.len(), 2);
+        assert_eq!((items[0].entry_id, &*items[0].class_name), (1, "Pump"));
+        assert_eq!(items[0].schema_element_id, 900);
+        assert_eq!(items[0].property("Tag"), Some("P-101"));
+        assert_eq!(items[0].property("Note"), Some(""));
+        assert_eq!(
+            items[0].schema_reference(),
+            Some("Sample__x0020__Library.01.00")
+        );
+        assert_eq!((items[1].entry_id, &*items[1].class_name), (2, "History"));
+        assert_eq!(items[1].property("Installed"), Some("1986-01-01"));
+    }
+
+    #[test]
+    fn item_data_over_the_size_limit_stays_raw_and_is_counted() {
+        // One table string of 127 three-byte characters; every attribute
+        // pair is four stored bytes that name it twice.
+        let long = "\u{3042}".repeat(127);
+        // enough pairs for more than half of the limit in stored bytes
+        let pairs = crate::v8::V8_MAX_ITEM_BYTES / 8 + 1;
+        let attributes = vec![(long.as_str(), long.as_str()); pairs];
+        let large = item_data(900, &long, &attributes, &[]);
+        assert!(large.len() > crate::v8::V8_MAX_ITEM_BYTES / 2);
+        let small = item_data(900, "Pump", &ITEM_ATTRIBUTES, &[("Tag", "P-101")]);
+        let record = auxiliary_record(
+            SHARED_CELL_ELEMENT_ID,
+            3,
+            &payload(&[
+                entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &large),
+                entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 2, true, &large),
+                entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 3, true, &small),
+            ]),
+        );
+        // the file is read, and the record keeps its exact bytes
+        let document = read_with_auxiliary(std::slice::from_ref(&record));
+        let element = &document.models[0].elements[0];
+        assert_eq!(element.kind(), "SHARED_CELL_INSTANCE");
+        assert_eq!(element.auxiliary_records[0].as_bytes(), record.as_slice());
+        assert_eq!(element.auxiliary_records[0].entries().unwrap().len(), 3);
+
+        // The second large entry does not fit in what the call has left: it
+        // is counted and stays raw. The small entry after it is decoded.
+        let decoded = element.decode_item_instances();
+        assert_eq!(
+            decoded
+                .instances
+                .iter()
+                .map(|item| item.entry_id)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(decoded.over_limit, 1);
+        assert_eq!(element.item_instances(), decoded.instances);
+        assert_eq!(decoded.instances[0].attributes.len(), pairs);
+        let stored = large.len() + small.len();
+        assert!(stored <= crate::v8::V8_MAX_ITEM_BYTES);
+        let memory = decoded.instances.iter().map(item_memory).sum::<usize>();
+        assert!(memory <= MEMORY_PER_STORED_BYTE * stored);
+    }
+
+    #[test]
+    fn the_item_data_of_many_hostile_elements_takes_memory_in_line_with_the_stored_bytes() {
+        // Every element carries one instance that names one long table
+        // string 600 times. The 600 uses are 1,200 of its stored bytes and
+        // name 228,600 bytes of text. All instances of the document are
+        // decoded and kept.
+        const ELEMENTS: usize = 2_000;
+        const PAIRS: usize = 300;
+        let long = "\u{3042}".repeat(127);
+        let attributes = vec![(long.as_str(), long.as_str()); PAIRS];
+        let hostile = item_data(900, &long, &attributes, &[]);
+        assert_eq!(hostile.len() - 4 * PAIRS, 288);
+        let mut objects = Vec::new();
+        let mut records = Vec::new();
+        for element_id in (1_000..).take(ELEMENTS) {
+            let mut object = shared_cell_record(0, [1.0, 2.0, 0.0]);
+            write_u64(&mut object, 0x10, element_id);
+            objects.push(object);
+            records.push(auxiliary_record(
+                element_id,
+                1,
+                &payload(&[entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &hostile)]),
+            ));
+        }
+        let dgn = dgn_with_objects_and_auxiliary(&model_header(), &objects, &records);
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        let elements = &document.models[0].elements;
+        assert_eq!(elements.len(), ELEMENTS);
+
+        let kept = elements
+            .iter()
+            .map(V8Element::decode_item_instances)
+            .collect::<Vec<_>>();
+        assert!(kept
+            .iter()
+            .all(|decoded| decoded.instances.len() == 1 && decoded.over_limit == 0));
+        let instances = kept.iter().flat_map(|decoded| &decoded.instances);
+
+        // The stored bytes are the item data of every auxiliary record.
+        let stored = ELEMENTS * hostile.len();
+        let named = instances
+            .clone()
+            .flat_map(|item| &item.attributes)
+            .map(|pair| pair.name.len() + pair.value.len())
+            .sum::<usize>();
+        assert_eq!(named, ELEMENTS * PAIRS * 2 * long.len());
+        assert!(named > 100 * stored);
+        // The memory of all instances together is at most a fixed multiple
+        // of the stored bytes.
+        let memory = instances.clone().map(item_memory).sum::<usize>();
+        assert!(
+            memory <= MEMORY_PER_STORED_BYTE * stored,
+            "{memory} bytes of memory for {stored} stored bytes"
+        );
+        assert!(memory < named / 15);
+        // Each instance holds its table string once.
+        assert!(instances
+            .clone()
+            .all(|item| Arc::strong_count(&item.class_name) == 1 + 2 * PAIRS));
+    }
+
+    #[test]
+    fn item_data_that_does_not_decode_keeps_the_element_and_its_raw_record() {
+        let good = item_data(900, "Pump", &ITEM_ATTRIBUTES, &[("Tag", "P-101")]);
+        let mut truncated = good.clone();
+        truncated.pop();
+        let mut nested = good.clone();
+        let end = nested.len() - 1;
+        nested.insert(end, 0x02);
+        for (case, records, expected_items) in [
+            (
+                "one damaged entry beside a good one",
+                vec![auxiliary_record(
+                    SHARED_CELL_ELEMENT_ID,
+                    2,
+                    &payload(&[
+                        entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &truncated),
+                        entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 2, true, &good),
+                    ]),
+                )],
+                vec![2],
+            ),
+            (
+                "a layout that was not observed",
+                vec![auxiliary_record(
+                    SHARED_CELL_ELEMENT_ID,
+                    1,
+                    &payload(&[entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &nested)]),
+                )],
+                vec![],
+            ),
+            (
+                "an entry count that does not match the payload",
+                vec![auxiliary_record(
+                    SHARED_CELL_ELEMENT_ID,
+                    2,
+                    &payload(&[entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &good)]),
+                )],
+                vec![],
+            ),
+            (
+                "a payload without the closing word",
+                vec![auxiliary_record(
+                    SHARED_CELL_ELEMENT_ID,
+                    1,
+                    &entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &good),
+                )],
+                vec![],
+            ),
+            (
+                "an empty payload",
+                vec![auxiliary_record(SHARED_CELL_ELEMENT_ID, 0, &[])],
+                vec![],
+            ),
+        ] {
+            let document = read_with_auxiliary(&records);
+            let element = &document.models[0].elements[0];
+            assert_eq!(element.kind(), "SHARED_CELL_INSTANCE", "{case}");
+            assert_eq!(element.auxiliary_records.len(), 1, "{case}");
+            assert_eq!(
+                element.auxiliary_records[0].as_bytes(),
+                records[0].as_slice(),
+                "{case}"
+            );
+            assert_eq!(
+                element
+                    .item_instances()
+                    .iter()
+                    .map(|item| item.entry_id)
+                    .collect::<Vec<_>>(),
+                expected_items,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_prefix_and_mutation_of_a_file_with_item_data_is_panic_free() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let item = item_data(900, "Pump", &ITEM_ATTRIBUTES, &[("Tag", "P-101")]);
+        let record = auxiliary_record(
+            SHARED_CELL_ELEMENT_ID,
+            1,
+            &payload(&[entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &item)]),
+        );
+        // every single-byte change of the record, with the page rebuilt
+        for offset in 0..record.len() {
+            for value in [0x00, 0x01, 0x7f, 0x80, 0xff] {
+                let mut mutated = record.clone();
+                mutated[offset] = value;
+                let dgn = dgn_with_objects_and_auxiliary(
+                    &model_header(),
+                    &[shared_cell_record(0, [1.0, 2.0, 0.0])],
+                    &[mutated],
+                );
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    let _ = read_v8(&dgn, V8ScanOptions::default());
+                }));
+                assert!(
+                    outcome.is_ok(),
+                    "panic at record offset {offset} value {value}"
+                );
+            }
+        }
+        // every prefix and sampled byte flips of the whole container
+        let dgn = dgn_with_objects_and_auxiliary(
+            &model_header(),
+            &[shared_cell_record(0, [1.0, 2.0, 0.0])],
+            &[record],
+        );
+        for end in (0..=dgn.len()).step_by(7) {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = read_v8(&dgn[..end], V8ScanOptions::default());
+            }));
+            assert!(outcome.is_ok(), "panic at prefix {end}");
+        }
+        for offset in (0..dgn.len()).step_by(13) {
+            let mut mutated = dgn.clone();
+            mutated[offset] ^= 0xff;
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = read_v8(&mutated, V8ScanOptions::default());
+            }));
+            assert!(outcome.is_ok(), "panic after mutation at {offset}");
+        }
+    }
+
+    /// A stored-3D type-17 text: `extents` at 0x80, `quaternion` at 0x90,
+    /// origin at 0xb0, editable-field word at 0xc8, payload at 0xca.
+    fn text_3d_record(extents: [f64; 2], quaternion: [f64; 4], text: &[u8]) -> Vec<u8> {
+        let size = (0xca + text.len() + 1) & !1;
+        let mut record = vec![0; size];
+        write_u32(&mut record, 0, 0x1000_0011);
+        write_u32(&mut record, 4, (size / 2) as u32);
+        write_u32(&mut record, 8, (size / 2) as u32);
+        write_u32(&mut record, 0x0c, 64);
+        write_u64(&mut record, 0x10, 700);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        write_u32(&mut record, 0x28, 0x0000_0800);
+        record[0x6e..0x70].copy_from_slice(&(text.len() as u16).to_le_bytes());
+        write_f64(&mut record, 0x70, 1000.0);
+        write_f64(&mut record, 0x78, 1000.0);
+        write_f64(&mut record, 0x80, extents[0]);
+        write_f64(&mut record, 0x88, extents[1]);
+        for (index, value) in quaternion.iter().enumerate() {
+            write_f64(&mut record, 0x90 + index * 8, *value);
+        }
+        for (index, value) in [10.0, 20.0, 30.0].iter().enumerate() {
+            write_f64(&mut record, 0xb0 + index * 8, *value);
+        }
+        record[0xca..0xca + text.len()].copy_from_slice(text);
+        record
+    }
+
+    #[test]
+    fn a_3d_text_exposes_its_stored_quaternion() {
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let dgn = dgn_with_objects(
+            &model_header(),
+            &[
+                text_3d_record([400.0, 60.0], [half, 0.0, 0.0, -half], b"UP"),
+                shared_cell_record(0, [1.0, 2.0, 0.0]),
+            ],
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        let elements = &document.models[0].elements;
+        let V8ElementData::Text {
+            text,
+            orientation,
+            rotation_radians,
+            origin,
+            ..
+        } = &elements[0].data
+        else {
+            panic!("expected a text, got {}", elements[0].kind());
+        };
+        assert_eq!(text, "UP");
+        assert_eq!(
+            (origin.uor.x, origin.uor.y, origin.uor.z),
+            (10.0, 20.0, 30.0)
+        );
+        assert_eq!(*rotation_radians, None);
+        // the six stored values stay as they were: two extents, then w, x, y, z
+        assert_eq!(orientation, &[400.0, 60.0, half, 0.0, 0.0, -half]);
+        assert_eq!(elements[0].data.quaternion(), Some([half, 0.0, 0.0, -half]));
+        assert_eq!(elements[1].data.quaternion(), None);
+    }
+
+    const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+    /// A name linkage: property 1 with UTF-16 text after the `ff fd` mark.
+    fn name_linkage(name: &str) -> Vec<u8> {
+        let mut payload = vec![0xff, 0xfd];
+        payload.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut linkage = vec![0, 0x10, 0xd2, 0x56];
+        linkage.extend(1_u32.to_le_bytes());
+        linkage.extend((payload.len() as u32).to_le_bytes());
+        linkage.extend(payload);
+        linkage.resize(linkage.len().div_ceil(4) * 4, 0);
+        linkage[0] = (linkage.len() / 2 - 1) as u8;
+        linkage
+    }
+
+    /// The 0x100 primary bytes that a definition header and an instance
+    /// share: the six range values and the matrix at 0x70.
+    fn shared_cell_primary(
+        type_and_flags: u32,
+        id: u64,
+        range: [f64; 6],
+        matrix: [f64; 9],
+    ) -> Vec<u8> {
+        let mut record = vec![0; 0x100];
+        write_u32(&mut record, 0, type_and_flags);
+        write_u32(&mut record, 0x0c, 64);
+        write_u64(&mut record, 0x10, id);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        for (index, value) in range.iter().chain(matrix.iter()).enumerate() {
+            write_f64(&mut record, 0x70 + index * 8, *value);
+        }
+        record
+    }
+
+    fn with_name(mut record: Vec<u8>, name: &str) -> Vec<u8> {
+        let primary_words = (record.len() / 2) as u32;
+        record.extend(name_linkage(name));
+        let words = (record.len() / 2) as u32;
+        write_u32(&mut record, 4, words);
+        write_u32(&mut record, 8, primary_words);
+        record
+    }
+
+    fn definition_header(id: u64, name: &str, children: u32, range: [f64; 6]) -> Vec<u8> {
+        let mut record = shared_cell_primary(0x3000_0022, id, range, IDENTITY);
+        write_u32(&mut record, 0x68, children);
+        with_name(record, name)
+    }
+
+    fn named_instance(name: &str, range: [f64; 6], matrix: [f64; 9], origin: [f64; 3]) -> Vec<u8> {
+        let mut record = shared_cell_primary(0x1000_0023, 800, range, matrix);
+        for (index, value) in origin.iter().enumerate() {
+            write_f64(&mut record, 0xe8 + index * 8, *value);
+        }
+        with_name(record, name)
+    }
+
+    /// A 2D line that is a component of the header before it.
+    fn line_component(id: u64, from: [f64; 2], to: [f64; 2]) -> Vec<u8> {
+        let mut record = vec![0; 0x88];
+        write_u32(&mut record, 0, 0x5000_0003);
+        write_u32(&mut record, 4, 0x44);
+        write_u32(&mut record, 8, 0x44);
+        write_u32(&mut record, 0x0c, 64);
+        write_u64(&mut record, 0x10, id);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        for (index, value) in from.iter().chain(to.iter()).enumerate() {
+            write_f64(&mut record, 0x68 + index * 8, *value);
+        }
+        record
+    }
+
+    /// A named object that is no definition: it ends a run of components.
+    fn other_named_object(id: u64) -> Vec<u8> {
+        let mut record = vec![0; 0x20];
+        write_u32(&mut record, 0, 0x1000_005f);
+        write_u32(&mut record, 4, 0x10);
+        write_u32(&mut record, 8, 0x10);
+        write_u64(&mut record, 0x10, id);
+        record
+    }
+
+    fn model_header_with_origin(origin: [f64; 3]) -> Vec<u8> {
+        let mut stream = model_header();
+        for (index, value) in origin.iter().enumerate() {
+            write_f64(&mut stream[4..], 0xc8 + index * 8, *value);
+        }
+        stream
+    }
+
+    const SMALL: [f64; 6] = [0.0, 0.0, 0.0, 2000.0, 1000.0, 0.0];
+    const LARGE: [f64; 6] = [0.0, 0.0, 0.0, 4000.0, 3000.0, 0.0];
+
+    fn named_objects() -> Vec<Vec<u8>> {
+        vec![
+            other_named_object(10),
+            definition_header(20, "CELL_A", 2, SMALL),
+            line_component(21, [0.0, 0.0], [2000.0, 1000.0]),
+            line_component(22, [2000.0, 0.0], [0.0, 1000.0]),
+            definition_header(30, "CELL_A", 1, LARGE),
+            line_component(31, [0.0, 0.0], [4000.0, 3000.0]),
+            other_named_object(40),
+            line_component(41, [1.0, 1.0], [2.0, 2.0]),
+            definition_header(50, "EMPTY", 0, [0.0; 6]),
+        ]
+    }
+
+    fn points(element: &V8Element) -> Vec<(f64, f64, f64, f64)> {
+        let V8ElementData::Line { start, end } = &element.data else {
+            panic!("expected a line, got {}", element.kind());
+        };
+        vec![
+            (start.uor.x, start.uor.y, start.master.x, start.master.y),
+            (end.uor.x, end.uor.y, end.master.x, end.master.y),
+        ]
+    }
+
+    #[test]
+    fn shared_cell_definitions_hold_their_components_in_their_own_space() {
+        let quarter_turn = [0.0, -2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let dgn = dgn_with_pages(
+            &model_header_with_origin([500_000.0, 700_000.0, 0.0]),
+            &[named_instance(
+                "CELL_A",
+                LARGE,
+                quarter_turn,
+                [9000.0, 100.0, 0.0],
+            )],
+            &[],
+            &named_objects(),
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        // the model's own element is placed against the global origin
+        let instance = &document.models[0].elements[0];
+        let V8ElementData::SharedCellInstance {
+            origin, transform, ..
+        } = &instance.data
+        else {
+            panic!("expected an instance, got {}", instance.kind());
+        };
+        assert_eq!((origin.uor.x, origin.master.x), (9000.0, -491.0));
+
+        let definitions = document
+            .shared_cell_definitions(0, V8ScanOptions::default())
+            .unwrap();
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| (definition.name.as_str(), definition.elements.len()))
+                .collect::<Vec<_>>(),
+            [("CELL_A", 3), ("CELL_A", 2), ("EMPTY", 1)]
+        );
+        let small = &definitions[0];
+        let header = small.header().unwrap();
+        assert_eq!(header.kind(), "SHARED_CELL_DEFINITION");
+        assert_eq!(header.common.element_id, 20);
+        assert_eq!((header.index, header.parent_index), (0, None));
+        assert_eq!(header.child_indices, [1, 2]);
+        assert_eq!(small.range_values(), Some(&SMALL[..]));
+        assert_eq!(
+            small.elements[1..]
+                .iter()
+                .map(|element| (
+                    element.index,
+                    element.parent_index,
+                    element.common.element_id
+                ))
+                .collect::<Vec<_>>(),
+            [(1, Some(0), 21), (2, Some(0), 22)]
+        );
+        // definition space: master is UOR over the model scale, no global origin
+        assert_eq!(
+            points(&small.elements[1]),
+            [(0.0, 0.0, 0.0, 0.0), (2000.0, 1000.0, 2.0, 1.0)]
+        );
+        assert_eq!(definitions[2].range_values(), Some(&[0.0; 6][..]));
+
+        // two definitions share the name; the six range values pick one
+        assert!(!definitions[0].matches(&instance.data));
+        assert!(definitions[1].matches(&instance.data));
+        assert!(!definitions[2].matches(&instance.data));
+        assert!(!definitions[1].matches(&definitions[1].elements[1].data));
+
+        // the match is bit for bit: a zero with the other sign is another
+        // value, and so is a value one step away
+        let changed = |index: usize, value: f64| {
+            let mut data = instance.data.clone();
+            let V8ElementData::SharedCellInstance { transform, .. } = &mut data else {
+                unreachable!();
+            };
+            transform[index] = value;
+            data
+        };
+        assert!(definitions[1].matches(&changed(0, 0.0)));
+        assert!(!definitions[1].matches(&changed(0, -0.0)));
+        assert!(!definitions[1].matches(&changed(3, f64::from_bits(4000.0_f64.to_bits() + 1))));
+        // the matrix is not part of the match
+        assert!(definitions[1].matches(&changed(6, 7.0)));
+        // an instance without a name, or with another number of values
+        let mut unnamed = instance.data.clone();
+        if let V8ElementData::SharedCellInstance { name, .. } = &mut unnamed {
+            *name = None;
+        }
+        assert!(!definitions[1].matches(&unnamed));
+        let mut short = instance.data.clone();
+        if let V8ElementData::SharedCellInstance { transform, .. } = &mut short {
+            transform.pop();
+        }
+        assert!(!definitions[1].matches(&short));
+
+        // Placement: origin + M * p, with M the last nine values by rows.
+        // This matrix is not symmetric: read by columns it would turn the
+        // line the other way and put its far end at another point.
+        assert_eq!(transform[6..], quarter_turn);
+        let placed = points(&definitions[1].elements[1])
+            .iter()
+            .map(|(x, y, _, _)| {
+                let point = instance
+                    .data
+                    .place_definition_point(V8Point3::new(*x, *y, 0.0))
+                    .unwrap();
+                (point.x, point.y, point.z)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(placed, [(9000.0, 100.0, 0.0), (3000.0, 8100.0, 0.0)]);
+        // only an instance with its fifteen values places a point
+        let point = V8Point3::new(1.0, 1.0, 1.0);
+        assert!(definitions[1].elements[0]
+            .data
+            .place_definition_point(point)
+            .is_none());
+        let mut short = instance.data.clone();
+        if let V8ElementData::SharedCellInstance { transform, .. } = &mut short {
+            transform.pop();
+        }
+        assert!(short.place_definition_point(point).is_none());
+
+        assert_eq!(
+            read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 0)
+                .unwrap()
+                .len(),
+            3
+        );
+        for result in [
+            document.shared_cell_definitions(1, V8ScanOptions::default()),
+            read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 1),
+        ] {
+            // a wrong argument, not a malformed file
+            let error = result.unwrap_err();
+            assert_eq!(
+                error,
+                DgnError::V8ModelIndexOutOfRange { index: 1, count: 1 }
+            );
+            assert!(error.is_argument_error());
+        }
+        assert!(matches!(
+            missing_model(0, 0),
+            DgnError::InvalidV8ModelIndex { .. }
+        ));
+        assert!(!missing_model(0, 0).is_argument_error());
+    }
+
+    #[test]
+    fn item_data_on_a_definition_component_is_read_with_each_definitions_call() {
+        let pump = item_data(900, "Pump", &ITEM_ATTRIBUTES, &[("Tag", "P-101")]);
+        let record = |element_id: u64| {
+            auxiliary_record(
+                element_id,
+                1,
+                &payload(&[entry(V8_ITEM_INSTANCE_ENTRY_TYPE, 1, true, &pump)]),
+            )
+        };
+        // Records of the named auxiliary pages: one for a component of the
+        // first definition, one for the header of the second, and one for
+        // an element ID that no definition holds.
+        let dgn = dgn_with_named_pages(
+            &model_header(),
+            &[shared_cell_record(0, [1.0, 2.0, 0.0])],
+            &named_objects(),
+            &[record(21), record(30), record(999)],
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        // a plain read gives the element of the model none of them
+        assert_eq!(document.models[0].elements.len(), 1);
+        assert!(document.models[0].elements[0].auxiliary_records.is_empty());
+
+        let items = |definitions: &[V8SharedCellDefinition]| {
+            definitions
+                .iter()
+                .flat_map(|definition| &definition.elements)
+                .map(|element| (element.common.element_id, element.item_instances().len()))
+                .collect::<Vec<_>>()
+        };
+        let first = document
+            .shared_cell_definitions(0, V8ScanOptions::default())
+            .unwrap();
+        assert_eq!(
+            items(&first),
+            [(20, 0), (21, 1), (22, 0), (30, 1), (31, 0), (50, 0)]
+        );
+        let component = &first[0].elements[1];
+        assert_eq!(component.kind(), "LINE");
+        let instance = &component.item_instances()[0];
+        assert_eq!(&*instance.class_name, "Pump");
+        assert_eq!(instance.property("Tag"), Some("P-101"));
+
+        // Each call builds a new result that holds the records again: a
+        // call uses nothing up, and two kept results hold the item data
+        // twice.
+        let second = document
+            .shared_cell_definitions(0, V8ScanOptions::default())
+            .unwrap();
+        assert_eq!(items(&second), items(&first));
+        assert_eq!(
+            second[0].elements[1].item_instances(),
+            first[0].elements[1].item_instances()
+        );
+        let again = read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 0).unwrap();
+        assert_eq!(items(&again), items(&first));
+    }
+
+    #[test]
+    fn a_definition_header_in_a_model_stays_an_unknown_complex_element() {
+        // The same two objects in the graphical page of the model and in the
+        // named page: a definition header with one line.
+        let objects = |header: Vec<u8>| vec![header, line_component(21, [0.0, 0.0], [1.0, 1.0])];
+        let good = definition_header(20, "CELL_A", 1, SMALL);
+        let mut not_finite = good.clone();
+        write_f64(&mut not_finite, 0x70, f64::NAN);
+        write_f64(&mut not_finite, 0xa0, f64::INFINITY);
+
+        for (case, header, definitions) in [("finite", good, 1), ("not finite", not_finite, 0)] {
+            let run = objects(header);
+            let dgn = dgn_with_pages(&model_header(), &run, &[], &run);
+            // read_v8 reads the model as it did before definitions were
+            // read: an unknown complex header with its child count, whatever
+            // its values are
+            let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+            let elements = &document.models[0].elements;
+            assert_eq!(
+                elements[0].data,
+                V8ElementData::UnknownComplex { child_count: 1 },
+                "{case}"
+            );
+            assert_eq!(elements[0].kind(), "UNKNOWN_COMPLEX", "{case}");
+            assert_eq!(elements[0].child_indices, [1], "{case}");
+            assert_eq!(elements[1].kind(), "LINE", "{case}");
+            assert_eq!(elements[1].parent_index, Some(0), "{case}");
+            // the definitions path reads the named copy, and a value that
+            // is not finite leaves that run raw without an error
+            let found = document
+                .shared_cell_definitions(0, V8ScanOptions::default())
+                .unwrap();
+            assert_eq!(found.len(), definitions, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_tag_header_in_a_model_stays_an_unknown_complex_element() {
+        // A type-37 object with the header role is not read as a tag, in
+        // 2D too: it keeps its child count and the model is read.
+        let mut header = vec![0; 0x150];
+        write_u32(&mut header, 0, 0x3000_0025);
+        write_u32(&mut header, 4, 0xa8);
+        write_u32(&mut header, 8, 0xa8);
+        write_u32(&mut header, 0x0c, 64);
+        write_u64(&mut header, 0x10, 20);
+        write_u64(&mut header, 0x18, MODEL_ID);
+        write_u32(&mut header, 0x68, 1);
+        for offset in [0xa0, 0xb8] {
+            write_f64(&mut header, offset, f64::NAN);
+        }
+        let dgn = dgn_with_objects(
+            &model_header(),
+            &[header, line_component(21, [0.0, 0.0], [1.0, 1.0])],
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        let elements = &document.models[0].elements;
+        assert_eq!(
+            elements[0].data,
+            V8ElementData::UnknownComplex { child_count: 1 }
+        );
+        assert_eq!(elements[0].child_indices, [1]);
+        assert_eq!(elements[1].parent_index, Some(0));
+    }
+
+    #[test]
+    fn an_instance_places_a_definition_point_with_its_matrix_by_rows() {
+        // Nine different matrix values and a point with three different
+        // coordinates: each result is one row of the matrix times the point.
+        let matrix = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let dgn = dgn_with_objects(
+            &model_header(),
+            &[named_instance("CELL_A", LARGE, matrix, [10.0, 20.0, 30.0])],
+        );
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        let instance = &document.models[0].elements[0].data;
+        let placed = instance
+            .place_definition_point(V8Point3::new(1.0, 10.0, 100.0))
+            .unwrap();
+        // x: 10 + 1 + 20 + 300; y: 20 + 4 + 50 + 600; z: 30 + 7 + 80 + 900.
+        // By columns x would be 10 + 1 + 40 + 700.
+        assert_eq!((placed.x, placed.y, placed.z), (331.0, 674.0, 1017.0));
+        let origin = instance
+            .place_definition_point(V8Point3::new(0.0, 0.0, 0.0))
+            .unwrap();
+        assert_eq!((origin.x, origin.y, origin.z), (10.0, 20.0, 30.0));
+    }
+
+    #[test]
+    fn a_definition_can_hold_an_instance_of_another_definition() {
+        // the nested instance is a component: the same record with that role
+        let mut nested = named_instance("INNER", SMALL, IDENTITY, [100.0, 50.0, 0.0]);
+        write_u32(&mut nested, 0, 0x5000_0023);
+        let named = [
+            definition_header(20, "OUTER", 2, LARGE),
+            line_component(21, [0.0, 0.0], [4000.0, 3000.0]),
+            nested,
+            definition_header(30, "INNER", 1, SMALL),
+            line_component(31, [0.0, 0.0], [2000.0, 1000.0]),
+        ];
+        let dgn = dgn_with_pages(&model_header(), &[], &[], &named);
+        let definitions =
+            read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 0).unwrap();
+        assert_eq!(definitions.len(), 2);
+        let outer = &definitions[0];
+        assert_eq!(
+            outer
+                .elements
+                .iter()
+                .map(|element| (element.kind(), element.parent_index))
+                .collect::<Vec<_>>(),
+            [
+                ("SHARED_CELL_DEFINITION", None),
+                ("LINE", Some(0)),
+                ("SHARED_CELL_INSTANCE", Some(0))
+            ]
+        );
+        // The nested instance finds its own definition and places a point
+        // of it in the space of the outer definition. The reader does not
+        // expand it.
+        let instance = &outer.elements[2].data;
+        assert!(definitions[1].matches(instance));
+        assert!(!outer.matches(instance));
+        let placed = instance
+            .place_definition_point(V8Point3::new(2000.0, 1000.0, 0.0))
+            .unwrap();
+        assert_eq!((placed.x, placed.y, placed.z), (2100.0, 1050.0, 0.0));
+    }
+
+    #[test]
+    fn components_after_the_declared_count_are_not_part_of_the_definition() {
+        // A text node header that is itself a component, with two children.
+        let nested_header = |id: u64, children: u32| {
+            let mut record = vec![0; 0x80];
+            write_u32(&mut record, 0, 0x7000_0007);
+            write_u32(&mut record, 4, 0x40);
+            write_u32(&mut record, 8, 0x40);
+            write_u32(&mut record, 0x0c, 64);
+            write_u64(&mut record, 0x10, id);
+            write_u64(&mut record, 0x18, MODEL_ID);
+            write_u32(&mut record, 0x68, children);
+            record
+        };
+        let line = |id: u64| line_component(id, [0.0, 0.0], [1.0, 1.0]);
+        let named = [
+            // one child declared, three components stored
+            definition_header(20, "ONE", 1, SMALL),
+            line(21),
+            line(22),
+            line(23),
+            other_named_object(30),
+            // two children declared: a line and a header with its own two
+            // children; then a header and a line that no count covers
+            definition_header(40, "NESTED", 2, SMALL),
+            line(41),
+            nested_header(42, 2),
+            line(43),
+            line(44),
+            nested_header(45, 1),
+            line(46),
+            // the next definition is not affected
+            definition_header(50, "NEXT", 1, SMALL),
+            line(51),
+        ];
+        let dgn = dgn_with_pages(&model_header(), &[], &[], &named);
+        let definitions =
+            read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 0).unwrap();
+        let members = |definition: &V8SharedCellDefinition| {
+            definition
+                .elements
+                .iter()
+                .map(|element| (element.common.element_id, element.parent_index))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(definitions.len(), 3);
+        assert_eq!(members(&definitions[0]), [(20, None), (21, Some(0))]);
+        assert_eq!(
+            members(&definitions[1]),
+            [
+                (40, None),
+                (41, Some(0)),
+                (42, Some(0)),
+                (43, Some(2)),
+                (44, Some(2))
+            ]
+        );
+        assert_eq!(definitions[1].elements[2].child_indices, [3, 4]);
+        assert_eq!(members(&definitions[2]), [(50, None), (51, Some(0))]);
+        // every listed element but the header has a parent in the list
+        for definition in &definitions {
+            assert!(definition.elements[1..]
+                .iter()
+                .all(|element| element.parent_index.is_some()));
+        }
+    }
+
+    #[test]
+    fn runs_that_are_not_definitions_stay_raw() {
+        let read = |named: &[Vec<u8>]| {
+            let dgn = dgn_with_pages(&model_header(), &[], &[], named);
+            read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 0)
+                .unwrap()
+                .iter()
+                .map(|definition| {
+                    (
+                        definition.header().unwrap().common.element_id,
+                        definition.elements[1..]
+                            .iter()
+                            .map(V8Element::kind)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(read(&[]).is_empty());
+
+        // a header with another primary size is not read as a definition
+        let mut short = shared_cell_primary(0x3000_0022, 60, SMALL, IDENTITY);
+        short.truncate(0xf8);
+        write_u32(&mut short, 0x68, 1);
+        // a type-34 object that is not a header
+        let standalone = with_name(
+            shared_cell_primary(0x1000_0022, 70, SMALL, IDENTITY),
+            "LOOSE",
+        );
+        // a component that is too short to be a line stays an unknown child
+        let mut stub = line_component(81, [0.0, 0.0], [1.0, 1.0]);
+        stub.truncate(0x70);
+        write_u32(&mut stub, 4, 0x38);
+        write_u32(&mut stub, 8, 0x38);
+        let named = [
+            with_name(short, "SHORT"),
+            line_component(61, [0.0, 0.0], [1.0, 1.0]),
+            standalone,
+            definition_header(80, "STUB", 2, SMALL),
+            stub,
+            line_component(82, [0.0, 0.0], [1.0, 1.0]),
+            definition_header(90, "MORE", 5, SMALL),
+            line_component(91, [0.0, 0.0], [1.0, 1.0]),
+        ];
+        assert_eq!(
+            read(&named),
+            [(80, vec!["UNKNOWN", "LINE"]), (90, vec!["LINE"])]
+        );
+    }
+
+    #[test]
+    fn every_prefix_and_mutation_of_a_file_with_definitions_is_panic_free() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let named = named_objects();
+        for object in 0..named.len() {
+            for offset in (0..named[object].len()).step_by(3) {
+                for value in [0x00, 0x7f, 0xff] {
+                    let mut mutated = named.clone();
+                    mutated[object][offset] = value;
+                    let dgn = dgn_with_pages(&model_header(), &[], &[], &mutated);
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = read_v8_shared_cell_definitions(&dgn, V8ScanOptions::default(), 0);
+                    }));
+                    assert!(outcome.is_ok(), "panic at object {object} offset {offset}");
+                }
+            }
+        }
+        let dgn = dgn_with_pages(&model_header(), &[], &[], &named);
+        for end in (0..=dgn.len()).step_by(7) {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = read_v8_shared_cell_definitions(&dgn[..end], V8ScanOptions::default(), 0);
+            }));
+            assert!(outcome.is_ok(), "panic at prefix {end}");
+        }
+        // a nesting limit is an error, not a skipped definition
+        let options = V8ScanOptions {
+            max_hierarchy_depth: 0,
+            ..V8ScanOptions::default()
+        };
+        assert!(matches!(
+            read_v8_shared_cell_definitions(&dgn, options, 0),
+            Err(DgnError::V8HierarchyDepthLimitExceeded { .. })
+        ));
+    }
+
+    const STANDALONE_TAG: u32 = 0x1000_0025;
+    const COMPONENT_TAG: u32 = 0x5000_0025;
+    const GROVE_SET_ID: u64 = 300;
+    const HOST_ID: u64 = 800;
+
+    /// A complete tag object: the common header with its range (low X, low
+    /// Y, high X, high Y), the tag fields, then the linkages.
+    fn tag_record(
+        type_and_flags: u32,
+        id: u64,
+        range: [i64; 4],
+        parts: &TagParts<'_>,
+        attributes: &[u8],
+    ) -> Vec<u8> {
+        let mut record = tag_primary(parts);
+        write_u32(&mut record, 0, type_and_flags);
+        write_u32(&mut record, 0x0c, 64);
+        write_u64(&mut record, 0x10, id);
+        write_u64(&mut record, 0x18, MODEL_ID);
+        // the header stores the low corner and the extent
+        for (offset, value) in [
+            (0x38, range[0]),
+            (0x40, range[1]),
+            (0x50, range[2] - range[0]),
+            (0x58, range[3] - range[1]),
+        ] {
+            record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let primary_words = (record.len() / 2) as u32;
+        record.extend(attributes);
+        let words = (record.len() / 2) as u32;
+        write_u32(&mut record, 4, words);
+        write_u32(&mut record, 8, primary_words);
+        record
+    }
+
+    fn tag_set_record(id: u64, name: &str, definitions: &[u8]) -> Vec<u8> {
+        let mut record = tag_set_primary(definitions);
+        write_u32(&mut record, 0, 0x3000_0027);
+        write_u64(&mut record, 0x10, id);
+        with_name(record, name)
+    }
+
+    fn grove_definitions() -> Vec<u8> {
+        [
+            definition_bytes("Variety", 1, "Kind of pear", 1, [3, 1], b"Oak\0"),
+            definition_bytes("Yield", 2, "", 3, [4, 3], &0_i32.to_le_bytes()),
+        ]
+        .concat()
+    }
+
+    fn tagged_named_objects() -> Vec<Vec<u8>> {
+        // the bytes of a tag set under another code, and under another type
+        let mut other_code = tag_set_record(302, "Else", &grove_definitions());
+        other_code[0x28] = b'x';
+        let mut other_type = tag_set_record(303, "Else", &grove_definitions());
+        write_u32(&mut other_type, 0, 0x3000_005f);
+        vec![
+            other_named_object(10),
+            other_code,
+            other_type,
+            tag_set_record(GROVE_SET_ID, "Grove", &grove_definitions()),
+            // a definition of another value type: the set stays raw
+            tag_set_record(
+                301,
+                "Other",
+                &definition_bytes("Shape", 1, "", 5, [0, 0], b"\0"),
+            ),
+            definition_header(20, "CELL_A", 2, SMALL),
+            line_component(21, [0.0, 0.0], [2000.0, 1000.0]),
+            tag_record(
+                COMPONENT_TAG,
+                22,
+                [0, 0, 600, 200],
+                &TagParts {
+                    value: b"Elm\0",
+                    anchor: [300.0, 100.0],
+                    ..TagParts::default()
+                },
+                &tag_set_linkage(GROVE_SET_ID),
+            ),
+        ]
+    }
+
+    fn tagged_model_objects() -> Vec<Vec<u8>> {
+        let host = named_instance("CELL_A", SMALL, IDENTITY, [900.0, 100.0, 0.0]);
+        let both = [tag_set_linkage(GROVE_SET_ID), host_linkage(HOST_ID, [2, 9])].concat();
+        let mut in_3d = tag_record(
+            STANDALONE_TAG,
+            904,
+            [0, 0, 10, 10],
+            &TagParts::default(),
+            &tag_set_linkage(GROVE_SET_ID),
+        );
+        write_u32(&mut in_3d, 0x28, ELEMENT_3D_FLAG);
+        let mut too_long = tag_record(
+            STANDALONE_TAG,
+            906,
+            [0, 0, 10, 10],
+            &TagParts::default(),
+            &[],
+        );
+        write_u32(&mut too_long, 0x138, 3);
+        vec![
+            host,
+            // attached to the host: the first pair is the host origin, the
+            // second pair the way from there to the tag
+            tag_record(
+                STANDALONE_TAG,
+                901,
+                [900, -150, 990, -50],
+                &TagParts {
+                    value: b"Oak\0",
+                    anchor: [900.0, 100.0],
+                    offset: [60.0, -200.0],
+                    trailer: &[1; 10],
+                    code_page: 1252,
+                    ..TagParts::default()
+                },
+                &both,
+            ),
+            // free, with a range that is the single point (0, 0)
+            tag_record(
+                STANDALONE_TAG,
+                902,
+                [0, 0, 0, 0],
+                &TagParts {
+                    tag_id: 2,
+                    value_type: V8_TAG_VALUE_INTEGER,
+                    value: &42_i32.to_le_bytes(),
+                    anchor: [100.0, 200.0],
+                    ..TagParts::default()
+                },
+                &tag_set_linkage(GROVE_SET_ID),
+            ),
+            // a value type that is not decoded, and no known linkage
+            tag_record(
+                STANDALONE_TAG,
+                903,
+                [0, 0, 10, 10],
+                &TagParts {
+                    value_type: 5,
+                    value: &[1, 2, 3],
+                    ..TagParts::default()
+                },
+                &[],
+            ),
+            in_3d,
+            tag_record(0x3000_0025, 905, [0, 0, 10, 10], &TagParts::default(), &[]),
+            too_long,
+        ]
+    }
+
+    /// The document of the tag tests. Its bytes depend on the values in
+    /// this file alone: no clock and no compression library takes part.
+    fn tagged_dgn() -> Vec<u8> {
+        reproducible_dgn_with_pages(
+            &model_header(),
+            &tagged_model_objects(),
+            &[],
+            &tagged_named_objects(),
+        )
+    }
+
+    /// The checked-in file that the Python tests and the stream tests read.
+    const CONSTRUCTED_TAGS: &[u8] =
+        include_bytes!("../../../../tests/data/dgn/v8/constructed_tags.dgn");
+
+    /// Writes the document of the tag tests to the path that the variable
+    /// `EZDGN_WRITE_TAG_FIXTURE` names. This made the checked-in file
+    /// `tests/data/dgn/v8/constructed_tags.dgn`.
+    #[test]
+    #[ignore = "writes a fixture file; run it by name with EZDGN_WRITE_TAG_FIXTURE set"]
+    fn write_the_constructed_tag_fixture() {
+        let path = std::env::var("EZDGN_WRITE_TAG_FIXTURE").expect("EZDGN_WRITE_TAG_FIXTURE");
+        std::fs::write(path, tagged_dgn()).unwrap();
+    }
+
+    #[test]
+    fn the_checked_in_tag_file_is_what_the_builder_writes_byte_for_byte() {
+        let built = tagged_dgn();
+        assert_eq!(built.len(), CONSTRUCTED_TAGS.len());
+        assert!(
+            built == CONSTRUCTED_TAGS,
+            "tests/data/dgn/v8/constructed_tags.dgn is not what the builder writes; \
+             write it again with write_the_constructed_tag_fixture and put its new \
+             hash into SHA256SUMS"
+        );
+        // no clock in the bytes: a second build is the same
+        assert!(tagged_dgn() == built);
+    }
+
+    #[test]
+    fn a_stored_zlib_stream_is_fixed_bytes_and_inflates_to_its_input() {
+        use std::io::Read;
+
+        // written out by hand: header, one final stored block, Adler-32
+        assert_eq!(
+            zlib_stored(b"abc"),
+            [0x78, 0x01, 0x01, 3, 0, 0xfc, 0xff, b'a', b'b', b'c', 0x02, 0x4d, 0x01, 0x27]
+        );
+        assert_eq!(
+            zlib_stored(b""),
+            [0x78, 0x01, 0x01, 0, 0, 0xff, 0xff, 0, 0, 0, 1]
+        );
+        // more than one block
+        let long = (0..150_000_u32)
+            .map(|value| value as u8)
+            .collect::<Vec<_>>();
+        let stream = zlib_stored(&long);
+        assert_eq!(stream.len(), 2 + 3 * 5 + long.len() + 4);
+        let mut inflated = Vec::new();
+        flate2::read::ZlibDecoder::new(stream.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        assert!(inflated == long);
+    }
+
+    #[test]
+    fn tags_are_read_with_their_value_their_set_and_their_host() {
+        let document = read_v8(&tagged_dgn(), V8ScanOptions::default()).unwrap();
+        let model = &document.models[0];
+        assert_eq!(
+            model
+                .elements
+                .iter()
+                .map(V8Element::kind)
+                .collect::<Vec<_>>(),
+            [
+                "SHARED_CELL_INSTANCE",
+                "TAG",
+                "TAG",
+                "TAG",
+                "UNKNOWN",
+                "UNKNOWN_COMPLEX",
+                "UNKNOWN"
+            ]
+        );
+        // a tag is not a drawable entity
+        assert!(model.elements[1..4]
+            .iter()
+            .all(|element| !element.data.is_drawable()));
+        assert_eq!(model.entities().count(), 1);
+        assert_eq!(model.all_drawable_elements().count(), 1);
+
+        assert_eq!(
+            model.elements[1].data,
+            V8ElementData::Tag {
+                tag_id: 1,
+                value_type: V8_TAG_VALUE_TEXT,
+                value_bytes: Arc::from(&b"Oak\0"[..]),
+                value: Some(V8TagValue::Text("Oak".to_owned())),
+                tag_set_element_id: Some(GROVE_SET_ID),
+                host_element_id: Some(HOST_ID),
+                // the sum of the two stored pairs, inside the stored range
+                origin: Some(V8Point {
+                    uor: V8Point3::new(960.0, -100.0, 0.0),
+                    master: V8Point3::new(0.96, -0.1, 0.0),
+                }),
+            }
+        );
+        assert_eq!(model.elements[0].common.element_id, HOST_ID);
+        assert_eq!(
+            model.elements[2].data,
+            V8ElementData::Tag {
+                tag_id: 2,
+                value_type: V8_TAG_VALUE_INTEGER,
+                value_bytes: Arc::from(&[42, 0, 0, 0][..]),
+                value: Some(V8TagValue::Integer(42)),
+                tag_set_element_id: Some(GROVE_SET_ID),
+                host_element_id: None,
+                // (100, 200) is outside the stored range: no origin
+                origin: None,
+            }
+        );
+        assert_eq!(
+            model.elements[3].data,
+            V8ElementData::Tag {
+                tag_id: 1,
+                value_type: 5,
+                value_bytes: Arc::from(&[1, 2, 3][..]),
+                value: None,
+                tag_set_element_id: None,
+                host_element_id: None,
+                origin: Some(V8Point {
+                    uor: V8Point3::new(0.0, 0.0, 0.0),
+                    master: V8Point3::new(0.0, 0.0, 0.0),
+                }),
+            }
+        );
+
+        // the sets are decoded on request; the one that does not decode stays raw
+        let sets = document.tag_sets();
+        assert_eq!(
+            sets.iter()
+                .map(|set| (set.element_id, set.name.as_str(), set.definitions.len()))
+                .collect::<Vec<_>>(),
+            [(GROVE_SET_ID, "Grove", 2)]
+        );
+        assert_eq!(
+            document
+                .raw
+                .tag_set_objects()
+                .map(|object| object.element_id)
+                .collect::<Vec<_>>(),
+            [Some(GROVE_SET_ID), Some(301)]
+        );
+        // a tag-set object without an element ID is not decoded
+        let mut nameless = document.raw.tag_set_objects().next().unwrap().clone();
+        assert!(crate::v8::decode_v8_tag_set(&nameless).is_some());
+        nameless.element_id = None;
+        assert!(crate::v8::decode_v8_tag_set(&nameless).is_none());
+        for other in &document.raw.named_pages[0].objects[..3] {
+            assert!(crate::v8::decode_v8_tag_set(other).is_none());
+        }
+        // each decoded tag names a definition of its set, with its value type
+        for element in &model.elements[1..3] {
+            let V8ElementData::Tag {
+                tag_id,
+                value_type,
+                tag_set_element_id,
+                ..
+            } = &element.data
+            else {
+                unreachable!();
+            };
+            let set = sets
+                .iter()
+                .find(|set| Some(set.element_id) == *tag_set_element_id)
+                .unwrap();
+            assert_eq!(set.definition(*tag_id).unwrap().value_type, *value_type);
+        }
+
+        // a tag inside a shared-cell definition is a component of it
+        let definitions = document
+            .shared_cell_definitions(0, V8ScanOptions::default())
+            .unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0]
+                .elements
+                .iter()
+                .map(|element| (element.kind(), element.parent_index))
+                .collect::<Vec<_>>(),
+            [
+                ("SHARED_CELL_DEFINITION", None),
+                ("LINE", Some(0)),
+                ("TAG", Some(0))
+            ]
+        );
+        let V8ElementData::Tag { value, origin, .. } = &definitions[0].elements[2].data else {
+            unreachable!();
+        };
+        assert_eq!(*value, Some(V8TagValue::Text("Elm".to_owned())));
+        assert_eq!(origin.unwrap().uor, V8Point3::new(300.0, 100.0, 0.0));
+    }
+
+    #[test]
+    fn a_tag_origin_is_given_only_inside_the_stored_range() {
+        let origin = |range: [i64; 4], anchor: [f64; 2], offset: [f64; 2]| {
+            let parts = TagParts {
+                anchor,
+                offset,
+                ..TagParts::default()
+            };
+            let dgn = dgn_with_objects(
+                &model_header(),
+                &[tag_record(STANDALONE_TAG, 900, range, &parts, &[])],
+            );
+            let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+            let V8ElementData::Tag { origin, .. } = &document.models[0].elements[0].data else {
+                panic!("expected a tag");
+            };
+            origin.map(|point| (point.uor.x, point.uor.y))
+        };
+        let range = [-500, 100, 500, 300];
+        // the corners belong to the range
+        assert_eq!(
+            origin(range, [-500.0, 100.0], [0.0, 0.0]),
+            Some((-500.0, 100.0))
+        );
+        assert_eq!(
+            origin(range, [0.0, 0.0], [500.0, 300.0]),
+            Some((500.0, 300.0))
+        );
+        assert_eq!(
+            origin(range, [400.0, 400.0], [50.0, -150.0]),
+            Some((450.0, 250.0))
+        );
+        // one of the two values is outside
+        assert_eq!(origin(range, [-501.0, 100.0], [0.0, 0.0]), None);
+        assert_eq!(origin(range, [500.5, 100.0], [0.0, 0.0]), None);
+        assert_eq!(origin(range, [0.0, 99.0], [0.0, 0.0]), None);
+        assert_eq!(origin(range, [0.0, 200.0], [0.0, 101.0]), None);
+        // the first pair alone is inside, the sum is not
+        assert_eq!(origin(range, [0.0, 200.0], [600.0, 0.0]), None);
+        assert_eq!(origin(range, [f64::NAN, 200.0], [0.0, 0.0]), None);
+    }
+
+    #[test]
+    fn a_tag_value_longer_than_the_string_limit_stays_unknown() {
+        let parts = TagParts {
+            value: b"Oak\0",
+            ..TagParts::default()
+        };
+        let dgn = dgn_with_objects(
+            &model_header(),
+            &[tag_record(STANDALONE_TAG, 900, [0, 0, 0, 0], &parts, &[])],
+        );
+        let kind = |max_string_bytes| {
+            let options = V8ScanOptions {
+                max_string_bytes,
+                ..V8ScanOptions::default()
+            };
+            read_v8(&dgn, options).unwrap().models[0].elements[0].kind()
+        };
+        assert_eq!(kind(4), "TAG");
+        // not an error: the file is read as it was before tags were decoded
+        assert_eq!(kind(3), "UNKNOWN");
+    }
+
+    #[test]
+    fn a_damaged_tag_never_stops_the_file_from_being_read() {
+        let good = tag_record(
+            STANDALONE_TAG,
+            900,
+            [0, 0, 10, 10],
+            &TagParts {
+                value: b"Oak\0",
+                ..TagParts::default()
+            },
+            &[tag_set_linkage(GROVE_SET_ID), host_linkage(HOST_ID, [2, 9])].concat(),
+        );
+        let primary_bytes = 0x144;
+        assert_eq!(read_u32(&good, 8), Some(primary_bytes as u32 / 2));
+        let read = |record: Vec<u8>| {
+            let dgn = dgn_with_objects(&model_header(), &[record]);
+            let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+            document.models[0].elements[0].data.clone()
+        };
+        assert_eq!(read(good.clone()).kind_name(), "TAG");
+        // Every byte after the common header, one at a time: the read never
+        // fails, and the element is a tag or the unknown element it was.
+        for offset in COMMON_HEADER_BYTES..primary_bytes {
+            for value in [0x00, 0x7f, 0xff] {
+                let mut damaged = good.clone();
+                damaged[offset] = value;
+                let data = read(damaged);
+                assert!(
+                    matches!(data, V8ElementData::Tag { .. } | V8ElementData::Unknown),
+                    "offset {offset:#x} value {value:#x} gives {}",
+                    data.kind_name()
+                );
+            }
+        }
+        // values that are not numbers in both stored pairs: a tag, no origin
+        let mut not_a_number = good.clone();
+        not_a_number[0xa0..0xc8].copy_from_slice(&[0xff; 0x28]);
+        assert!(matches!(
+            read(not_a_number),
+            V8ElementData::Tag { origin: None, .. }
+        ));
+        // a declared value that does not fit, and primary bytes cut short
+        let mut too_long = good.clone();
+        write_u32(&mut too_long, 0x138, 5);
+        assert_eq!(read(too_long), V8ElementData::Unknown);
+        let mut cut = good[..0x100].to_vec();
+        write_u32(&mut cut, 4, 0x80);
+        write_u32(&mut cut, 8, 0x80);
+        assert_eq!(read(cut), V8ElementData::Unknown);
+    }
+
+    #[test]
+    fn one_call_decodes_a_bounded_number_of_tag_set_bytes() {
+        // three tag sets of 400,000 definition bytes each: the third would
+        // pass the limit of one call, so it is not decoded
+        let mut default = vec![b'x'; 399_987];
+        default.push(0);
+        let definitions = definition_bytes("A", 1, "", 1, [0, 0], &default);
+        assert_eq!(definitions.len(), 400_000);
+        let named = (0..3)
+            .map(|index| tag_set_record(300 + index, "Big", &definitions))
+            .collect::<Vec<_>>();
+        let dgn = dgn_with_pages(&model_header(), &[], &[], &named);
+        let document = read_v8(&dgn, V8ScanOptions::default()).unwrap();
+        assert_eq!(document.raw.tag_set_objects().count(), 3);
+        assert_eq!(
+            document
+                .tag_sets()
+                .iter()
+                .map(|set| set.element_id)
+                .collect::<Vec<_>>(),
+            [300, 301]
+        );
+        // each of them decodes when it is asked for alone
+        let last = document.raw.tag_set_objects().last().unwrap();
+        assert_eq!(crate::v8::decode_v8_tag_set(last).unwrap().element_id, 302);
+    }
+
+    #[test]
+    fn every_prefix_and_mutation_of_a_file_with_tags_is_panic_free() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let read = |dgn: &[u8]| {
+            if let Ok(document) = read_v8(dgn, V8ScanOptions::default()) {
+                let _ = document.tag_sets();
+                let _ = document.shared_cell_definitions(0, V8ScanOptions::default());
+            }
+        };
+        let model = tagged_model_objects();
+        let named = tagged_named_objects();
+        for (in_model, objects) in [(true, &model), (false, &named)] {
+            for object in 0..objects.len() {
+                for offset in (0..objects[object].len()).step_by(3) {
+                    for value in [0x00, 0x7f, 0xff] {
+                        let mut mutated = objects.clone();
+                        mutated[object][offset] = value;
+                        let dgn = if in_model {
+                            dgn_with_pages(&model_header(), &mutated, &[], &named)
+                        } else {
+                            dgn_with_pages(&model_header(), &model, &[], &mutated)
+                        };
+                        let outcome = catch_unwind(AssertUnwindSafe(|| read(&dgn)));
+                        assert!(
+                            outcome.is_ok(),
+                            "panic at object {object} offset {offset} (model: {in_model})"
+                        );
+                    }
+                }
+            }
+        }
+        let dgn = tagged_dgn();
+        for end in (0..=dgn.len()).step_by(7) {
+            let outcome = catch_unwind(AssertUnwindSafe(|| read(&dgn[..end])));
+            assert!(outcome.is_ok(), "panic at prefix {end}");
+        }
     }
 
     #[test]

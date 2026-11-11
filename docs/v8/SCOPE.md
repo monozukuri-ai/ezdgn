@@ -13,9 +13,12 @@ The reader is a bounded, read-only pipeline:
 3. inflate complete zlib payloads with a hard output ceiling;
 4. parse the model index, model storages, object pages, and auxiliary pages;
 5. retain every recognized raw object as an addressable exact byte sequence;
-6. decode model metadata, standard graphical elements, hierarchy, linkages,
-   and auxiliary-record associations; and
-7. expose the result through Rust, Python, CLI inspection, and an explicit XY
+6. decode model metadata, standard graphical elements, tag elements,
+   hierarchy, linkages, and auxiliary-record associations;
+7. decode on request, and not when a document is read, the entries of an
+   auxiliary record, item instances, shared-cell definitions, and tag sets;
+   and
+8. expose the result through Rust, Python, CLI inspection, and an explicit XY
    plotting adapter.
 
 The semantic model currently covers:
@@ -32,7 +35,20 @@ The semantic model currently covers:
   symbology, and stored/effective dimension;
 - model identity, name, description, dimension, units, UOR scale, origin, and
   extents;
-- property and unknown linkages with exact bytes; and
+- property and unknown linkages with exact bytes;
+- the entries of an auxiliary-record payload with their type word, entry ID
+  and exact data;
+- shared-cell definitions from the named object pages, on request, with their
+  components and hierarchy in definition space, and the match of an instance
+  to its definition;
+- item instances on graphical elements: the item class name, the stored root
+  attributes, and each property name with its text value, for the one stored
+  layout recorded in `FORMAT_NOTES.md`;
+- tag elements stored as 2D: the tag ID, the value type, the value bytes, a
+  text or integer value, the element IDs of the tag set and of the host, and
+  the origin when it lies inside the stored range; and tag sets from the
+  named object pages, on request, with the name, ID, prompt, value type and
+  default of each definition; and
 - unknown graphical, control, named, linkage, and auxiliary records through
   the raw model.
 
@@ -49,9 +65,16 @@ This milestone does not support:
 - V8 creation, writing, editing, or round-trip serialization;
 - complete dimension annotation semantics;
 - full B-spline knot/weight/surface semantics;
-- shared-cell definition lookup and transformed instance expansion;
-- product-specific custom objects, schemas, Item Types, business properties,
-  or arbitrary XAttribute payload semantics;
+- transformed shared-cell instance expansion (the definitions and the
+  placement rule are available; the reader does not copy components into the
+  model) and ByCell symbology resolution;
+- product-specific custom objects, schema text, typed or converted Item Type
+  values, item instance layouts other than the recorded one (nested elements,
+  wider counts and lengths), business properties, or other XAttribute payload
+  semantics;
+- tag values of a type other than text and integer, tags stored as 3D, tag
+  sets with such a definition, the text size and rotation of a tag, and the
+  join of a tag to its definition or its host;
 - font resource resolution or application-specific display fidelity; or
 - camera-aware 3D rendering. The optional plotter is documented as an XY
   preview and leaves the native Z coordinates unchanged.
@@ -72,6 +95,10 @@ make a file appear fully decoded.
 - `FORMAT_NOTES.md` records the byte-level evidence used by the decoder.
 - A rule observed in only one file is not silently generalized. Ambiguous
   records remain raw or partially typed.
+- Some rules rest on lawfully held files that are confidential and cannot be
+  shared. A reviewer cannot reproduce them from public files. `FORMAT_NOTES.md`
+  lists each of them under "Rules that rest on confidential files", with how
+  it was found, its counts, and the constructed test that covers it.
 
 ## Public APIs and compatibility
 
@@ -79,6 +106,17 @@ Rust callers use `scan_v8_objects()` for the raw model and `read_v8()` for the
 semantic model. Python exposes the same operations plus `read_v8file()`.
 `open_document()` and `openfile()` dispatch between V7 and V8 without changing
 the legacy contracts.
+
+`V8ElementData::Tag` and `V8ElementData::SharedCellDefinition` are new
+variants of a public Rust enum: code that matches `V8ElementData` without a
+wildcard arm must add them. `DgnError::V8ModelIndexOutOfRange` is a new
+variant of the error enum in the same way. The new enum `V8TagValue` is
+`#[non_exhaustive]`, because other tag value types exist and are not decoded
+yet. A type-37 object that is read as a tag has the kind `TAG` and no longer
+`UNKNOWN`, so Python's `unknown_elements` no longer lists it. Nothing else
+that `read_v8()` returned before changes: a shared-cell definition is
+returned only by the calls that read definitions, and a type-34 header in a
+model is the unknown complex element it was.
 
 `read()`, `readfile()`, `scan_records()`, and `inspect_headers()` remain V7
 record APIs and intentionally reject V8/CFB input. This preserves existing V7
@@ -95,7 +133,9 @@ A release claiming this scope must pass all of the following:
   offsets, with the source and hash recorded in `PROVENANCE.md`;
 - malformed page, object, model-index, auxiliary-record, compressed-stream,
   hierarchy, vertex, string, and resource-limit cases fail deterministically
-  without panic;
+  without panic, and malformed auxiliary entries, item instances, tag
+  elements and tag sets stay raw without panic and without rejecting the
+  document, as does item data over the stored size limit of one call;
 - the bounded fuzz target builds and the parser benchmark runs;
 - all Rust and Python tests, fixture integrity checks, formatting, and clippy
   checks pass;

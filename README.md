@@ -238,6 +238,17 @@ per defined level: `level_id` as graphical headers store it, the user-visible
 `document.level(level_id)`. An element header that holds the ByLevel sentinel
 `0xffffffff` in its weight, color or style takes the value of its level.
 
+Level IDs are unique within one level table only. When a file holds more than
+one, `document.levels` lists the entries of all of them in file order and
+`document.level(level_id)` returns the first entry with that ID.
+`document.level_tables` keeps the tables apart: each `V8LevelTable` has the
+`header` object that opens it (`None` for entries that follow no level table
+header), its `levels`, and `level(level_id)` for a lookup in that table alone.
+`document.level_candidates(level_id)` returns the entry of every table that
+defines the ID, so a caller can tell an unambiguous level from one that the
+tables name differently. `ezdgn.v8.level_tables(raw)` does the same grouping
+on a raw scan. The reader does not decide which table is the file's own.
+
 Malformed structure raises `InvalidDgnError`; configured resource ceilings
 raise `DgnLimitError`. The complete clean-room boundary, evidence ledger, and
 known limitations are recorded in [docs/v8/SCOPE.md](docs/v8/SCOPE.md),

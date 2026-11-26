@@ -16,8 +16,8 @@ pub use container::{
     inspect_v8_container, V8CfbEntry, V8CfbEntryKind, V8ContainerInfo, DEFAULT_MAX_CFB_ENTRIES,
 };
 pub use entity::{
-    read_v8, V8CommonHeader, V8Document, V8Element, V8ElementData, V8MeshFace, V8Model, V8Point,
-    V8PointOrientation, V8TextEncoding,
+    read_v8, V8CommonHeader, V8Document, V8Element, V8ElementData, V8MeshFace, V8MeshFaces,
+    V8Model, V8Point, V8PointOrientation, V8TextEncoding,
 };
 pub use linkage::{decode_v8_linkages, V8Linkage, V8_PROPERTY_LINKAGE_KIND};
 pub use metadata::{V8Dimension, V8ModelMetadata, V8Point3, V8Range3, V8Range3I64};

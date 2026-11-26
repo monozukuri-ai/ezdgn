@@ -80,11 +80,97 @@ impl V8TextEncoding {
 }
 
 /// One face loop of an indexed mesh: zero-based point indices and, for the
-/// edge that starts at each of them, whether the edge is drawn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct V8MeshFace {
-    pub point_indices: Vec<usize>,
-    pub visible_edges: Vec<bool>,
+/// edge that starts at each of them, whether the edge is drawn. A view into
+/// the arrays of [`V8MeshFaces`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V8MeshFace<'a> {
+    pub point_indices: &'a [u32],
+    pub visible_edges: &'a [bool],
+}
+
+/// The face loops of an indexed mesh, held as three contiguous arrays instead
+/// of two allocations per face: the point indices and edge flags of all faces
+/// one after the other, and the offset at which each face starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V8MeshFaces {
+    /// Start of each face in `point_indices`, followed by the total length.
+    offsets: Vec<u32>,
+    point_indices: Vec<u32>,
+    visible_edges: Vec<bool>,
+}
+
+impl Default for V8MeshFaces {
+    fn default() -> Self {
+        Self {
+            offsets: vec![0],
+            point_indices: Vec::new(),
+            visible_edges: Vec::new(),
+        }
+    }
+}
+
+impl V8MeshFaces {
+    fn with_capacity(face_count: usize, index_count: usize) -> Self {
+        let mut offsets = Vec::with_capacity(face_count + 1);
+        offsets.push(0);
+        Self {
+            offsets,
+            point_indices: Vec::with_capacity(index_count),
+            visible_edges: Vec::with_capacity(index_count),
+        }
+    }
+
+    /// Number of faces.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<V8MeshFace<'_>> {
+        let start = *self.offsets.get(index)?;
+        let end = *self.offsets.get(index.checked_add(1)?)?;
+        Some(self.face(start, end))
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = V8MeshFace<'_>> + '_ {
+        self.offsets
+            .windows(2)
+            .map(|range| self.face(range[0], range[1]))
+    }
+
+    /// Where each face starts in [`Self::point_indices`] and
+    /// [`Self::visible_edges`], followed by their length: face `i` covers
+    /// `offsets[i]..offsets[i + 1]`.
+    #[must_use]
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// Zero-based point indices of all faces, one face after the other.
+    #[must_use]
+    pub fn point_indices(&self) -> &[u32] {
+        &self.point_indices
+    }
+
+    /// For each point index, whether the edge that starts there is drawn.
+    #[must_use]
+    pub fn visible_edges(&self) -> &[bool] {
+        &self.visible_edges
+    }
+
+    fn face(&self, start: u32, end: u32) -> V8MeshFace<'_> {
+        let range = start as usize..end as usize;
+        V8MeshFace {
+            point_indices: &self.point_indices[range.clone()],
+            visible_edges: &self.visible_edges[range],
+        }
+    }
 }
 
 /// Decoded standard V8 element data. Unknown objects remain represented by
@@ -182,7 +268,7 @@ pub enum V8ElementData {
         child_count: usize,
         style: u32,
         points: Vec<V8Point>,
-        faces: Vec<V8MeshFace>,
+        faces: V8MeshFaces,
     },
     MatrixHeader {
         child_count: usize,
@@ -1033,6 +1119,7 @@ const MATRIX_VALUES_OFFSET: usize = 0x78;
 const MATRIX_INTEGER_BYTES: usize = 4;
 const MATRIX_DOUBLE_BYTES: usize = 8;
 const POINT_COMPONENTS: usize = 3;
+const MESH_FACE_MIN_POINTS: usize = 3;
 const MATRIX_VALUES_PER_VERTEX_LIMIT: usize = 16;
 
 fn decode_mesh_header(raw: &V8RawObject) -> Result<V8ElementData, DgnError> {
@@ -1045,7 +1132,7 @@ fn decode_mesh_header(raw: &V8RawObject) -> Result<V8ElementData, DgnError> {
         child_count,
         style,
         points: Vec::new(),
-        faces: Vec::new(),
+        faces: V8MeshFaces::default(),
     })
 }
 
@@ -1139,7 +1226,7 @@ fn resolve_meshes(
 
 struct IndexedFaceLoopMesh {
     points: Vec<V8Point>,
-    faces: Vec<V8MeshFace>,
+    faces: V8MeshFaces,
 }
 
 fn indexed_face_loop_mesh(
@@ -1204,33 +1291,41 @@ fn indexed_face_loop_mesh(
     Ok(Some(IndexedFaceLoopMesh { points, faces }))
 }
 
-fn face_loops(indices: &[i32], point_count: usize) -> Option<Vec<V8MeshFace>> {
-    let mut faces = Vec::new();
-    let mut face = V8MeshFace::default();
-    for &value in indices {
-        if value == 0 {
-            if !face.point_indices.is_empty() {
-                if face.point_indices.len() < 3 {
-                    return None;
-                }
-                faces.push(std::mem::take(&mut face));
+/// Split the index values into face loops. `None` when a loop has fewer than
+/// three points, an index lies outside the points, or there is no face.
+fn face_loops(indices: &[i32], point_count: usize) -> Option<V8MeshFaces> {
+    let loops = || {
+        indices
+            .split(|&value| value == 0)
+            .filter(|face| !face.is_empty())
+    };
+    let mut face_count = 0;
+    let mut index_count = 0;
+    for face in loops() {
+        if face.len() < MESH_FACE_MIN_POINTS {
+            return None;
+        }
+        face_count += 1;
+        index_count += face.len();
+    }
+    if face_count == 0 {
+        return None;
+    }
+    let mut faces = V8MeshFaces::with_capacity(face_count, index_count);
+    for face in loops() {
+        for &value in face {
+            let point_index = value.unsigned_abs().checked_sub(1)?;
+            if usize::try_from(point_index).ok()? >= point_count {
+                return None;
             }
-            continue;
+            faces.point_indices.push(point_index);
+            faces.visible_edges.push(value > 0);
         }
-        let point_index = usize::try_from(value.unsigned_abs()).ok()?.checked_sub(1)?;
-        if point_index >= point_count {
-            return None;
-        }
-        face.point_indices.push(point_index);
-        face.visible_edges.push(value > 0);
+        faces
+            .offsets
+            .push(u32::try_from(faces.point_indices.len()).ok()?);
     }
-    if !face.point_indices.is_empty() {
-        if face.point_indices.len() < 3 {
-            return None;
-        }
-        faces.push(face);
-    }
-    (!faces.is_empty()).then_some(faces)
+    Some(faces)
 }
 
 fn resolve_container_dimensions(elements: &mut [V8Element]) {
@@ -1561,7 +1656,7 @@ mod tests {
                     child_count: 4,
                     style,
                     points: Vec::new(),
-                    faces: Vec::new(),
+                    faces: V8MeshFaces::default(),
                 },
                 parent_index: None,
                 child_indices: vec![1, 2, 3, 4],
@@ -1612,15 +1707,15 @@ mod tests {
         assert_eq!(points[1].uor, V8Point3::new(10.0, 0.0, 0.0));
         assert_eq!(points[1].master, metadata.to_master(points[1].uor));
         assert_eq!(
-            faces,
-            &vec![
+            faces.iter().collect::<Vec<_>>(),
+            vec![
                 V8MeshFace {
-                    point_indices: vec![0, 1, 2],
-                    visible_edges: vec![true, true, false],
+                    point_indices: &[0, 1, 2],
+                    visible_edges: &[true, true, false],
                 },
                 V8MeshFace {
-                    point_indices: vec![0, 3, 1],
-                    visible_edges: vec![true, true, true],
+                    point_indices: &[0, 3, 1],
+                    visible_edges: &[true, true, true],
                 },
             ]
         );
@@ -1724,8 +1819,9 @@ mod tests {
         };
         assert_eq!(elements[0].child_indices, vec![1, 2, 3, 4]);
         assert_eq!(points[1].master, V8Point3::new(1.0, 0.0, 0.0));
-        assert_eq!(faces[0].visible_edges, vec![true, true, false]);
-        assert_eq!(faces[1].point_indices, vec![0, 3, 1]);
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces.get(0).unwrap().visible_edges, [true, true, false]);
+        assert_eq!(faces.get(1).unwrap().point_indices, [0, 3, 1]);
         assert!(elements[0].data.is_drawable());
         assert!(elements[1..].iter().all(|child| !child.data.is_drawable()));
     }
@@ -1744,6 +1840,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn face_loops_are_contiguous_arrays_with_one_offset_per_face() {
+        // A triangle with a hidden edge, an empty loop, a quadrilateral, and
+        // a last loop without its terminating zero.
+        let faces = face_loops(&[1, 2, -3, 0, 0, 4, 3, 2, 1, 0, 2, -4, 5], 5).unwrap();
+        assert_eq!(faces.len(), 3);
+        assert!(!faces.is_empty());
+        assert_eq!(faces.offsets(), [0, 3, 7, 10]);
+        assert_eq!(faces.point_indices(), [0, 1, 2, 3, 2, 1, 0, 1, 3, 4]);
+        assert_eq!(
+            faces.visible_edges(),
+            [true, true, false, true, true, true, true, true, false, true]
+        );
+        assert_eq!(
+            faces.get(1),
+            Some(V8MeshFace {
+                point_indices: &[3, 2, 1, 0],
+                visible_edges: &[true; 4],
+            })
+        );
+        assert_eq!(faces.get(3), None);
+        assert_eq!(faces.get(usize::MAX), None);
+        let loops = faces.iter();
+        assert_eq!(loops.len(), 3);
+        assert_eq!(
+            loops
+                .map(|face| face.point_indices.len())
+                .collect::<Vec<_>>(),
+            [3, 4, 3]
+        );
+        // Exact allocations: no growth slack is kept per mesh.
+        assert_eq!(faces.offsets.capacity(), 4);
+        assert_eq!(faces.point_indices.capacity(), 10);
+        assert_eq!(faces.visible_edges.capacity(), 10);
+
+        let none = V8MeshFaces::default();
+        assert!(none.is_empty());
+        assert_eq!(none.offsets(), [0]);
+        assert_eq!(none.get(0), None);
+        assert_eq!(none.iter().count(), 0);
     }
 
     #[test]

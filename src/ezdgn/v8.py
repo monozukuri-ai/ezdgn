@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import math
+import operator
+import struct
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, TypeAlias, cast
+from functools import lru_cache
+from typing import Any, Iterator, Literal, TypeAlias, TypeVar, cast, overload
 
 from ._core import (
     DEFAULT_MAX_CFB_ENTRIES,
@@ -276,13 +280,325 @@ class V8MeshFace:
     visible_edges: tuple[bool, ...]
 
 
+_Item = TypeVar("_Item")
+_POINT_STRUCT = struct.Struct("<3d")
+_FACE_OFFSET_STRUCT = struct.Struct("<I")
+_FACE_RANGE_STRUCT = struct.Struct("<2I")
+_PACKED_VALUE_FORMATS = ("d", "i")
+_ORIENTATION_VALUES = 4
+_REPR_ITEMS = 3
+
+
+def _as_bytes(data: bytes | bytearray | memoryview) -> bytes:
+    return data if isinstance(data, bytes) else bytes(memoryview(data))
+
+
+@lru_cache(maxsize=None)
+def _value_struct(format: str, width: int) -> struct.Struct:
+    return struct.Struct(f"<{width}{format}")
+
+
+class _PackedSequence(Sequence[_Item]):
+    """Tuple-like behaviour shared by the packed sequences of ``V8ElementData``.
+
+    A packed sequence stands for the tuple of items it would build: it has a
+    length, can be indexed, sliced (a slice is a tuple) and iterated, and
+    compares and hashes equal to that tuple. Items are built each time they are
+    read, so ``sequence[0] is sequence[0]`` is false.
+    """
+
+    __slots__ = ()
+
+    def _buffers(self) -> tuple[Any, ...]:
+        raise NotImplementedError
+
+    def _item(self, position: int) -> _Item:
+        raise NotImplementedError
+
+    @overload
+    def __getitem__(self, index: int) -> _Item: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[_Item, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> _Item | tuple[_Item, ...]:
+        length = len(self)
+        if isinstance(index, slice):
+            positions = range(*index.indices(length))
+            return tuple(self._item(position) for position in positions)
+        position = operator.index(index)
+        if position < 0:
+            position += length
+        if not 0 <= position < length:
+            raise IndexError(f"{type(self).__name__} index out of range")
+        return self._item(position)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _PackedSequence):
+            if type(other) is type(self) and other._buffers() == self._buffers():
+                return True
+        elif not isinstance(other, tuple):
+            return NotImplemented
+        return len(self) == len(other) and all(
+            mine == theirs for mine, theirs in zip(self, other)
+        )
+
+    def __hash__(self) -> int:
+        return hash(tuple(self))
+
+    def __add__(self, other: object) -> tuple[Any, ...]:
+        if isinstance(other, (tuple, _PackedSequence)):
+            return tuple(self) + tuple(other)
+        return NotImplemented
+
+    def __radd__(self, other: object) -> tuple[Any, ...]:
+        if isinstance(other, tuple):
+            return other + tuple(self)
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        shown = [repr(item) for item in self[:_REPR_ITEMS]]
+        if len(self) > _REPR_ITEMS:
+            shown.append("...")
+        return f"<{type(self).__name__} of {len(self)}: {', '.join(shown)}>"
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return type(self), self._buffers()
+
+
+class V8PointArray(_PackedSequence[V8Point]):
+    """The points of one element, kept as packed coordinates.
+
+    ``read_v8`` stores an element's ``vertices`` in this form. It behaves as
+    the tuple of :class:`V8Point` it stands for, and builds each point when it
+    is read. ``uor_bytes`` and ``master_bytes`` hold the same points as
+    little-endian ``float64`` ``x, y, z`` triples for bulk access, for example
+    ``numpy.frombuffer(vertices.master_bytes, "<f8").reshape(-1, 3)``.
+    """
+
+    __slots__ = ("_uor", "_master")
+
+    def __init__(self, uor: bytes, master: bytes) -> None:
+        uor = _as_bytes(uor)
+        master = _as_bytes(master)
+        if len(uor) != len(master) or len(uor) % _POINT_STRUCT.size:
+            raise ValueError(
+                "uor and master must hold the same number of little-endian "
+                "float64 XYZ triples"
+            )
+        self._uor = uor
+        self._master = master
+
+    @classmethod
+    def from_points(cls, points: Iterable[V8Point]) -> V8PointArray:
+        uor = bytearray()
+        master = bytearray()
+        for point in points:
+            uor += _POINT_STRUCT.pack(*point.uor)
+            master += _POINT_STRUCT.pack(*point.master)
+        return cls(bytes(uor), bytes(master))
+
+    @property
+    def uor_bytes(self) -> bytes:
+        return self._uor
+
+    @property
+    def master_bytes(self) -> bytes:
+        return self._master
+
+    def __len__(self) -> int:
+        return len(self._uor) // _POINT_STRUCT.size
+
+    def __iter__(self) -> Iterator[V8Point]:
+        return map(
+            V8Point,
+            _POINT_STRUCT.iter_unpack(self._uor),
+            _POINT_STRUCT.iter_unpack(self._master),
+        )
+
+    def _item(self, position: int) -> V8Point:
+        offset = position * _POINT_STRUCT.size
+        return V8Point(
+            _POINT_STRUCT.unpack_from(self._uor, offset),
+            _POINT_STRUCT.unpack_from(self._master, offset),
+        )
+
+    def _buffers(self) -> tuple[bytes, bytes]:
+        return self._uor, self._master
+
+
+class V8MeshFaceArray(_PackedSequence[V8MeshFace]):
+    """The face loops of one mesh, kept as packed index arrays.
+
+    ``read_v8`` stores a mesh's ``faces`` in this form. It behaves as the tuple
+    of :class:`V8MeshFace` it stands for, and builds each face when it is read.
+    ``point_indices_bytes`` holds the zero-based point indices of all faces, one
+    after the other, as little-endian ``uint32``; ``visible_edges_bytes`` holds
+    one byte (0 or 1) per index; and ``offsets_bytes`` holds, as little-endian
+    ``uint32``, where each face starts in those two arrays, followed by their
+    length. Face ``i`` therefore covers ``offsets[i]:offsets[i + 1]``.
+    """
+
+    __slots__ = ("_offsets", "_point_indices", "_visible_edges")
+
+    def __init__(
+        self, offsets: bytes, point_indices: bytes, visible_edges: bytes
+    ) -> None:
+        offsets = _as_bytes(offsets)
+        point_indices = _as_bytes(point_indices)
+        visible_edges = _as_bytes(visible_edges)
+        index_count = len(visible_edges)
+        offset_bytes = _FACE_OFFSET_STRUCT.size
+        if (
+            len(offsets) < offset_bytes
+            or len(offsets) % offset_bytes
+            or len(point_indices) != index_count * offset_bytes
+            or _FACE_OFFSET_STRUCT.unpack_from(offsets, 0)[0] != 0
+            or _FACE_OFFSET_STRUCT.unpack_from(offsets, len(offsets) - offset_bytes)[0]
+            != index_count
+        ):
+            raise ValueError(
+                "offsets must hold one little-endian uint32 per face and a final "
+                "one, running from 0 to the number of point indices, and "
+                "visible_edges must hold one byte per point index"
+            )
+        self._offsets = offsets
+        self._point_indices = point_indices
+        self._visible_edges = visible_edges
+
+    @classmethod
+    def from_faces(cls, faces: Iterable[V8MeshFace]) -> V8MeshFaceArray:
+        offsets = bytearray(_FACE_OFFSET_STRUCT.size)
+        point_indices = bytearray()
+        visible_edges = bytearray()
+        for face in faces:
+            if len(face.point_indices) != len(face.visible_edges):
+                raise ValueError("a face needs one visible_edges flag per point index")
+            point_indices += struct.pack(
+                f"<{len(face.point_indices)}I", *face.point_indices
+            )
+            visible_edges += bytes(map(bool, face.visible_edges))
+            offsets += _FACE_OFFSET_STRUCT.pack(len(visible_edges))
+        return cls(bytes(offsets), bytes(point_indices), bytes(visible_edges))
+
+    @property
+    def offsets_bytes(self) -> bytes:
+        return self._offsets
+
+    @property
+    def point_indices_bytes(self) -> bytes:
+        return self._point_indices
+
+    @property
+    def visible_edges_bytes(self) -> bytes:
+        return self._visible_edges
+
+    def __len__(self) -> int:
+        return len(self._offsets) // _FACE_OFFSET_STRUCT.size - 1
+
+    def __iter__(self) -> Iterator[V8MeshFace]:
+        offsets = _FACE_OFFSET_STRUCT.iter_unpack(self._offsets)
+        (start,) = next(offsets)
+        for (end,) in offsets:
+            yield self._face(start, end)
+            start = end
+
+    def _item(self, position: int) -> V8MeshFace:
+        return self._face(
+            *_FACE_RANGE_STRUCT.unpack_from(
+                self._offsets, position * _FACE_OFFSET_STRUCT.size
+            )
+        )
+
+    def _face(self, start: int, end: int) -> V8MeshFace:
+        count = end - start
+        return V8MeshFace(
+            struct.unpack_from(
+                f"<{count}I", self._point_indices, start * _FACE_OFFSET_STRUCT.size
+            ),
+            struct.unpack_from(f"<{count}?", self._visible_edges, start),
+        )
+
+    def _buffers(self) -> tuple[bytes, bytes, bytes]:
+        return self._offsets, self._point_indices, self._visible_edges
+
+
+class V8ValueArray(_PackedSequence[Any]):
+    """Numbers of one element, kept as a packed little-endian array.
+
+    ``read_v8`` stores matrix ``values`` (``width`` 1: each item is a number)
+    and point-string ``orientations`` (``width`` 4: each item is a tuple of
+    four numbers) in this form. ``format`` is ``"d"`` for ``float64`` and
+    ``"i"`` for ``int32``, as in :mod:`struct`; ``data_bytes`` holds the
+    numbers for bulk access.
+    """
+
+    __slots__ = ("_format", "_width", "_data")
+
+    def __init__(self, format: Literal["d", "i"], data: bytes, width: int = 1) -> None:
+        if format not in _PACKED_VALUE_FORMATS:
+            raise ValueError("format must be 'd' (float64) or 'i' (int32)")
+        if width < 1:
+            raise ValueError("width must be at least 1")
+        data = _as_bytes(data)
+        if len(data) % _value_struct(format, width).size:
+            raise ValueError("data must hold whole items of little-endian numbers")
+        self._format = format
+        self._width = width
+        self._data = data
+
+    @classmethod
+    def from_values(
+        cls, format: Literal["d", "i"], values: Iterable[Any], width: int = 1
+    ) -> V8ValueArray:
+        numbers = [
+            number
+            for item in values
+            for number in ((item,) if width == 1 else item)
+        ]
+        return cls(format, struct.pack(f"<{len(numbers)}{format}", *numbers), width)
+
+    @property
+    def format(self) -> Literal["d", "i"]:
+        return self._format
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def data_bytes(self) -> bytes:
+        return self._data
+
+    def __len__(self) -> int:
+        return len(self._data) // _value_struct(self._format, self._width).size
+
+    def __iter__(self) -> Iterator[Any]:
+        items = _value_struct(self._format, self._width).iter_unpack(self._data)
+        return map(operator.itemgetter(0), items) if self._width == 1 else items
+
+    def _item(self, position: int) -> Any:
+        item_struct = _value_struct(self._format, self._width)
+        item = item_struct.unpack_from(self._data, position * item_struct.size)
+        return item[0] if self._width == 1 else item
+
+    def _buffers(self) -> tuple[str, bytes, int]:
+        return self._format, self._data, self._width
+
+
 @dataclass(frozen=True, slots=True)
 class V8ElementData:
-    """Native parameters for a supported V8 element kind."""
+    """Native parameters for a supported V8 element kind.
+
+    ``vertices``, ``orientations``, ``faces`` and ``values`` are sequences.
+    Data read from a file holds them packed (:class:`V8PointArray`,
+    :class:`V8MeshFaceArray`, :class:`V8ValueArray`); data built by hand can
+    use plain tuples, and the two compare equal.
+    """
 
     kind: str
-    vertices: tuple[V8Point, ...] = ()
-    orientations: tuple[tuple[float, float, float, float], ...] = ()
+    vertices: Sequence[V8Point] = ()
+    orientations: Sequence[tuple[float, float, float, float]] = ()
     origin: V8Point | None = None
     center: V8Point | None = None
     anchor: V8Point | None = None
@@ -314,9 +630,9 @@ class V8ElementData:
     properties_raw: int | None = None
     declared_poles: int | None = None
     style: int | None = None
-    faces: tuple[V8MeshFace, ...] = ()
+    faces: Sequence[V8MeshFace] = ()
     columns: int | None = None
-    values: tuple[float, ...] = ()
+    values: Sequence[float] = ()
 
     @property
     def rotation_degrees(self) -> float | None:
@@ -787,6 +1103,51 @@ def _point_from_core(row: tuple[Point3, Point3]) -> V8Point:
     return V8Point(tuple(row[0]), tuple(row[1]))  # type: ignore[arg-type]
 
 
+def _is_packed(row: Any, buffers: int) -> bool:
+    return (
+        isinstance(row, tuple)
+        and len(row) == buffers
+        and all(isinstance(item, bytes) for item in row)
+    )
+
+
+def _points_from_core(row: Any) -> Sequence[V8Point]:
+    """Packed ``(uor, master)`` buffers, or one ``(uor, master)`` row per point."""
+
+    if _is_packed(row, 2):
+        return V8PointArray(*row)
+    return tuple(_point_from_core(item) for item in row)
+
+
+def _faces_from_core(row: Any) -> Sequence[V8MeshFace]:
+    """Packed ``(offsets, point_indices, visible_edges)``, or one row per face."""
+
+    if _is_packed(row, 3):
+        return V8MeshFaceArray(*row)
+    return tuple(
+        V8MeshFace(tuple(point_indices), tuple(visible_edges))
+        for point_indices, visible_edges in row
+    )
+
+
+def _values_from_core(row: Any) -> Sequence[float]:
+    """A packed ``(format, data)`` pair, or the numbers themselves."""
+
+    if isinstance(row, tuple) and len(row) == 2 and isinstance(row[1], bytes):
+        return V8ValueArray(*row)
+    return tuple(row)
+
+
+def _orientations_from_core(
+    row: Any,
+) -> Sequence[tuple[float, float, float, float]]:
+    """Packed ``float64`` quadruples, or one row of four numbers per point."""
+
+    if isinstance(row, bytes):
+        return V8ValueArray("d", row, _ORIENTATION_VALUES)
+    return tuple(tuple(item) for item in row)
+
+
 def _common_from_core(row: dict[str, Any]) -> V8CommonHeader:
     return V8CommonHeader(
         level=row["level"],
@@ -810,8 +1171,8 @@ def _common_from_core(row: dict[str, Any]) -> V8CommonHeader:
 def _element_data_from_core(row: dict[str, Any]) -> V8ElementData:
     return V8ElementData(
         kind=row["kind"],
-        vertices=tuple(_point_from_core(item) for item in row.get("vertices", ())),
-        orientations=tuple(tuple(item) for item in row.get("orientations", ())),
+        vertices=_points_from_core(row.get("vertices", ())),
+        orientations=_orientations_from_core(row.get("orientations", ())),
         origin=(
             _point_from_core(row["origin"]) if row.get("origin") is not None else None
         ),
@@ -849,12 +1210,9 @@ def _element_data_from_core(row: dict[str, Any]) -> V8ElementData:
         properties_raw=row.get("properties_raw"),
         declared_poles=row.get("declared_poles"),
         style=row.get("style"),
-        faces=tuple(
-            V8MeshFace(tuple(point_indices), tuple(visible_edges))
-            for point_indices, visible_edges in row.get("faces", ())
-        ),
+        faces=_faces_from_core(row.get("faces", ())),
         columns=row.get("columns"),
-        values=tuple(row.get("values", ())),
+        values=_values_from_core(row.get("values", ())),
     )
 
 
@@ -949,16 +1307,19 @@ __all__ = [
     "V8Level",
     "V8Linkage",
     "V8MeshFace",
+    "V8MeshFaceArray",
     "V8Model",
     "V8ModelIndexEntry",
     "V8ModelMetadata",
     "V8ObjectPage",
     "V8PageHeader",
     "V8Point",
+    "V8PointArray",
     "V8RawDocument",
     "V8RawModel",
     "V8RawObject",
     "V8ScanLimits",
+    "V8ValueArray",
     "LEVEL_TABLE_ELEMENT_TYPE",
     "LEVEL_TABLE_KIND",
     "NAME_LINKAGE_SIGNATURE",

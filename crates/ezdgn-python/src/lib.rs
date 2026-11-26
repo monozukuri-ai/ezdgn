@@ -6,11 +6,12 @@ use ezdgn_core::{
     CommonElementHeader, DesignSettings, DgnError as CoreDgnError, ElementData2D, LinkageData,
     MasterPoint, Point2, RawPoint, RecordScan, ScanOptions, V7Document2D, V7ElementStyle,
     V7WriteOptions, V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element,
-    V8ElementData, V8Linkage, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point, V8Range3,
-    V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions, WritableElement2D,
+    V8ElementData, V8Linkage, V8MeshFace, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point,
+    V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions,
+    WritableElement2D,
 };
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyOverflowError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -807,25 +808,28 @@ fn v8_element_data_dict<'py>(
     result.set_item("kind", data.kind_name())?;
     match data {
         V8ElementData::Line { start, end } => {
-            result.set_item("vertices", [v8_point_row(*start), v8_point_row(*end)])?;
+            result.set_item("vertices", v8_packed_points(py, &[*start, *end])?)?;
         }
         V8ElementData::LineString { vertices }
         | V8ElementData::Shape { vertices }
         | V8ElementData::Curve { vertices }
         | V8ElementData::BSplinePole { vertices } => {
-            result.set_item("vertices", v8_point_rows(vertices))?;
+            result.set_item("vertices", v8_packed_points(py, vertices)?)?;
         }
         V8ElementData::PointString {
             vertices,
             orientations,
         } => {
-            result.set_item("vertices", v8_point_rows(vertices))?;
+            result.set_item("vertices", v8_packed_points(py, vertices)?)?;
             result.set_item(
                 "orientations",
-                orientations
-                    .iter()
-                    .map(|orientation| orientation.values)
-                    .collect::<Vec<_>>(),
+                packed_f64(
+                    py,
+                    orientations.len() * ORIENTATION_VALUES,
+                    orientations
+                        .iter()
+                        .flat_map(|orientation| orientation.values),
+                )?,
             )?;
         }
         V8ElementData::Text {
@@ -954,14 +958,8 @@ fn v8_element_data_dict<'py>(
         } => {
             result.set_item("child_count", *child_count)?;
             result.set_item("style", *style)?;
-            result.set_item("vertices", v8_point_rows(points))?;
-            result.set_item(
-                "faces",
-                faces
-                    .iter()
-                    .map(|face| (face.point_indices.clone(), face.visible_edges.clone()))
-                    .collect::<Vec<_>>(),
-            )?;
+            result.set_item("vertices", v8_packed_points(py, points)?)?;
+            result.set_item("faces", v8_packed_mesh_faces(py, faces)?)?;
         }
         V8ElementData::MatrixHeader {
             child_count,
@@ -971,10 +969,11 @@ fn v8_element_data_dict<'py>(
             result.set_item("columns", *columns)?;
         }
         V8ElementData::MatrixIntegerData { values } => {
-            result.set_item("values", values)?;
+            result.set_item("values", (PACKED_I32_FORMAT, packed_i32(py, values)?))?;
         }
         V8ElementData::MatrixDoubleData { values } => {
-            result.set_item("values", values)?;
+            let data = packed_f64(py, values.len(), values.iter().copied())?;
+            result.set_item("values", (PACKED_F64_FORMAT, data))?;
         }
         V8ElementData::Unknown => {}
     }
@@ -1012,8 +1011,116 @@ fn v8_point_row(point: V8Point) -> V8PointRow {
     (v8_point3_row(point.uor), v8_point3_row(point.master))
 }
 
-fn v8_point_rows(points: &[V8Point]) -> Vec<V8PointRow> {
-    points.iter().copied().map(v8_point_row).collect()
+const F64_BYTES: usize = 8;
+const I32_BYTES: usize = 4;
+const U32_BYTES: usize = 4;
+const POINT_COMPONENTS: usize = 3;
+const ORIENTATION_VALUES: usize = 4;
+/// `struct` format characters that tell Python how a packed value buffer is typed.
+const PACKED_F64_FORMAT: &str = "d";
+const PACKED_I32_FORMAT: &str = "i";
+
+/// Coordinates of a point list as packed little-endian `f64` XYZ triples: one
+/// buffer in UOR and one in master units.
+type V8PackedPoints<'py> = (Bound<'py, PyBytes>, Bound<'py, PyBytes>);
+/// Face loops of a mesh as packed arrays: `u32` offsets (one per face plus a
+/// final one) into the `u32` zero-based point indices, and one visibility byte
+/// per index.
+type V8PackedMeshFaces<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+);
+
+fn v8_packed_points<'py>(py: Python<'py>, points: &[V8Point]) -> PyResult<V8PackedPoints<'py>> {
+    let value_count = points.len() * POINT_COMPONENTS;
+    Ok((
+        packed_f64(
+            py,
+            value_count,
+            points.iter().flat_map(|point| point.uor.as_array()),
+        )?,
+        packed_f64(
+            py,
+            value_count,
+            points.iter().flat_map(|point| point.master.as_array()),
+        )?,
+    ))
+}
+
+fn v8_packed_mesh_faces<'py>(
+    py: Python<'py>,
+    faces: &[V8MeshFace],
+) -> PyResult<V8PackedMeshFaces<'py>> {
+    let index_count: usize = faces.iter().map(|face| face.point_indices.len()).sum();
+    let offsets = PyBytes::new_with(py, (faces.len() + 1) * U32_BYTES, |buffer| {
+        write_u32s(buffer, mesh_face_offsets(faces)).map_err(index_overflow)
+    })?;
+    let point_indices = PyBytes::new_with(py, index_count * U32_BYTES, |buffer| {
+        let indices = faces.iter().flat_map(|face| face.point_indices.iter());
+        write_u32s(buffer, indices.copied()).map_err(index_overflow)
+    })?;
+    let visible_edges = PyBytes::new_with(py, index_count, |buffer| {
+        let edges = faces.iter().flat_map(|face| face.visible_edges.iter());
+        for (byte, visible) in buffer.iter_mut().zip(edges) {
+            *byte = u8::from(*visible);
+        }
+        Ok(())
+    })?;
+    Ok((offsets, point_indices, visible_edges))
+}
+
+/// Start of each face in the flattened index array, followed by the total.
+fn mesh_face_offsets(faces: &[V8MeshFace]) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(faces.iter().scan(0_usize, |end, face| {
+        *end += face.point_indices.len();
+        Some(*end)
+    }))
+}
+
+fn index_overflow(value: usize) -> PyErr {
+    PyOverflowError::new_err(format!(
+        "mesh index {value} does not fit the packed 32-bit layout"
+    ))
+}
+
+fn packed_f64<'py>(
+    py: Python<'py>,
+    count: usize,
+    values: impl Iterator<Item = f64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, count * F64_BYTES, |buffer| {
+        write_f64s(buffer, values);
+        Ok(())
+    })
+}
+
+fn packed_i32<'py>(py: Python<'py>, values: &[i32]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, values.len() * I32_BYTES, |buffer| {
+        write_i32s(buffer, values.iter().copied());
+        Ok(())
+    })
+}
+
+fn write_f64s(buffer: &mut [u8], values: impl Iterator<Item = f64>) {
+    for (chunk, value) in buffer.chunks_exact_mut(F64_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_i32s(buffer: &mut [u8], values: impl Iterator<Item = i32>) {
+    for (chunk, value) in buffer.chunks_exact_mut(I32_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Writes each value as a little-endian `u32`, or returns the first value that does not fit.
+fn write_u32s(buffer: &mut [u8], values: impl Iterator<Item = usize>) -> Result<(), usize> {
+    for (chunk, value) in buffer.chunks_exact_mut(U32_BYTES).zip(values) {
+        let narrow = u32::try_from(value).map_err(|_| value)?;
+        chunk.copy_from_slice(&narrow.to_le_bytes());
+    }
+    Ok(())
 }
 
 fn v8_range_i64_row(range: V8Range3I64) -> ([i64; 3], [i64; 3]) {
@@ -1591,4 +1698,54 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_v7_2d_primitives, module)?)?;
     module.add_function(wrap_pyfunction!(write_v7_2d_bytes, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face(point_indices: &[usize], visible_edges: &[bool]) -> V8MeshFace {
+        V8MeshFace {
+            point_indices: point_indices.to_vec(),
+            visible_edges: visible_edges.to_vec(),
+        }
+    }
+
+    #[test]
+    fn packs_values_as_little_endian_rows() {
+        let mut doubles = [0_u8; 2 * F64_BYTES];
+        write_f64s(&mut doubles, [1.5, -2.0].into_iter());
+        assert_eq!(doubles[..F64_BYTES], 1.5_f64.to_le_bytes());
+        assert_eq!(doubles[F64_BYTES..], (-2.0_f64).to_le_bytes());
+
+        let mut integers = [0_u8; 2 * I32_BYTES];
+        write_i32s(&mut integers, [-3, 7].into_iter());
+        assert_eq!(integers, [0xfd, 0xff, 0xff, 0xff, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn mesh_face_offsets_bound_each_face_in_the_flattened_indices() {
+        let faces = [
+            face(&[0, 1, 2], &[true, true, false]),
+            face(&[0, 3, 1, 2], &[true, true, true, true]),
+        ];
+        assert_eq!(mesh_face_offsets(&faces).collect::<Vec<_>>(), [0, 3, 7]);
+        assert_eq!(mesh_face_offsets(&[]).collect::<Vec<_>>(), [0]);
+
+        let mut offsets = [0_u8; 3 * U32_BYTES];
+        write_u32s(&mut offsets, mesh_face_offsets(&faces)).unwrap();
+        assert_eq!(offsets, [0, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn an_index_beyond_32_bits_is_reported_instead_of_truncated() {
+        let Ok(too_large) = usize::try_from(u64::from(u32::MAX) + 1) else {
+            return;
+        };
+        let mut buffer = [0_u8; U32_BYTES];
+        assert_eq!(
+            write_u32s(&mut buffer, [too_large].into_iter()),
+            Err(too_large)
+        );
+    }
 }

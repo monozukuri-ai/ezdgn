@@ -8,6 +8,9 @@ control sequences as preview approximations.
 from __future__ import annotations
 
 import math
+import operator
+from array import array
+from itertools import compress
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
@@ -25,7 +28,7 @@ from .entities import (
     Text,
     _DEFAULT_V7_COLORS,
 )
-from .v8 import V8Document, V8Element, V8Model
+from .v8 import V8Document, V8Element, V8ElementData, V8Model
 
 CoordinateSpace: TypeAlias = Literal["master", "uor"]
 Point2: TypeAlias = tuple[float, float]
@@ -33,6 +36,11 @@ RgbFloat: TypeAlias = tuple[float, float, float]
 RgbaFloat: TypeAlias = tuple[float, float, float, float]
 StrokeKey: TypeAlias = tuple[RgbFloat, Any, float]
 PolygonKey: TypeAlias = tuple[RgbFloat, RgbaFloat, Any, float]
+
+_POINT_INDEX_BITS = 32
+# Agg rasterizes one path as a whole and holds a cell for every pixel each of
+# its edges touches, so mesh edges are drawn in paths of a bounded size.
+_MESH_PATH_EDGES = 100_000
 
 _LINE_STYLES: dict[int, Any] = {
     0: "-",
@@ -144,6 +152,76 @@ def save_plot(
         _load_matplotlib()["pyplot"].close(figure)
 
 
+def mesh_edge_path(
+    data: V8ElementData,
+    *,
+    coordinate_space: CoordinateSpace = "master",
+) -> Any:
+    """Return the visible edges of a V8 mesh as one Matplotlib ``Path``.
+
+    Each edge is one ``MOVETO``/``LINETO`` pair in the XY plane of the chosen
+    coordinate space. An edge that several faces share appears once, and an
+    edge that no face marks visible is left out. The path of a mesh without
+    visible edges has no vertices.
+
+    ``plot()`` joins these into compound paths, one or a few per display
+    style, instead of drawing one path per edge. To draw a single mesh, use
+    ``PathPatch(mesh_edge_path(element.data), fill=False)``.
+    """
+
+    if coordinate_space not in ("master", "uor"):
+        raise ValueError("coordinate_space must be 'master' or 'uor'")
+    matplotlib = _load_matplotlib()
+    return _mesh_edge_path(
+        data, coordinate_space, matplotlib["Path"], matplotlib["numpy"]
+    )
+
+
+def _mesh_edge_path(
+    data: V8ElementData,
+    coordinate_space: CoordinateSpace,
+    path_type: Any,
+    numpy: Any,
+) -> Any:
+    starts = array("I")
+    ends = array("I")
+    for face in data.faces:
+        loop = face.point_indices
+        starts.extend(compress(loop, face.visible_edges))
+        ends.extend(compress(loop[1:] + loop[:1], face.visible_edges))
+    start = numpy.frombuffer(starts, dtype=numpy.uintc)
+    end = numpy.frombuffer(ends, dtype=numpy.uintc)
+    drawn = _first_of_each_edge(start, end, numpy)
+
+    coordinates = array("d")
+    point_xyz = operator.attrgetter(coordinate_space)
+    for point in data.vertices:
+        coordinates.extend(point_xyz(point)[:2])
+    xy = numpy.frombuffer(coordinates, dtype=numpy.double).reshape(-1, 2)
+
+    vertices = numpy.empty((2 * len(drawn), 2))
+    vertices[0::2] = xy[start[drawn]]
+    vertices[1::2] = xy[end[drawn]]
+    return path_type(vertices, _edge_codes(len(drawn), path_type, numpy))
+
+
+def _first_of_each_edge(start: Any, end: Any, numpy: Any) -> Any:
+    """Positions of the edges to draw: each pair of distinct points once."""
+
+    low = numpy.minimum(start, end).astype(numpy.uint64)
+    high = numpy.maximum(start, end).astype(numpy.uint64)
+    candidates = numpy.flatnonzero(low != high)
+    pairs = (low[candidates] << _POINT_INDEX_BITS) | high[candidates]
+    _, first = numpy.unique(pairs, return_index=True)
+    first.sort()
+    return candidates[first]
+
+
+def _edge_codes(edge_count: int, path_type: Any, numpy: Any) -> Any:
+    edge = numpy.array([path_type.MOVETO, path_type.LINETO], path_type.code_type)
+    return numpy.tile(edge, edge_count)
+
+
 def _save_figure(
     figure: Any,
     output: str | Path,
@@ -198,6 +276,7 @@ class _Renderer:
         self.PolyCollection = matplotlib["PolyCollection"]
         self.TextPath = matplotlib["TextPath"]
         self.Affine2D = matplotlib["Affine2D"]
+        self.numpy = matplotlib["numpy"]
         self._line_batches: dict[
             StrokeKey, list[list[Point2] | tuple[Point2, ...]]
         ] = {}
@@ -375,12 +454,14 @@ class _Renderer:
     ) -> None:
         if len(points) < 2:
             return
-        key: StrokeKey = (
+        self._line_batches.setdefault(self._stroke_key(style), []).append(points)
+
+    def _stroke_key(self, style: BasicStyle | None) -> StrokeKey:
+        return (
             self._color(None if style is None else style.rgb),
             self._line_style(style),
             self._line_width(style),
         )
-        self._line_batches.setdefault(key, []).append(points)
 
     def _polygon(
         self,
@@ -461,11 +542,15 @@ class _V8Renderer(_Renderer):
     def __init__(self, *, drawing: V8Document, **options: Any) -> None:
         super().__init__(drawing=drawing, **options)  # type: ignore[arg-type]
         self.drawing = drawing  # type: ignore[assignment]
+        self._mesh_paths: dict[StrokeKey, list[Any]] = {}
+        self._mesh_path_edges: dict[StrokeKey, int] = {}
 
     def render(self) -> None:
         for model in self.drawing.models:
             for element in model.elements:
                 self._element(model, element)
+        for stroke in list(self._mesh_paths):
+            self._add_mesh_edges(stroke)
         self._flush_collections()
 
     def _element(self, model: V8Model, element: V8Element) -> None:
@@ -512,17 +597,49 @@ class _V8Renderer(_Renderer):
         )
 
     def _mesh_v8(self, element: V8Element, style: BasicStyle) -> None:
-        points = self._points(element.data.vertices)
-        drawn: set[tuple[int, int]] = set()
-        for face in element.data.faces:
-            loop = face.point_indices
-            for position, visible in enumerate(face.visible_edges):
-                start = loop[position]
-                end = loop[(position + 1) % len(loop)]
-                edge = (min(start, end), max(start, end))
-                if visible and start != end and edge not in drawn:
-                    drawn.add(edge)
-                    self._polyline((points[start], points[end]), style)
+        path = _mesh_edge_path(
+            element.data, self.coordinate_space, self.Path, self.numpy
+        )
+        edge_count = len(path.vertices) // 2
+        if edge_count == 0:
+            return
+        stroke = self._stroke_key(style)
+        collected = self._mesh_path_edges.get(stroke, 0)
+        if collected and collected + edge_count > _MESH_PATH_EDGES:
+            self._add_mesh_edges(stroke)
+            collected = 0
+        self._mesh_paths.setdefault(stroke, []).append(path)
+        self._mesh_path_edges[stroke] = collected + edge_count
+
+    def _add_mesh_edges(self, stroke: StrokeKey) -> None:
+        """Draw the collected mesh edges of one style as compound paths.
+
+        The collected meshes share one path; a single mesh with more edges
+        than a path may hold is spread over several.
+        """
+
+        color, line_style, line_width = stroke
+        del self._mesh_path_edges[stroke]
+        edges = self.Path.make_compound_path(*self._mesh_paths.pop(stroke))
+        step = 2 * _MESH_PATH_EDGES
+        for first in range(0, len(edges.vertices), step):
+            patch = self.PathPatch(
+                self.Path(
+                    edges.vertices[first : first + step],
+                    edges.codes[first : first + step],
+                ),
+                facecolor="none",
+                edgecolor=color,
+                linestyle=line_style,
+                linewidth=line_width,
+                zorder=2,
+            )
+            # add_patch() walks a path segment by segment in Python to find
+            # its limits; for straight edges the vertices already hold them.
+            self.ax.add_artist(patch)
+        self.ax.update_datalim(
+            (edges.vertices.min(axis=0), edges.vertices.max(axis=0))
+        )
 
     def _ellipse_v8(self, element: V8Element, style: BasicStyle) -> None:
         data = element.data
@@ -700,6 +817,7 @@ def _style_axes(
 
 def _load_matplotlib() -> dict[str, Any]:
     try:
+        import numpy
         from matplotlib import colors
         from matplotlib import pyplot
         from matplotlib.collections import LineCollection, PolyCollection
@@ -720,8 +838,9 @@ def _load_matplotlib() -> dict[str, Any]:
         "PolyCollection": PolyCollection,
         "TextPath": TextPath,
         "colors": colors,
+        "numpy": numpy,
         "pyplot": pyplot,
     }
 
 
-__all__ = ["CoordinateSpace", "plot", "save_plot"]
+__all__ = ["CoordinateSpace", "mesh_edge_path", "plot", "save_plot"]

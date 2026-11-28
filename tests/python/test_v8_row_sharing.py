@@ -54,3 +54,11 @@ def test_decoded_objects_of_a_page_share_their_strings() -> None:
     assert first.family is second.family
     assert first.role is second.role
     assert model.elements[0].kind is model.elements[1].kind
+
+
+def test_definition_components_share_their_named_page_path() -> None:
+    (definition,) = ezdgn.read_v8_shared_cell_definitions(V8)
+    header, *components = definition.elements
+    assert components
+    for component in components:
+        assert component.raw.stream_path is header.raw.stream_path

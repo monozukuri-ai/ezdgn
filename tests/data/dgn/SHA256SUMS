@@ -4,3 +4,4 @@ dd8465f18569d9289809e9e0962115d365d0a56de021393952a5e7a0a20b527c  tests/data/dgn
 bd09d118a595f5afba833c7c61dad83cf02b01f1b224836b8493a164de90da4e  tests/data/dgn/malformed/knot_oob.dgn
 8f32f87ce4b16881aa64f5cb9f75c98851833f96fef37ca0ad31aa6bb18d1df0  tests/data/dgn/v8/test_dgnv8.dgn
 09f765e0aa8dc06bb1d0da4ed86f060dc0a839d480b3dc67e54841ecceec6433  tests/data/dgn/v8/test_dgnv8_ref.csv
+407f7dd8f5093646d4f27735d92b45c13319e08c8b1471a49d09e693160f2261  tests/data/dgn/v8/constructed_tags.dgn

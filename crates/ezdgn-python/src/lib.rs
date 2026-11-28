@@ -1,19 +1,26 @@
 //! PyO3 bindings for `ezdgn-core`.
 
 use ezdgn_core::{
-    decode_common_header, decode_design_settings, detect_format, inspect_v8_container, read_v7_2d,
-    read_v8, scan_records, scan_v8_objects as core_scan_v8_objects, write_v7_2d,
-    CommonElementHeader, DesignSettings, DgnError as CoreDgnError, ElementData2D, LinkageData,
-    MasterPoint, Point2, RawPoint, RecordScan, ScanOptions, V7Document2D, V7ElementStyle,
-    V7WriteOptions, V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element,
-    V8ElementData, V8Linkage, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point, V8Range3,
-    V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions, WritableElement2D,
+    decode_common_header, decode_design_settings, decode_v8_auxiliary_entries, decode_v8_item_data,
+    decode_v8_item_instances, decode_v8_tag_set_data as core_decode_v8_tag_set_data,
+    decode_v8_tag_set_parts, detect_format, inspect_v8_container, read_v7_2d, read_v8,
+    read_v8_shared_cell_definitions as core_read_v8_shared_cell_definitions, scan_records,
+    scan_v8_objects as core_scan_v8_objects, write_v7_2d, CommonElementHeader, DesignSettings,
+    DgnError as CoreDgnError, ElementData2D, LinkageData, MasterPoint, Point2, RawPoint,
+    RecordScan, ScanOptions, V7Document2D, V7ElementStyle, V7WriteOptions, V8AuxiliaryEntry,
+    V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element, V8ElementData,
+    V8ItemInstance, V8ItemValue, V8Linkage, V8MeshFaces, V8ModelMetadata, V8ObjectPage,
+    V8ObjectRole, V8Point, V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions,
+    V8ScanOptions, V8TagSet, V8TagValue, WritableElement2D,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 
 create_exception!(
     _core,
@@ -277,6 +284,150 @@ fn scan_v8_object_records(
 fn read_v8_document(py: Python<'_>, data: &[u8], limits: V8LimitsRow) -> PyResult<Py<PyDict>> {
     let document = read_v8(data, v8_scan_options(&limits)?).map_err(core_error_to_python)?;
     Ok(v8_document_dict(py, &document)?.unbind())
+}
+
+/// Return the shared-cell definitions of a V8 file: each one a name and its
+/// elements (the header first), with every raw object and auxiliary record
+/// inline.
+#[pyfunction]
+fn read_v8_shared_cells(
+    py: Python<'_>,
+    data: &[u8],
+    limits: V8LimitsRow,
+    model_index: usize,
+) -> PyResult<Py<PyList>> {
+    let definitions =
+        core_read_v8_shared_cell_definitions(data, v8_scan_options(&limits)?, model_index)
+            .map_err(core_error_to_python)?;
+    let result = PyList::empty(py);
+    let mut paths = HashMap::new();
+    for definition in &definitions {
+        let value = PyDict::new(py);
+        value.set_item(intern!(py, "name"), &definition.name)?;
+        let elements = PyList::empty(py);
+        for element in &definition.elements {
+            let row = v8_element_dict(py, element)?;
+            let path = paths
+                .entry(element.raw.stream_path.as_str())
+                .or_insert_with(|| V8SharedPath::new(py, &element.raw.stream_path));
+            row.set_item(
+                intern!(py, "raw"),
+                v8_raw_object_dict(py, &element.raw, path)?,
+            )?;
+            let auxiliary = PyList::empty(py);
+            for record in &element.auxiliary_records {
+                let path = paths
+                    .entry(record.stream_path.as_str())
+                    .or_insert_with(|| V8SharedPath::new(py, &record.stream_path));
+                auxiliary.append(v8_auxiliary_record_dict(py, record, path)?)?;
+            }
+            row.set_item(intern!(py, "auxiliary_records"), auxiliary)?;
+            elements.append(row)?;
+        }
+        value.set_item(intern!(py, "elements"), elements)?;
+        result.append(value)?;
+    }
+    Ok(result.unbind())
+}
+
+/// Split one auxiliary payload into its entries, or return `None` when the
+/// payload does not follow the entry layout exactly.
+#[pyfunction]
+fn decode_v8_auxiliary_payload(
+    py: Python<'_>,
+    payload: &[u8],
+    entry_count: u32,
+) -> PyResult<Option<Py<PyList>>> {
+    decode_v8_auxiliary_entries(payload, entry_count)
+        .map(|entries| Ok(v8_auxiliary_entries_list(py, &entries)?.unbind()))
+        .transpose()
+}
+
+/// Decode the data block of one item-instance entry, or return `None` when
+/// the data does not match the observed layout exactly.
+#[pyfunction]
+fn decode_v8_item_instance_data(
+    py: Python<'_>,
+    entry_id: u32,
+    data: &[u8],
+) -> PyResult<Option<Py<PyDict>>> {
+    let mut strings = ItemStrings::new(py);
+    decode_v8_item_data(entry_id, data)
+        .map(|item| Ok(strings.instance_dict(&item)?.unbind()))
+        .transpose()
+}
+
+/// Decode the item instances of the auxiliary payloads of one element. Each
+/// payload comes with its declared entry count. Returns the instances and
+/// the number of item entries that the size limit of one call left raw.
+/// Every use of one table string is the same Python `str` object.
+#[pyfunction]
+fn decode_v8_item_instances_data(
+    py: Python<'_>,
+    payloads: Vec<(Bound<'_, PyBytes>, u32)>,
+) -> PyResult<(Py<PyList>, usize)> {
+    let decoded = decode_v8_item_instances(
+        payloads
+            .iter()
+            .filter_map(|(payload, count)| decode_v8_auxiliary_entries(payload.as_bytes(), *count))
+            .flatten(),
+    );
+    let mut strings = ItemStrings::new(py);
+    let result = PyList::empty(py);
+    for item in &decoded.instances {
+        result.append(strings.instance_dict(item)?)?;
+    }
+    Ok((result.unbind(), decoded.over_limit))
+}
+
+/// Decode a tag set from the primary and attribute bytes of its named
+/// object, or return `None` when they do not match the observed layout.
+#[pyfunction]
+fn decode_v8_tag_set_data(
+    py: Python<'_>,
+    element_id: u64,
+    primary: &[u8],
+    attributes: &[u8],
+) -> PyResult<Option<Py<PyDict>>> {
+    core_decode_v8_tag_set_data(element_id, primary, attributes)
+        .map(|set| Ok(v8_tag_set_dict(py, &set)?.unbind()))
+        .transpose()
+}
+
+/// Decode the tag sets among the given named objects, each as its element
+/// ID, full raw bytes and attribute offset, under the byte limit of one call.
+#[pyfunction]
+fn decode_v8_tag_sets_data(
+    py: Python<'_>,
+    objects: Vec<(u64, Bound<'_, PyBytes>, usize)>,
+) -> PyResult<Py<PyList>> {
+    let sets = decode_v8_tag_set_parts(objects.iter().filter_map(|(id, raw, offset)| {
+        let (primary, attributes) = raw.as_bytes().split_at_checked(*offset)?;
+        Some((*id, primary, attributes))
+    }));
+    let result = PyList::empty(py);
+    for set in &sets {
+        result.append(v8_tag_set_dict(py, set)?)?;
+    }
+    Ok(result.unbind())
+}
+
+fn v8_tag_set_dict<'py>(py: Python<'py>, set: &V8TagSet) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item(intern!(py, "element_id"), set.element_id)?;
+    result.set_item(intern!(py, "name"), &set.name)?;
+    let definitions = PyList::empty(py);
+    for definition in &set.definitions {
+        let value = PyDict::new(py);
+        value.set_item(intern!(py, "name"), &definition.name)?;
+        value.set_item(intern!(py, "tag_id"), definition.tag_id)?;
+        value.set_item(intern!(py, "prompt"), &definition.prompt)?;
+        value.set_item(intern!(py, "value_type"), definition.value_type)?;
+        set_v8_tag_value(&value, intern!(py, "default"), Some(&definition.default))?;
+        definitions.append(value)?;
+    }
+    result.set_item(intern!(py, "definitions"), definitions)?;
+    Ok(result)
 }
 
 #[pyfunction]
@@ -809,6 +960,88 @@ fn v8_auxiliary_record_dict<'py>(
     Ok(result)
 }
 
+fn v8_auxiliary_entries_list<'py>(
+    py: Python<'py>,
+    entries: &[V8AuxiliaryEntry],
+) -> PyResult<Bound<'py, PyList>> {
+    let result = PyList::empty(py);
+    for entry in entries {
+        let value = PyDict::new(py);
+        value.set_item(intern!(py, "index"), entry.index)?;
+        value.set_item(intern!(py, "offset"), entry.offset)?;
+        value.set_item(intern!(py, "type_id"), entry.type_id)?;
+        value.set_item(intern!(py, "entry_id"), entry.entry_id)?;
+        value.set_item(intern!(py, "size_word"), entry.size_word)?;
+        value.set_item(intern!(py, "reserved"), entry.reserved)?;
+        value.set_item(intern!(py, "data"), PyBytes::new(py, entry.data()))?;
+        result.append(value)?;
+    }
+    Ok(result)
+}
+
+/// The Python strings of the item instances of one call.
+///
+/// An instance holds one shared handle for each string of its string table,
+/// and its class name, names and values are clones of those handles. The
+/// address of a handle therefore tells the table strings apart, and each
+/// one becomes one Python `str` that every use points at. No text is copied
+/// for a second use.
+struct ItemStrings<'py> {
+    py: Python<'py>,
+    seen: HashMap<*const u8, Bound<'py, PyString>>,
+}
+
+impl<'py> ItemStrings<'py> {
+    fn new(py: Python<'py>) -> Self {
+        Self {
+            py,
+            seen: HashMap::new(),
+        }
+    }
+
+    fn text(&mut self, text: &Arc<str>) -> Bound<'py, PyString> {
+        let py = self.py;
+        self.seen
+            .entry(Arc::as_ptr(text).cast())
+            .or_insert_with(|| PyString::new(py, text))
+            .clone()
+    }
+
+    fn pairs(&mut self, values: &[V8ItemValue]) -> PyResult<Bound<'py, PyTuple>> {
+        let py = self.py;
+        PyTuple::new(
+            py,
+            values
+                .iter()
+                .map(|item| (self.text(&item.name), self.text(&item.value))),
+        )
+    }
+
+    fn instance_dict(&mut self, item: &V8ItemInstance) -> PyResult<Bound<'py, PyDict>> {
+        let py = self.py;
+        let result = PyDict::new(py);
+        result.set_item(intern!(py, "entry_id"), item.entry_id)?;
+        result.set_item(intern!(py, "schema_element_id"), item.schema_element_id)?;
+        result.set_item(intern!(py, "class_name"), self.text(&item.class_name))?;
+        result.set_item(intern!(py, "attributes"), self.pairs(&item.attributes)?)?;
+        result.set_item(intern!(py, "properties"), self.pairs(&item.properties)?)?;
+        Ok(result)
+    }
+}
+
+fn set_v8_tag_value(
+    target: &Bound<'_, PyDict>,
+    key: &Bound<'_, PyString>,
+    value: Option<&V8TagValue>,
+) -> PyResult<()> {
+    match value {
+        Some(V8TagValue::Text(text)) => target.set_item(key, text),
+        Some(V8TagValue::Integer(number)) => target.set_item(key, *number),
+        // no value, or a value type that this binding does not know yet
+        _ => target.set_item(key, target.py().None()),
+    }
+}
+
 fn v8_model_metadata_dict<'py>(
     py: Python<'py>,
     metadata: &V8ModelMetadata,
@@ -920,26 +1153,29 @@ fn v8_element_data_dict<'py>(
         V8ElementData::Line { start, end } => {
             result.set_item(
                 intern!(py, "vertices"),
-                [v8_point_row(*start), v8_point_row(*end)],
+                v8_packed_points(py, &[*start, *end])?,
             )?;
         }
         V8ElementData::LineString { vertices }
         | V8ElementData::Shape { vertices }
         | V8ElementData::Curve { vertices }
         | V8ElementData::BSplinePole { vertices } => {
-            result.set_item(intern!(py, "vertices"), v8_point_rows(vertices))?;
+            result.set_item(intern!(py, "vertices"), v8_packed_points(py, vertices)?)?;
         }
         V8ElementData::PointString {
             vertices,
             orientations,
         } => {
-            result.set_item(intern!(py, "vertices"), v8_point_rows(vertices))?;
+            result.set_item(intern!(py, "vertices"), v8_packed_points(py, vertices)?)?;
             result.set_item(
                 intern!(py, "orientations"),
-                orientations
-                    .iter()
-                    .map(|orientation| orientation.values)
-                    .collect::<Vec<_>>(),
+                packed_f64(
+                    py,
+                    orientations.len() * ORIENTATION_VALUES,
+                    orientations
+                        .iter()
+                        .flat_map(|orientation| orientation.values),
+                )?,
             )?;
         }
         V8ElementData::Text {
@@ -1053,6 +1289,15 @@ fn v8_element_data_dict<'py>(
             result.set_item(intern!(py, "origin"), v8_point_row(*origin))?;
             result.set_item(intern!(py, "transform"), transform)?;
         }
+        V8ElementData::SharedCellDefinition {
+            child_count,
+            name,
+            transform,
+        } => {
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "name"), name)?;
+            result.set_item(intern!(py, "transform"), transform)?;
+        }
         V8ElementData::BSplineCurve {
             child_count,
             properties_raw,
@@ -1066,6 +1311,29 @@ fn v8_element_data_dict<'py>(
             Some(point) => result.set_item(intern!(py, "anchor"), v8_point_row(*point))?,
             None => result.set_item(intern!(py, "anchor"), py.None())?,
         },
+        V8ElementData::Tag {
+            tag_id,
+            value_type,
+            value_bytes,
+            value,
+            tag_set_element_id,
+            host_element_id,
+            origin,
+        } => {
+            result.set_item(intern!(py, "tag_id"), *tag_id)?;
+            result.set_item(intern!(py, "value_type"), *value_type)?;
+            result.set_item(
+                intern!(py, "value_bytes"),
+                PyBytes::new(py, value_bytes.as_ref()),
+            )?;
+            set_v8_tag_value(&result, intern!(py, "value"), value.as_ref())?;
+            result.set_item(intern!(py, "tag_set_element_id"), *tag_set_element_id)?;
+            result.set_item(intern!(py, "host_element_id"), *host_element_id)?;
+            match origin {
+                Some(point) => result.set_item(intern!(py, "origin"), v8_point_row(*point))?,
+                None => result.set_item(intern!(py, "origin"), py.None())?,
+            }
+        }
         V8ElementData::Mesh {
             child_count,
             style,
@@ -1074,14 +1342,8 @@ fn v8_element_data_dict<'py>(
         } => {
             result.set_item(intern!(py, "child_count"), *child_count)?;
             result.set_item(intern!(py, "style"), *style)?;
-            result.set_item(intern!(py, "vertices"), v8_point_rows(points))?;
-            result.set_item(
-                intern!(py, "faces"),
-                faces
-                    .iter()
-                    .map(|face| (face.point_indices.clone(), face.visible_edges.clone()))
-                    .collect::<Vec<_>>(),
-            )?;
+            result.set_item(intern!(py, "vertices"), v8_packed_points(py, points)?)?;
+            result.set_item(intern!(py, "faces"), v8_packed_mesh_faces(py, faces)?)?;
         }
         V8ElementData::MatrixHeader {
             child_count,
@@ -1091,10 +1353,14 @@ fn v8_element_data_dict<'py>(
             result.set_item(intern!(py, "columns"), *columns)?;
         }
         V8ElementData::MatrixIntegerData { values } => {
-            result.set_item(intern!(py, "values"), values)?;
+            result.set_item(
+                intern!(py, "values"),
+                (PACKED_I32_FORMAT, packed_i32(py, values)?),
+            )?;
         }
         V8ElementData::MatrixDoubleData { values } => {
-            result.set_item(intern!(py, "values"), values)?;
+            let data = packed_f64(py, values.len(), values.iter().copied())?;
+            result.set_item(intern!(py, "values"), (PACKED_F64_FORMAT, data))?;
         }
         V8ElementData::Unknown => {}
     }
@@ -1138,8 +1404,105 @@ fn v8_point_row(point: V8Point) -> V8PointRow {
     (v8_point3_row(point.uor), v8_point3_row(point.master))
 }
 
-fn v8_point_rows(points: &[V8Point]) -> Vec<V8PointRow> {
-    points.iter().copied().map(v8_point_row).collect()
+const F64_BYTES: usize = 8;
+const I32_BYTES: usize = 4;
+const U32_BYTES: usize = 4;
+const POINT_COMPONENTS: usize = 3;
+const ORIENTATION_VALUES: usize = 4;
+/// `struct` format characters that tell Python how a packed value buffer is typed.
+const PACKED_F64_FORMAT: &str = "d";
+const PACKED_I32_FORMAT: &str = "i";
+
+/// Coordinates of a point list as packed little-endian `f64` XYZ triples: one
+/// buffer in UOR and one in master units.
+type V8PackedPoints<'py> = (Bound<'py, PyBytes>, Bound<'py, PyBytes>);
+/// Face loops of a mesh as packed arrays: `u32` offsets (one per face plus a
+/// final one) into the `u32` zero-based point indices, and one visibility byte
+/// per index.
+type V8PackedMeshFaces<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+);
+
+fn v8_packed_points<'py>(py: Python<'py>, points: &[V8Point]) -> PyResult<V8PackedPoints<'py>> {
+    let value_count = points.len() * POINT_COMPONENTS;
+    Ok((
+        packed_f64(
+            py,
+            value_count,
+            points.iter().flat_map(|point| point.uor.as_array()),
+        )?,
+        packed_f64(
+            py,
+            value_count,
+            points.iter().flat_map(|point| point.master.as_array()),
+        )?,
+    ))
+}
+
+fn v8_packed_mesh_faces<'py>(
+    py: Python<'py>,
+    faces: &V8MeshFaces,
+) -> PyResult<V8PackedMeshFaces<'py>> {
+    let visible_edges = faces.visible_edges();
+    Ok((
+        packed_u32(py, faces.offsets())?,
+        packed_u32(py, faces.point_indices())?,
+        PyBytes::new_with(py, visible_edges.len(), |buffer| {
+            write_flags(buffer, visible_edges);
+            Ok(())
+        })?,
+    ))
+}
+
+fn packed_u32<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, values.len() * U32_BYTES, |buffer| {
+        write_u32s(buffer, values);
+        Ok(())
+    })
+}
+
+fn packed_f64<'py>(
+    py: Python<'py>,
+    count: usize,
+    values: impl Iterator<Item = f64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, count * F64_BYTES, |buffer| {
+        write_f64s(buffer, values);
+        Ok(())
+    })
+}
+
+fn packed_i32<'py>(py: Python<'py>, values: &[i32]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, values.len() * I32_BYTES, |buffer| {
+        write_i32s(buffer, values.iter().copied());
+        Ok(())
+    })
+}
+
+fn write_f64s(buffer: &mut [u8], values: impl Iterator<Item = f64>) {
+    for (chunk, value) in buffer.chunks_exact_mut(F64_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_i32s(buffer: &mut [u8], values: impl Iterator<Item = i32>) {
+    for (chunk, value) in buffer.chunks_exact_mut(I32_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_u32s(buffer: &mut [u8], values: &[u32]) {
+    for (chunk, value) in buffer.chunks_exact_mut(U32_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_flags(buffer: &mut [u8], flags: &[bool]) {
+    for (byte, flag) in buffer.iter_mut().zip(flags) {
+        *byte = u8::from(*flag);
+    }
 }
 
 fn v8_range_i64_row(range: V8Range3I64) -> ([i64; 3], [i64; 3]) {
@@ -1642,7 +2005,9 @@ fn format_row(format: ezdgn_core::DgnFormat) -> FormatRow {
 
 fn core_error_to_python(error: CoreDgnError) -> PyErr {
     let message = error.to_string();
-    if error.is_unsupported_error() {
+    if error.is_argument_error() {
+        PyValueError::new_err(message)
+    } else if error.is_unsupported_error() {
         UnsupportedDgnError::new_err(message)
     } else if error.is_limit_error() {
         DgnLimitError::new_err(message)
@@ -1711,10 +2076,60 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(inspect_v8_cfb, module)?)?;
     module.add_function(wrap_pyfunction!(scan_v8_object_records, module)?)?;
     module.add_function(wrap_pyfunction!(read_v8_document, module)?)?;
+    module.add_function(wrap_pyfunction!(read_v8_shared_cells, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_auxiliary_payload, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_item_instance_data, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_item_instances_data, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_tag_set_data, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_v8_tag_sets_data, module)?)?;
+    module.add(
+        "V8_ITEM_INSTANCE_ENTRY_TYPE",
+        ezdgn_core::V8_ITEM_INSTANCE_ENTRY_TYPE,
+    )?;
+    module.add(
+        "V8_TAG_SET_CODE",
+        PyBytes::new(py, &ezdgn_core::V8_TAG_SET_CODE),
+    )?;
+    module.add(
+        "V8_MAX_AUXILIARY_ENTRIES",
+        ezdgn_core::V8_MAX_AUXILIARY_ENTRIES,
+    )?;
+    module.add("V8_MAX_ITEM_BYTES", ezdgn_core::V8_MAX_ITEM_BYTES)?;
+    module.add("V8_MAX_TAG_SET_BYTES", ezdgn_core::V8_MAX_TAG_SET_BYTES)?;
+    module.add("V8_TAG_VALUE_TEXT", ezdgn_core::V8_TAG_VALUE_TEXT)?;
+    module.add("V8_TAG_VALUE_INTEGER", ezdgn_core::V8_TAG_VALUE_INTEGER)?;
     module.add_function(wrap_pyfunction!(scan_v7_records, module)?)?;
     module.add_function(wrap_pyfunction!(read_v7_design_settings, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_v7_headers, module)?)?;
     module.add_function(wrap_pyfunction!(read_v7_2d_primitives, module)?)?;
     module.add_function(wrap_pyfunction!(write_v7_2d_bytes, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packs_values_as_little_endian_rows() {
+        let mut doubles = [0_u8; 2 * F64_BYTES];
+        write_f64s(&mut doubles, [1.5, -2.0].into_iter());
+        assert_eq!(doubles[..F64_BYTES], 1.5_f64.to_le_bytes());
+        assert_eq!(doubles[F64_BYTES..], (-2.0_f64).to_le_bytes());
+
+        let mut integers = [0_u8; 2 * I32_BYTES];
+        write_i32s(&mut integers, [-3, 7].into_iter());
+        assert_eq!(integers, [0xfd, 0xff, 0xff, 0xff, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn packs_face_arrays_as_little_endian_words_and_flag_bytes() {
+        let mut offsets = [0_u8; 3 * U32_BYTES];
+        write_u32s(&mut offsets, &[0, 3, 0x0102_0304]);
+        assert_eq!(offsets, [0, 0, 0, 0, 3, 0, 0, 0, 4, 3, 2, 1]);
+
+        let mut flags = [0xff_u8; 3];
+        write_flags(&mut flags, &[true, false, true]);
+        assert_eq!(flags, [1, 0, 1]);
+    }
 }

@@ -732,40 +732,117 @@ class V8Level:
     color_index: int
 
 
+@dataclass(frozen=True, slots=True)
+class V8LevelTable:
+    """One level table: a table header and the level entries that follow it.
+
+    Level IDs are unique within a table only. ``header`` is the type-96 named
+    object that opens the table, or ``None`` for entries that follow no level
+    table header. ``levels`` holds the entries in file order and is empty for
+    a header without entries.
+    """
+
+    header: V8RawObject | None
+    levels: tuple[V8Level, ...]
+
+    def level(self, level_id: int) -> V8Level | None:
+        """The first entry of this table with ``level_id``, if it defines one."""
+
+        for item in self.levels:
+            if item.level_id == level_id:
+                return item
+        return None
+
+
 LEVEL_TABLE_ELEMENT_TYPE = 95
+LEVEL_TABLE_HEADER_ELEMENT_TYPE = 96
 LEVEL_TABLE_KIND = 1
 NAME_LINKAGE_SIGNATURE = 0x56D2
 # Symbology sentinels in V8 headers and level entries.
 SYMBOLOGY_BY_LEVEL = 0xFFFFFFFF
 SYMBOLOGY_BY_CELL = 0xFFFFFFFE
+_LEVEL_ENTRY_BYTES = 0x60
+_COMPONENT_ROLES = ("component", "header_component")
 
 
 def level_table(raw: V8RawDocument) -> tuple[V8Level, ...]:
-    """Decode the level-table entries of a scanned document (see FORMAT_NOTES)."""
+    """Decode the level-table entries of a scanned document (see FORMAT_NOTES).
+
+    Every entry of every level table is returned in file order; use
+    ``level_tables()`` to keep the entries of each table apart.
+    """
 
     levels: list[V8Level] = []
     for page in raw.named_pages:
         for item in page.objects:
-            if (
-                item.element_type != LEVEL_TABLE_ELEMENT_TYPE
-                or item.level != LEVEL_TABLE_KIND
-            ):
-                continue
-            primary = item.primary_bytes
-            if len(primary) < 0x60:
-                continue
-            levels.append(
-                V8Level(
-                    raw=item,
-                    level_id=_u32(primary, 0x20),
-                    number=_u32(primary, 0x5C),
-                    name=_name_linkage(item.attribute_bytes),
-                    line_style=_i32(primary, 0x40),
-                    line_weight=_u32(primary, 0x44),
-                    color_index=_u32(primary, 0x48),
-                )
-            )
+            if _is_level_entry(item):
+                level = _level_from_entry(item)
+                if level is not None:
+                    levels.append(level)
     return tuple(levels)
+
+
+def level_tables(raw: V8RawDocument) -> tuple[V8LevelTable, ...]:
+    """Group the level-table entries of a scanned document by their table.
+
+    The named objects are read in file order, across pages. A type-96 header
+    that is not itself a component ends the table before it, and starts a new
+    one when its ``level`` word is 1 (the level table kind). A level entry
+    joins the table that is open, or starts a table without a header when none
+    is. Any other object that is not a component ends the open table. Tables
+    are never merged, so the entries of all tables, in order, are
+    ``level_table(raw)``.
+    """
+
+    tables: list[tuple[V8RawObject | None, list[V8Level]]] = []
+    table_is_open = False
+    for page in raw.named_pages:
+        for item in page.objects:
+            if _is_level_entry(item):
+                if not table_is_open:
+                    tables.append((None, []))
+                    table_is_open = True
+                level = _level_from_entry(item)
+                if level is not None:
+                    tables[-1][1].append(level)
+            elif item.role not in _COMPONENT_ROLES:
+                table_is_open = _is_level_table_header(item)
+                if table_is_open:
+                    tables.append((item, []))
+    return tuple(
+        V8LevelTable(header=header, levels=tuple(levels))
+        for header, levels in tables
+        if header is not None or levels
+    )
+
+
+def _is_level_entry(item: V8RawObject) -> bool:
+    return (
+        item.element_type == LEVEL_TABLE_ELEMENT_TYPE
+        and item.level == LEVEL_TABLE_KIND
+    )
+
+
+def _is_level_table_header(item: V8RawObject) -> bool:
+    return (
+        item.element_type == LEVEL_TABLE_HEADER_ELEMENT_TYPE
+        and item.level == LEVEL_TABLE_KIND
+    )
+
+
+def _level_from_entry(item: V8RawObject) -> V8Level | None:
+    primary = item.primary_bytes
+    if len(primary) < _LEVEL_ENTRY_BYTES:
+        return None
+    return V8Level(
+        raw=item,
+        level_id=_u32(primary, 0x20),
+        number=_u32(primary, 0x5C),
+        name=_name_linkage(item.attribute_bytes),
+        line_style=_i32(primary, 0x40),
+        line_weight=_u32(primary, 0x44),
+        color_index=_u32(primary, 0x48),
+    )
 
 
 def _u32(data: bytes, offset: int) -> int:
@@ -944,13 +1021,33 @@ class V8Document:
 
         return level_table(self.raw)
 
+    @property
+    def level_tables(self) -> tuple[V8LevelTable, ...]:
+        """The level tables of the file, in file order (see ``level_tables()``)."""
+
+        return level_tables(self.raw)
+
     def level(self, level_id: int) -> V8Level | None:
-        """The level-table entry a header's ``level`` number refers to, if defined."""
+        """The level-table entry a header's ``level`` number refers to, if defined.
+
+        This is the first entry with that ID in file order. A file with several
+        level tables can define the ID more than once: see ``level_candidates()``.
+        """
 
         for item in self.levels:
             if item.level_id == level_id:
                 return item
         return None
+
+    def level_candidates(self, level_id: int) -> tuple[V8Level, ...]:
+        """The entry for ``level_id`` in each level table that defines it.
+
+        The entries are in file order, one per table. More than one entry
+        means the tables disagree on, or repeat, what the ID stands for.
+        """
+
+        found = (table.level(level_id) for table in self.level_tables)
+        return tuple(item for item in found if item is not None)
 
     @property
     def tag_sets(self) -> tuple[V8TagSet, ...]:
@@ -1544,6 +1641,7 @@ __all__ = [
     "V8ItemInstance",
     "V8ItemInstances",
     "V8Level",
+    "V8LevelTable",
     "V8Linkage",
     "V8MeshFace",
     "V8Model",
@@ -1561,6 +1659,7 @@ __all__ = [
     "V8TagDefinition",
     "V8TagSet",
     "LEVEL_TABLE_ELEMENT_TYPE",
+    "LEVEL_TABLE_HEADER_ELEMENT_TYPE",
     "LEVEL_TABLE_KIND",
     "NAME_LINKAGE_SIGNATURE",
     "SYMBOLOGY_BY_CELL",
@@ -1579,6 +1678,7 @@ __all__ = [
     "decode_tag_set",
     "inspect_v8_container",
     "level_table",
+    "level_tables",
     "read_v8",
     "read_v8_shared_cell_definitions",
     "read_v8file",

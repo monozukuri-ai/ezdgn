@@ -318,6 +318,30 @@ the color index on the MicroStation file and was 0 on the DWG conversion;
 `0x28`, `0x2c` and `0x60` vary by file and remain unresolved. Element headers
 use `0xffffffff` (ByLevel) and `0xfffffffe` (ByCell) in their symbology words.
 
+### Level tables
+
+In the checked-in fixture the level entry is a component that directly follows
+a type-96 header object in the same named page, and the header's `level` word
+(`0x0c`) is 1 like the entry's. That header is 64 bytes, has element ID 1 and
+no linkages. The fixture has two more type-96 headers, with `level` words 4
+and 2; the one with 2 is followed by one type-95 entry whose `level` word is
+also 2. In all three, the `u32` at `0x20` equals the number of type-95 entries
+that follow (1, 0 and 1); the reader does not use that count.
+
+`level_tables()` groups level entries on that structure. It reads the named
+objects in file order, across pages:
+
+- a type-96 object that is not a component ends the open table, and starts a
+  new level table when its `level` word is 1;
+- a type-95 entry with `level` word 1 joins the open table, or starts a table
+  without a header when none is open;
+- any other object that is not a component ends the open table.
+
+Tables are never merged, so a level ID that several tables define stays one
+entry per table. The fixture has a single level table. Files with several are
+covered by constructed objects only: no rule for which table is the file's own
+has been observed, and none is applied.
+
 ## Shared-cell definitions
 
 A shared-cell definition is a type-34 header object in the named object pages

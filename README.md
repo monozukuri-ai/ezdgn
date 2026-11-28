@@ -325,7 +325,11 @@ flattened or modified. V8 3D geometry uses an XY preview projection, and
 orientation matrices are retained but not applied by the 2D renderer. V7 text
 does not store its code page, so the caller must select the correct encoding
 for non-ASCII text. Geometry and text with compatible display styles are
-batched to keep large previews practical.
+batched to keep large previews practical. The visible edges of V8 meshes are
+drawn as compound paths, one or a few per display style, so a mesh costs two
+path vertices per edge instead of a path object per edge.
+`ezdgn.plotting.mesh_edge_path(element.data)` returns the edge path of a
+single mesh for use in your own figures.
 
 ## V7 writer and optional custom seeds
 

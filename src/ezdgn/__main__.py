@@ -440,7 +440,7 @@ def _v8_entity_payload(element: V8Element) -> dict[str, Any]:
     if data.orientation:
         payload["orientation"] = data.orientation
     if data.orientations:
-        payload["orientations"] = data.orientations
+        payload["orientations"] = [list(item) for item in data.orientations]
     if data.transform:
         payload["transform"] = data.transform
     if data.text_bytes is not None:

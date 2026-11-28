@@ -113,10 +113,15 @@ wildcard arm must add them. `DgnError::V8ModelIndexOutOfRange` is a new
 variant of the error enum in the same way. The new enum `V8TagValue` is
 `#[non_exhaustive]`, because other tag value types exist and are not decoded
 yet. A type-37 object that is read as a tag has the kind `TAG` and no longer
-`UNKNOWN`, so Python's `unknown_elements` no longer lists it. Nothing else
-that `read_v8()` returned before changes: a shared-cell definition is
-returned only by the calls that read definitions, and a type-34 header in a
-model is the unknown complex element it was.
+`UNKNOWN`, so Python's `unknown_elements` no longer lists it. Shared-cell
+definition calls read the definitions. A type-34 header in a model keeps its
+existing unknown-complex representation.
+
+Python file readers expose mesh faces, vertices, matrix values and point-string
+orientations as packed sequences. Use `tuple(sequence)` when a caller requires
+a tuple. In Rust, the `Mesh` variant stores `V8MeshFaces`. Use `get()` or
+`iter()` for borrowed faces with `u32` point indices, and `from_arrays()` to
+construct face data.
 
 `read()`, `readfile()`, `scan_records()`, and `inspect_headers()` remain V7
 record APIs and intentionally reject V8/CFB input. This preserves existing V7

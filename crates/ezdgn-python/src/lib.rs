@@ -9,9 +9,9 @@ use ezdgn_core::{
     DgnError as CoreDgnError, ElementData2D, LinkageData, MasterPoint, Point2, RawPoint,
     RecordScan, ScanOptions, V7Document2D, V7ElementStyle, V7WriteOptions, V8AuxiliaryEntry,
     V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element, V8ElementData,
-    V8ItemInstance, V8ItemValue, V8Linkage, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point,
-    V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions, V8TagSet,
-    V8TagValue, WritableElement2D,
+    V8ItemInstance, V8ItemValue, V8Linkage, V8MeshFaces, V8ModelMetadata, V8ObjectPage,
+    V8ObjectRole, V8Point, V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions,
+    V8ScanOptions, V8TagSet, V8TagValue, WritableElement2D,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1029,25 +1029,28 @@ fn v8_element_data_dict<'py>(
     result.set_item("kind", data.kind_name())?;
     match data {
         V8ElementData::Line { start, end } => {
-            result.set_item("vertices", [v8_point_row(*start), v8_point_row(*end)])?;
+            result.set_item("vertices", v8_packed_points(py, &[*start, *end])?)?;
         }
         V8ElementData::LineString { vertices }
         | V8ElementData::Shape { vertices }
         | V8ElementData::Curve { vertices }
         | V8ElementData::BSplinePole { vertices } => {
-            result.set_item("vertices", v8_point_rows(vertices))?;
+            result.set_item("vertices", v8_packed_points(py, vertices)?)?;
         }
         V8ElementData::PointString {
             vertices,
             orientations,
         } => {
-            result.set_item("vertices", v8_point_rows(vertices))?;
+            result.set_item("vertices", v8_packed_points(py, vertices)?)?;
             result.set_item(
                 "orientations",
-                orientations
-                    .iter()
-                    .map(|orientation| orientation.values)
-                    .collect::<Vec<_>>(),
+                packed_f64(
+                    py,
+                    orientations.len() * ORIENTATION_VALUES,
+                    orientations
+                        .iter()
+                        .flat_map(|orientation| orientation.values),
+                )?,
             )?;
         }
         V8ElementData::Text {
@@ -1205,14 +1208,8 @@ fn v8_element_data_dict<'py>(
         } => {
             result.set_item("child_count", *child_count)?;
             result.set_item("style", *style)?;
-            result.set_item("vertices", v8_point_rows(points))?;
-            result.set_item(
-                "faces",
-                faces
-                    .iter()
-                    .map(|face| (face.point_indices.clone(), face.visible_edges.clone()))
-                    .collect::<Vec<_>>(),
-            )?;
+            result.set_item("vertices", v8_packed_points(py, points)?)?;
+            result.set_item("faces", v8_packed_mesh_faces(py, faces)?)?;
         }
         V8ElementData::MatrixHeader {
             child_count,
@@ -1222,10 +1219,11 @@ fn v8_element_data_dict<'py>(
             result.set_item("columns", *columns)?;
         }
         V8ElementData::MatrixIntegerData { values } => {
-            result.set_item("values", values)?;
+            result.set_item("values", (PACKED_I32_FORMAT, packed_i32(py, values)?))?;
         }
         V8ElementData::MatrixDoubleData { values } => {
-            result.set_item("values", values)?;
+            let data = packed_f64(py, values.len(), values.iter().copied())?;
+            result.set_item("values", (PACKED_F64_FORMAT, data))?;
         }
         V8ElementData::Unknown => {}
     }
@@ -1263,8 +1261,105 @@ fn v8_point_row(point: V8Point) -> V8PointRow {
     (v8_point3_row(point.uor), v8_point3_row(point.master))
 }
 
-fn v8_point_rows(points: &[V8Point]) -> Vec<V8PointRow> {
-    points.iter().copied().map(v8_point_row).collect()
+const F64_BYTES: usize = 8;
+const I32_BYTES: usize = 4;
+const U32_BYTES: usize = 4;
+const POINT_COMPONENTS: usize = 3;
+const ORIENTATION_VALUES: usize = 4;
+/// `struct` format characters that tell Python how a packed value buffer is typed.
+const PACKED_F64_FORMAT: &str = "d";
+const PACKED_I32_FORMAT: &str = "i";
+
+/// Coordinates of a point list as packed little-endian `f64` XYZ triples: one
+/// buffer in UOR and one in master units.
+type V8PackedPoints<'py> = (Bound<'py, PyBytes>, Bound<'py, PyBytes>);
+/// Face loops of a mesh as packed arrays: `u32` offsets (one per face plus a
+/// final one) into the `u32` zero-based point indices, and one visibility byte
+/// per index.
+type V8PackedMeshFaces<'py> = (
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+);
+
+fn v8_packed_points<'py>(py: Python<'py>, points: &[V8Point]) -> PyResult<V8PackedPoints<'py>> {
+    let value_count = points.len() * POINT_COMPONENTS;
+    Ok((
+        packed_f64(
+            py,
+            value_count,
+            points.iter().flat_map(|point| point.uor.as_array()),
+        )?,
+        packed_f64(
+            py,
+            value_count,
+            points.iter().flat_map(|point| point.master.as_array()),
+        )?,
+    ))
+}
+
+fn v8_packed_mesh_faces<'py>(
+    py: Python<'py>,
+    faces: &V8MeshFaces,
+) -> PyResult<V8PackedMeshFaces<'py>> {
+    let visible_edges = faces.visible_edges();
+    Ok((
+        packed_u32(py, faces.offsets())?,
+        packed_u32(py, faces.point_indices())?,
+        PyBytes::new_with(py, visible_edges.len(), |buffer| {
+            write_flags(buffer, visible_edges);
+            Ok(())
+        })?,
+    ))
+}
+
+fn packed_u32<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, values.len() * U32_BYTES, |buffer| {
+        write_u32s(buffer, values);
+        Ok(())
+    })
+}
+
+fn packed_f64<'py>(
+    py: Python<'py>,
+    count: usize,
+    values: impl Iterator<Item = f64>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, count * F64_BYTES, |buffer| {
+        write_f64s(buffer, values);
+        Ok(())
+    })
+}
+
+fn packed_i32<'py>(py: Python<'py>, values: &[i32]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, values.len() * I32_BYTES, |buffer| {
+        write_i32s(buffer, values.iter().copied());
+        Ok(())
+    })
+}
+
+fn write_f64s(buffer: &mut [u8], values: impl Iterator<Item = f64>) {
+    for (chunk, value) in buffer.chunks_exact_mut(F64_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_i32s(buffer: &mut [u8], values: impl Iterator<Item = i32>) {
+    for (chunk, value) in buffer.chunks_exact_mut(I32_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_u32s(buffer: &mut [u8], values: &[u32]) {
+    for (chunk, value) in buffer.chunks_exact_mut(U32_BYTES).zip(values) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_flags(buffer: &mut [u8], flags: &[bool]) {
+    for (byte, flag) in buffer.iter_mut().zip(flags) {
+        *byte = u8::from(*flag);
+    }
 }
 
 fn v8_range_i64_row(range: V8Range3I64) -> ([i64; 3], [i64; 3]) {
@@ -1866,4 +1961,32 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_v7_2d_primitives, module)?)?;
     module.add_function(wrap_pyfunction!(write_v7_2d_bytes, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packs_values_as_little_endian_rows() {
+        let mut doubles = [0_u8; 2 * F64_BYTES];
+        write_f64s(&mut doubles, [1.5, -2.0].into_iter());
+        assert_eq!(doubles[..F64_BYTES], 1.5_f64.to_le_bytes());
+        assert_eq!(doubles[F64_BYTES..], (-2.0_f64).to_le_bytes());
+
+        let mut integers = [0_u8; 2 * I32_BYTES];
+        write_i32s(&mut integers, [-3, 7].into_iter());
+        assert_eq!(integers, [0xfd, 0xff, 0xff, 0xff, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn packs_face_arrays_as_little_endian_words_and_flag_bytes() {
+        let mut offsets = [0_u8; 3 * U32_BYTES];
+        write_u32s(&mut offsets, &[0, 3, 0x0102_0304]);
+        assert_eq!(offsets, [0, 0, 0, 0, 3, 0, 0, 0, 4, 3, 2, 1]);
+
+        let mut flags = [0xff_u8; 3];
+        write_flags(&mut flags, &[true, false, true]);
+        assert_eq!(flags, [1, 0, 1]);
+    }
 }

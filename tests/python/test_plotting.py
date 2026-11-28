@@ -115,6 +115,7 @@ def test_meshes_of_one_style_share_a_compound_path(
     figure, axes = ezdgn.plot(document)
 
     assert not axes.collections
+    assert tuple(axes.dataLim.minpos) == (2, 2)
     assert sorted(len(path_edges(patch.get_path())) for patch in axes.patches) == [4, 8]
     shared, other = sorted(axes.patches, key=lambda patch: -len(patch.get_path().codes))
     assert path_edges(shared.get_path())[:4] == MESH_EDGES

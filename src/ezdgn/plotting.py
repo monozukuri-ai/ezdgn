@@ -620,7 +620,8 @@ class _V8Renderer(_Renderer):
 
         color, line_style, line_width = stroke
         del self._mesh_path_edges[stroke]
-        edges = self.Path.make_compound_path(*self._mesh_paths.pop(stroke))
+        paths = self._mesh_paths.pop(stroke)
+        edges = paths[0] if len(paths) == 1 else self.Path.make_compound_path(*paths)
         step = 2 * _MESH_PATH_EDGES
         for first in range(0, len(edges.vertices), step):
             patch = self.PathPatch(
@@ -637,9 +638,7 @@ class _V8Renderer(_Renderer):
             # add_patch() walks a path segment by segment in Python to find
             # its limits; for straight edges the vertices already hold them.
             self.ax.add_artist(patch)
-        self.ax.update_datalim(
-            (edges.vertices.min(axis=0), edges.vertices.max(axis=0))
-        )
+        self.ax.update_datalim(edges.vertices)
 
     def _ellipse_v8(self, element: V8Element, style: BasicStyle) -> None:
         data = element.data

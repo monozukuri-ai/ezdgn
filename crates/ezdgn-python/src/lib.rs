@@ -6,12 +6,12 @@ use ezdgn_core::{
     CommonElementHeader, DesignSettings, DgnError as CoreDgnError, ElementData2D, LinkageData,
     MasterPoint, Point2, RawPoint, RecordScan, ScanOptions, V7Document2D, V7ElementStyle,
     V7WriteOptions, V8AuxiliaryPage, V8AuxiliaryRecord, V8CommonHeader, V8Document, V8Element,
-    V8ElementData, V8Linkage, V8MeshFace, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point,
+    V8ElementData, V8Linkage, V8MeshFaces, V8ModelMetadata, V8ObjectPage, V8ObjectRole, V8Point,
     V8Range3, V8Range3I64, V8RawDocument, V8RawObject, V8ReadOptions, V8ScanOptions,
     WritableElement2D,
 };
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyOverflowError};
+use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -1050,38 +1050,24 @@ fn v8_packed_points<'py>(py: Python<'py>, points: &[V8Point]) -> PyResult<V8Pack
 
 fn v8_packed_mesh_faces<'py>(
     py: Python<'py>,
-    faces: &[V8MeshFace],
+    faces: &V8MeshFaces,
 ) -> PyResult<V8PackedMeshFaces<'py>> {
-    let index_count: usize = faces.iter().map(|face| face.point_indices.len()).sum();
-    let offsets = PyBytes::new_with(py, (faces.len() + 1) * U32_BYTES, |buffer| {
-        write_u32s(buffer, mesh_face_offsets(faces)).map_err(index_overflow)
-    })?;
-    let point_indices = PyBytes::new_with(py, index_count * U32_BYTES, |buffer| {
-        let indices = faces.iter().flat_map(|face| face.point_indices.iter());
-        write_u32s(buffer, indices.copied()).map_err(index_overflow)
-    })?;
-    let visible_edges = PyBytes::new_with(py, index_count, |buffer| {
-        let edges = faces.iter().flat_map(|face| face.visible_edges.iter());
-        for (byte, visible) in buffer.iter_mut().zip(edges) {
-            *byte = u8::from(*visible);
-        }
-        Ok(())
-    })?;
-    Ok((offsets, point_indices, visible_edges))
-}
-
-/// Start of each face in the flattened index array, followed by the total.
-fn mesh_face_offsets(faces: &[V8MeshFace]) -> impl Iterator<Item = usize> + '_ {
-    std::iter::once(0).chain(faces.iter().scan(0_usize, |end, face| {
-        *end += face.point_indices.len();
-        Some(*end)
-    }))
-}
-
-fn index_overflow(value: usize) -> PyErr {
-    PyOverflowError::new_err(format!(
-        "mesh index {value} does not fit the packed 32-bit layout"
+    let visible_edges = faces.visible_edges();
+    Ok((
+        packed_u32(py, faces.offsets())?,
+        packed_u32(py, faces.point_indices())?,
+        PyBytes::new_with(py, visible_edges.len(), |buffer| {
+            write_flags(buffer, visible_edges);
+            Ok(())
+        })?,
     ))
+}
+
+fn packed_u32<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, values.len() * U32_BYTES, |buffer| {
+        write_u32s(buffer, values);
+        Ok(())
+    })
 }
 
 fn packed_f64<'py>(
@@ -1114,13 +1100,16 @@ fn write_i32s(buffer: &mut [u8], values: impl Iterator<Item = i32>) {
     }
 }
 
-/// Writes each value as a little-endian `u32`, or returns the first value that does not fit.
-fn write_u32s(buffer: &mut [u8], values: impl Iterator<Item = usize>) -> Result<(), usize> {
+fn write_u32s(buffer: &mut [u8], values: &[u32]) {
     for (chunk, value) in buffer.chunks_exact_mut(U32_BYTES).zip(values) {
-        let narrow = u32::try_from(value).map_err(|_| value)?;
-        chunk.copy_from_slice(&narrow.to_le_bytes());
+        chunk.copy_from_slice(&value.to_le_bytes());
     }
-    Ok(())
+}
+
+fn write_flags(buffer: &mut [u8], flags: &[bool]) {
+    for (byte, flag) in buffer.iter_mut().zip(flags) {
+        *byte = u8::from(*flag);
+    }
 }
 
 fn v8_range_i64_row(range: V8Range3I64) -> ([i64; 3], [i64; 3]) {
@@ -1704,13 +1693,6 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
-    fn face(point_indices: &[usize], visible_edges: &[bool]) -> V8MeshFace {
-        V8MeshFace {
-            point_indices: point_indices.to_vec(),
-            visible_edges: visible_edges.to_vec(),
-        }
-    }
-
     #[test]
     fn packs_values_as_little_endian_rows() {
         let mut doubles = [0_u8; 2 * F64_BYTES];
@@ -1724,28 +1706,13 @@ mod tests {
     }
 
     #[test]
-    fn mesh_face_offsets_bound_each_face_in_the_flattened_indices() {
-        let faces = [
-            face(&[0, 1, 2], &[true, true, false]),
-            face(&[0, 3, 1, 2], &[true, true, true, true]),
-        ];
-        assert_eq!(mesh_face_offsets(&faces).collect::<Vec<_>>(), [0, 3, 7]);
-        assert_eq!(mesh_face_offsets(&[]).collect::<Vec<_>>(), [0]);
-
+    fn packs_face_arrays_as_little_endian_words_and_flag_bytes() {
         let mut offsets = [0_u8; 3 * U32_BYTES];
-        write_u32s(&mut offsets, mesh_face_offsets(&faces)).unwrap();
-        assert_eq!(offsets, [0, 0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0]);
-    }
+        write_u32s(&mut offsets, &[0, 3, 0x0102_0304]);
+        assert_eq!(offsets, [0, 0, 0, 0, 3, 0, 0, 0, 4, 3, 2, 1]);
 
-    #[test]
-    fn an_index_beyond_32_bits_is_reported_instead_of_truncated() {
-        let Ok(too_large) = usize::try_from(u64::from(u32::MAX) + 1) else {
-            return;
-        };
-        let mut buffer = [0_u8; U32_BYTES];
-        assert_eq!(
-            write_u32s(&mut buffer, [too_large].into_iter()),
-            Err(too_large)
-        );
+        let mut flags = [0xff_u8; 3];
+        write_flags(&mut flags, &[true, false, true]);
+        assert_eq!(flags, [1, 0, 1]);
     }
 }

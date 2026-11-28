@@ -8,6 +8,7 @@ import struct
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import pairwise
 from typing import Any, Iterator, Literal, TypeAlias, TypeVar, cast, overload
 
 from ._core import (
@@ -293,9 +294,21 @@ def _as_bytes(data: bytes | bytearray | memoryview) -> bytes:
     return data if isinstance(data, bytes) else bytes(memoryview(data))
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=32)
 def _value_struct(format: str, width: int) -> struct.Struct:
     return struct.Struct(f"<{width}{format}")
+
+
+def _hash_value(value: Any) -> Any:
+    # Unpacking creates a new float. Python hashes NaNs by identity, so
+    # identical buffers need a shared NaN when computing their tuple hash.
+    if isinstance(value, float) and math.isnan(value):
+        return math.nan
+    if isinstance(value, tuple):
+        return tuple(_hash_value(part) for part in value)
+    if isinstance(value, V8Point):
+        return V8Point(_hash_value(value.uor), _hash_value(value.master))
+    return value
 
 
 class _PackedSequence(Sequence[_Item]):
@@ -344,7 +357,7 @@ class _PackedSequence(Sequence[_Item]):
         )
 
     def __hash__(self) -> int:
-        return hash(tuple(self))
+        return hash(tuple(_hash_value(item) for item in self))
 
     def __add__(self, other: object) -> tuple[Any, ...]:
         if isinstance(other, (tuple, _PackedSequence)):
@@ -462,6 +475,9 @@ class V8MeshFaceArray(_PackedSequence[V8MeshFace]):
                 "one, running from 0 to the number of point indices, and "
                 "visible_edges must hold one byte per point index"
             )
+        boundaries = _FACE_OFFSET_STRUCT.iter_unpack(offsets)
+        if any(start > end for (start,), (end,) in pairwise(boundaries)):
+            raise ValueError("face offsets must be nondecreasing")
         self._offsets = offsets
         self._point_indices = point_indices
         self._visible_edges = visible_edges
@@ -551,12 +567,16 @@ class V8ValueArray(_PackedSequence[Any]):
     def from_values(
         cls, format: Literal["d", "i"], values: Iterable[Any], width: int = 1
     ) -> V8ValueArray:
-        numbers = [
-            number
-            for item in values
-            for number in ((item,) if width == 1 else item)
-        ]
-        return cls(format, struct.pack(f"<{len(numbers)}{format}", *numbers), width)
+        if format not in _PACKED_VALUE_FORMATS or width < 1:
+            raise ValueError("format must be 'd' or 'i' and width must be positive")
+        item_struct = _value_struct(format, width)
+        data = bytearray()
+        for value in values:
+            row = (value,) if width == 1 else tuple(value)
+            if len(row) != width:
+                raise ValueError(f"expected {width} numbers per item")
+            data.extend(item_struct.pack(*row))
+        return cls(format, bytes(data), width)
 
     @property
     def format(self) -> Literal["d", "i"]:

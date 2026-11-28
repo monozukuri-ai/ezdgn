@@ -117,6 +117,24 @@ def test_equal_values_compare_equal_when_their_bytes_differ() -> None:
     assert integers == V8ValueArray.from_values("d", (1.0, 2.0))
 
 
+def test_equal_nan_buffers_work_as_dictionary_keys() -> None:
+    nan = float("nan")
+    point = V8Point((nan, 1, 2), (0, nan, 2))
+    for first in (
+        V8PointArray.from_points((point,)),
+        V8ValueArray.from_values("d", (nan,) * 5),
+        V8ValueArray.from_values("d", ((1, nan),), width=2),
+    ):
+        second = pickle.loads(pickle.dumps(first))
+        assert first == second
+        assert {first: 1}[second] == 1
+
+
+def test_value_array_checks_the_width_of_each_input_row() -> None:
+    with pytest.raises(ValueError, match="2 numbers per item"):
+        V8ValueArray.from_values("i", [(1,), (2, 3, 4)], width=2)
+
+
 def test_file_orientations_are_packed_quadruples() -> None:
     data = ezdgn.read_v8(V8).models[0].elements[POINT_STRING_INDEX].data
 
@@ -176,6 +194,8 @@ def test_mesh_face_array_rejects_inconsistent_buffers() -> None:
     for arguments in (
         (b"", b"", b""),
         (offsets[:-1], point_indices, visible_edges),
+        (struct.pack("<4I", 0, 5, 3, 7), point_indices, visible_edges),
+        (struct.pack("<3I", 0, 8, 7), point_indices, visible_edges),
         (offsets, point_indices[:-4], visible_edges),
         (offsets, point_indices, visible_edges[:-1]),
         (struct.pack("<3I", 1, 3, 7), point_indices, visible_edges),

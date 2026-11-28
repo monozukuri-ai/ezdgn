@@ -442,6 +442,20 @@ def test_a_tag_set_code_outside_the_primary_bytes_makes_no_tag_set() -> None:
     assert replace(document, raw=raw).tag_set(300) == EXPECTED
 
 
+def test_bulk_tag_set_lookup_uses_existing_raw_buffers(monkeypatch) -> None:
+    document = ezdgn.read_v8(V8)
+    page = document.raw.named_pages[0]
+    item = _named_object(300, _primary(DEFINITIONS), _name_linkage(b"Grove"))
+    raw = replace(document.raw, named_pages=(replace(page, objects=(item,)),))
+
+    def copied_slice(_):
+        pytest.fail("bulk lookup copied a raw object before applying the byte budget")
+
+    for field in ("primary_bytes", "attribute_bytes"):
+        monkeypatch.setattr(ezdgn.V8RawObject, field, property(copied_slice))
+    assert tag_sets(raw) == (EXPECTED,)
+
+
 def test_tag_set_decoding_is_bounded() -> None:
     assert V8_MAX_TAG_SET_BYTES == 1_048_576
 

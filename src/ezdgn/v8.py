@@ -920,8 +920,8 @@ def tag_sets(raw: V8RawDocument) -> tuple[V8TagSet, ...]:
         "list[dict[str, Any]]",
         _decode_v8_tag_sets_data(
             [
-                (item.element_id, item.primary_bytes, item.attribute_bytes)
-                for item in tag_set_objects(raw)
+                (item.element_id, item.raw_bytes, item.attribute_words * 2)
+                for item in _iter_tag_set_objects(raw)
                 if item.element_id is not None
             ]
         ),

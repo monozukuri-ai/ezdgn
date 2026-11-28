@@ -384,17 +384,16 @@ fn decode_v8_tag_set_data(
 }
 
 /// Decode the tag sets among the given named objects, each as its element
-/// ID, primary bytes and attribute bytes, under the byte limit of one call.
+/// ID, full raw bytes and attribute offset, under the byte limit of one call.
 #[pyfunction]
 fn decode_v8_tag_sets_data(
     py: Python<'_>,
-    objects: Vec<(u64, Bound<'_, PyBytes>, Bound<'_, PyBytes>)>,
+    objects: Vec<(u64, Bound<'_, PyBytes>, usize)>,
 ) -> PyResult<Py<PyList>> {
-    let sets = decode_v8_tag_set_parts(
-        objects
-            .iter()
-            .map(|(id, primary, attributes)| (*id, primary.as_bytes(), attributes.as_bytes())),
-    );
+    let sets = decode_v8_tag_set_parts(objects.iter().filter_map(|(id, raw, offset)| {
+        let (primary, attributes) = raw.as_bytes().split_at_checked(*offset)?;
+        Some((*id, primary, attributes))
+    }));
     let result = PyList::empty(py);
     for set in &sets {
         result.append(v8_tag_set_dict(py, set)?)?;

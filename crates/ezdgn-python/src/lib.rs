@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 
@@ -299,21 +300,31 @@ fn read_v8_shared_cells(
         core_read_v8_shared_cell_definitions(data, v8_scan_options(&limits)?, model_index)
             .map_err(core_error_to_python)?;
     let result = PyList::empty(py);
+    let mut paths = HashMap::new();
     for definition in &definitions {
         let value = PyDict::new(py);
-        value.set_item("name", &definition.name)?;
+        value.set_item(intern!(py, "name"), &definition.name)?;
         let elements = PyList::empty(py);
         for element in &definition.elements {
             let row = v8_element_dict(py, element)?;
-            row.set_item("raw", v8_raw_object_dict(py, &element.raw)?)?;
+            let path = paths
+                .entry(element.raw.stream_path.as_str())
+                .or_insert_with(|| V8SharedPath::new(py, &element.raw.stream_path));
+            row.set_item(
+                intern!(py, "raw"),
+                v8_raw_object_dict(py, &element.raw, path)?,
+            )?;
             let auxiliary = PyList::empty(py);
             for record in &element.auxiliary_records {
-                auxiliary.append(v8_auxiliary_record_dict(py, record)?)?;
+                let path = paths
+                    .entry(record.stream_path.as_str())
+                    .or_insert_with(|| V8SharedPath::new(py, &record.stream_path));
+                auxiliary.append(v8_auxiliary_record_dict(py, record, path)?)?;
             }
-            row.set_item("auxiliary_records", auxiliary)?;
+            row.set_item(intern!(py, "auxiliary_records"), auxiliary)?;
             elements.append(row)?;
         }
-        value.set_item("elements", elements)?;
+        value.set_item(intern!(py, "elements"), elements)?;
         result.append(value)?;
     }
     Ok(result.unbind())
@@ -403,19 +414,19 @@ fn decode_v8_tag_sets_data(
 
 fn v8_tag_set_dict<'py>(py: Python<'py>, set: &V8TagSet) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("element_id", set.element_id)?;
-    result.set_item("name", &set.name)?;
+    result.set_item(intern!(py, "element_id"), set.element_id)?;
+    result.set_item(intern!(py, "name"), &set.name)?;
     let definitions = PyList::empty(py);
     for definition in &set.definitions {
         let value = PyDict::new(py);
-        value.set_item("name", &definition.name)?;
-        value.set_item("tag_id", definition.tag_id)?;
-        value.set_item("prompt", &definition.prompt)?;
-        value.set_item("value_type", definition.value_type)?;
-        set_v8_tag_value(&value, "default", Some(&definition.default))?;
+        value.set_item(intern!(py, "name"), &definition.name)?;
+        value.set_item(intern!(py, "tag_id"), definition.tag_id)?;
+        value.set_item(intern!(py, "prompt"), &definition.prompt)?;
+        value.set_item(intern!(py, "value_type"), definition.value_type)?;
+        set_v8_tag_value(&value, intern!(py, "default"), Some(&definition.default))?;
         definitions.append(value)?;
     }
-    result.set_item("definitions", definitions)?;
+    result.set_item(intern!(py, "definitions"), definitions)?;
     Ok(result)
 }
 
@@ -661,19 +672,22 @@ fn v8_scan_options(limits: &[usize]) -> PyResult<V8ScanOptions> {
 
 fn v8_document_dict<'py>(py: Python<'py>, document: &V8Document) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("raw", v8_raw_document_dict(py, &document.raw)?)?;
+    result.set_item(intern!(py, "raw"), v8_raw_document_dict(py, &document.raw)?)?;
     let models = PyList::empty(py);
     for model in &document.models {
         let value = PyDict::new(py);
-        value.set_item("metadata", v8_model_metadata_dict(py, &model.metadata)?)?;
+        value.set_item(
+            intern!(py, "metadata"),
+            v8_model_metadata_dict(py, &model.metadata)?,
+        )?;
         let elements = PyList::empty(py);
         for element in &model.elements {
             elements.append(v8_element_dict(py, element)?)?;
         }
-        value.set_item("elements", elements)?;
+        value.set_item(intern!(py, "elements"), elements)?;
         models.append(value)?;
     }
-    result.set_item("models", models)?;
+    result.set_item(intern!(py, "models"), models)?;
     Ok(result)
 }
 
@@ -682,51 +696,69 @@ fn v8_raw_document_dict<'py>(
     document: &V8RawDocument,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("container", v8_container_dict(py, &document.container)?)?;
-    result.set_item("total_inflated_bytes", document.total_inflated_bytes)?;
-    result.set_item("graphical_object_count", document.graphical_object_count())?;
-    result.set_item("total_object_count", document.total_object_count())?;
-    result.set_item("skipped_models", document.skipped_models.clone())?;
+    result.set_item(
+        intern!(py, "container"),
+        v8_container_dict(py, &document.container)?,
+    )?;
+    result.set_item(
+        intern!(py, "total_inflated_bytes"),
+        document.total_inflated_bytes,
+    )?;
+    result.set_item(
+        intern!(py, "graphical_object_count"),
+        document.graphical_object_count(),
+    )?;
+    result.set_item(
+        intern!(py, "total_object_count"),
+        document.total_object_count(),
+    )?;
+    result.set_item(
+        intern!(py, "skipped_models"),
+        document.skipped_models.clone(),
+    )?;
 
     let models = PyList::empty(py);
     for model in &document.models {
         let value = PyDict::new(py);
-        value.set_item("index", v8_model_index_dict(py, &model.index)?)?;
-        value.set_item("storage_path", &model.storage_path)?;
-        value.set_item("model_header_stream_path", &model.model_header_stream.path)?;
+        value.set_item(intern!(py, "index"), v8_model_index_dict(py, &model.index)?)?;
+        value.set_item(intern!(py, "storage_path"), &model.storage_path)?;
         value.set_item(
-            "model_header_stream_bytes",
+            intern!(py, "model_header_stream_path"),
+            &model.model_header_stream.path,
+        )?;
+        value.set_item(
+            intern!(py, "model_header_stream_bytes"),
             PyBytes::new(py, model.model_header_stream.as_bytes()),
         )?;
         value.set_item(
-            "model_header_bytes",
+            intern!(py, "model_header_bytes"),
             PyBytes::new(py, model.model_header_bytes.as_ref()),
         )?;
         value.set_item(
-            "graphical_pages",
+            intern!(py, "graphical_pages"),
             v8_object_pages_list(py, &model.graphical_pages)?,
         )?;
         value.set_item(
-            "graphical_auxiliary_pages",
+            intern!(py, "graphical_auxiliary_pages"),
             v8_auxiliary_pages_list(py, &model.graphical_auxiliary_pages)?,
         )?;
         value.set_item(
-            "control_pages",
+            intern!(py, "control_pages"),
             v8_object_pages_list(py, &model.control_pages)?,
         )?;
         value.set_item(
-            "control_auxiliary_pages",
+            intern!(py, "control_auxiliary_pages"),
             v8_auxiliary_pages_list(py, &model.control_auxiliary_pages)?,
         )?;
         models.append(value)?;
     }
-    result.set_item("models", models)?;
+    result.set_item(intern!(py, "models"), models)?;
     result.set_item(
-        "named_pages",
+        intern!(py, "named_pages"),
         v8_object_pages_list(py, &document.named_pages)?,
     )?;
     result.set_item(
-        "named_auxiliary_pages",
+        intern!(py, "named_auxiliary_pages"),
         v8_auxiliary_pages_list(py, &document.named_auxiliary_pages)?,
     )?;
     Ok(result)
@@ -737,15 +769,21 @@ fn v8_container_dict<'py>(
     container: &ezdgn_core::V8ContainerInfo,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("cfb_version", container.cfb_version)?;
-    result.set_item("has_dgn_v8_markers", container.has_dgn_v8_markers)?;
-    result.set_item("missing_markers", &container.missing_markers)?;
-    result.set_item("model_storage_paths", &container.model_storage_paths)?;
+    result.set_item(intern!(py, "cfb_version"), container.cfb_version)?;
+    result.set_item(
+        intern!(py, "has_dgn_v8_markers"),
+        container.has_dgn_v8_markers,
+    )?;
+    result.set_item(intern!(py, "missing_markers"), &container.missing_markers)?;
+    result.set_item(
+        intern!(py, "model_storage_paths"),
+        &container.model_storage_paths,
+    )?;
     let entries = PyList::empty(py);
     for entry in &container.entries {
         entries.append((&entry.path, entry.kind.as_str(), entry.size_bytes))?;
     }
-    result.set_item("entries", entries)?;
+    result.set_item(intern!(py, "entries"), entries)?;
     Ok(result)
 }
 
@@ -754,15 +792,18 @@ fn v8_model_index_dict<'py>(
     entry: &ezdgn_core::V8ModelIndexEntry,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("index", entry.index)?;
-    result.set_item("raw_number", entry.raw_number)?;
-    result.set_item("storage_index", entry.storage_index)?;
-    result.set_item("model_number", entry.model_number)?;
-    result.set_item("flags", entry.flags)?;
-    result.set_item("model_id", entry.model_id)?;
-    result.set_item("name", &entry.name)?;
-    result.set_item("description", &entry.description)?;
-    result.set_item("raw_bytes", PyBytes::new(py, entry.raw_bytes.as_ref()))?;
+    result.set_item(intern!(py, "index"), entry.index)?;
+    result.set_item(intern!(py, "raw_number"), entry.raw_number)?;
+    result.set_item(intern!(py, "storage_index"), entry.storage_index)?;
+    result.set_item(intern!(py, "model_number"), entry.model_number)?;
+    result.set_item(intern!(py, "flags"), entry.flags)?;
+    result.set_item(intern!(py, "model_id"), entry.model_id)?;
+    result.set_item(intern!(py, "name"), &entry.name)?;
+    result.set_item(intern!(py, "description"), &entry.description)?;
+    result.set_item(
+        intern!(py, "raw_bytes"),
+        PyBytes::new(py, entry.raw_bytes.as_ref()),
+    )?;
     Ok(result)
 }
 
@@ -771,10 +812,10 @@ fn v8_page_header_dict<'py>(
     header: ezdgn_core::V8PageHeader,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("record_count", header.record_count)?;
-    result.set_item("format_version", header.format_version)?;
-    result.set_item("page_number", header.page_number)?;
-    result.set_item("population", header.population)?;
+    result.set_item(intern!(py, "record_count"), header.record_count)?;
+    result.set_item(intern!(py, "format_version"), header.format_version)?;
+    result.set_item(intern!(py, "page_number"), header.page_number)?;
+    result.set_item(intern!(py, "population"), header.population)?;
     Ok(result)
 }
 
@@ -785,37 +826,82 @@ fn v8_object_pages_list<'py>(
     let result = PyList::empty(py);
     for page in pages {
         let value = PyDict::new(py);
-        value.set_item("stream_path", &page.stream_path)?;
-        value.set_item("family", page.family.as_str())?;
-        value.set_item("header", v8_page_header_dict(py, page.header)?)?;
-        value.set_item("inflated_size", page.inflated_size)?;
+        let stream_path = V8SharedPath::new(py, &page.stream_path);
+        value.set_item(intern!(py, "stream_path"), &stream_path.shared)?;
+        value.set_item(
+            intern!(py, "family"),
+            PyString::intern(py, page.family.as_str()),
+        )?;
+        value.set_item(intern!(py, "header"), v8_page_header_dict(py, page.header)?)?;
+        value.set_item(intern!(py, "inflated_size"), page.inflated_size)?;
         let objects = PyList::empty(py);
         for object in &page.objects {
-            objects.append(v8_raw_object_dict(py, object)?)?;
+            objects.append(v8_raw_object_dict(py, object, &stream_path)?)?;
         }
-        value.set_item("objects", objects)?;
+        value.set_item(intern!(py, "objects"), objects)?;
         result.append(value)?;
     }
     Ok(result)
 }
 
-fn v8_raw_object_dict<'py>(py: Python<'py>, object: &V8RawObject) -> PyResult<Bound<'py, PyDict>> {
+/// The Python string of a page's stream path, shared by the rows of the
+/// page instead of being copied into each of them.
+struct V8SharedPath<'a, 'py> {
+    text: &'a str,
+    shared: Bound<'py, PyString>,
+}
+
+impl<'a, 'py> V8SharedPath<'a, 'py> {
+    fn new(py: Python<'py>, text: &'a str) -> Self {
+        Self {
+            text,
+            shared: PyString::new(py, text),
+        }
+    }
+
+    /// The shared string when `text` is the page's path, else its own string.
+    fn get(&self, text: &str) -> Bound<'py, PyString> {
+        if text == self.text {
+            self.shared.clone()
+        } else {
+            PyString::new(self.shared.py(), text)
+        }
+    }
+}
+
+fn v8_raw_object_dict<'py>(
+    py: Python<'py>,
+    object: &V8RawObject,
+    page_path: &V8SharedPath<'_, 'py>,
+) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("index", object.index)?;
-    result.set_item("page_index", object.page_index)?;
-    result.set_item("family", object.family.as_str())?;
-    result.set_item("stream_path", &object.stream_path)?;
-    result.set_item("inflated_offset", object.inflated_offset)?;
-    result.set_item("framing_prefix", object.framing_prefix)?;
-    result.set_item("type_and_flags", object.type_and_flags)?;
-    result.set_item("element_type", object.element_type)?;
-    result.set_item("role", v8_role_name(object.role))?;
-    result.set_item("words", object.words)?;
-    result.set_item("attribute_words", object.attribute_words)?;
-    result.set_item("level", object.level)?;
-    result.set_item("element_id", object.element_id)?;
-    result.set_item("model_id", object.model_id)?;
-    result.set_item("raw_bytes", PyBytes::new(py, object.as_bytes()))?;
+    result.set_item(intern!(py, "index"), object.index)?;
+    result.set_item(intern!(py, "page_index"), object.page_index)?;
+    result.set_item(
+        intern!(py, "family"),
+        PyString::intern(py, object.family.as_str()),
+    )?;
+    result.set_item(
+        intern!(py, "stream_path"),
+        page_path.get(&object.stream_path),
+    )?;
+    result.set_item(intern!(py, "inflated_offset"), object.inflated_offset)?;
+    result.set_item(intern!(py, "framing_prefix"), object.framing_prefix)?;
+    result.set_item(intern!(py, "type_and_flags"), object.type_and_flags)?;
+    result.set_item(intern!(py, "element_type"), object.element_type)?;
+    result.set_item(
+        intern!(py, "role"),
+        PyString::intern(py, v8_role_name(object.role)),
+    )?;
+    result.set_item(intern!(py, "words"), object.words)?;
+    result.set_item(intern!(py, "attribute_words"), object.attribute_words)?;
+    result.set_item(intern!(py, "level"), object.level)?;
+    result.set_item(intern!(py, "element_id"), object.element_id)?;
+    result.set_item(intern!(py, "model_id"), object.model_id)?;
+    result.set_item(
+        intern!(py, "raw_bytes"),
+        PyBytes::new(py, object.as_bytes()),
+    )?;
     Ok(result)
 }
 
@@ -835,14 +921,15 @@ fn v8_auxiliary_pages_list<'py>(
     let result = PyList::empty(py);
     for page in pages {
         let value = PyDict::new(py);
-        value.set_item("stream_path", &page.stream_path)?;
-        value.set_item("header", v8_page_header_dict(py, page.header)?)?;
-        value.set_item("inflated_size", page.inflated_size)?;
+        let stream_path = V8SharedPath::new(py, &page.stream_path);
+        value.set_item(intern!(py, "stream_path"), &stream_path.shared)?;
+        value.set_item(intern!(py, "header"), v8_page_header_dict(py, page.header)?)?;
+        value.set_item(intern!(py, "inflated_size"), page.inflated_size)?;
         let records = PyList::empty(py);
         for record in &page.records {
-            records.append(v8_auxiliary_record_dict(py, record)?)?;
+            records.append(v8_auxiliary_record_dict(py, record, &stream_path)?)?;
         }
-        value.set_item("records", records)?;
+        value.set_item(intern!(py, "records"), records)?;
         result.append(value)?;
     }
     Ok(result)
@@ -851,18 +938,25 @@ fn v8_auxiliary_pages_list<'py>(
 fn v8_auxiliary_record_dict<'py>(
     py: Python<'py>,
     record: &V8AuxiliaryRecord,
+    page_path: &V8SharedPath<'_, 'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("index", record.index)?;
-    result.set_item("stream_path", &record.stream_path)?;
-    result.set_item("inflated_offset", record.inflated_offset)?;
-    result.set_item("magic", record.magic)?;
-    result.set_item("kind", record.kind)?;
-    result.set_item("reserved", record.reserved)?;
-    result.set_item("element_id", record.element_id)?;
-    result.set_item("flags", record.flags)?;
-    result.set_item("raw_bytes", PyBytes::new(py, record.as_bytes()))?;
-    result.set_item("payload", PyBytes::new(py, record.payload()))?;
+    result.set_item(intern!(py, "index"), record.index)?;
+    result.set_item(
+        intern!(py, "stream_path"),
+        page_path.get(&record.stream_path),
+    )?;
+    result.set_item(intern!(py, "inflated_offset"), record.inflated_offset)?;
+    result.set_item(intern!(py, "magic"), record.magic)?;
+    result.set_item(intern!(py, "kind"), record.kind)?;
+    result.set_item(intern!(py, "reserved"), record.reserved)?;
+    result.set_item(intern!(py, "element_id"), record.element_id)?;
+    result.set_item(intern!(py, "flags"), record.flags)?;
+    result.set_item(
+        intern!(py, "raw_bytes"),
+        PyBytes::new(py, record.as_bytes()),
+    )?;
+    result.set_item(intern!(py, "payload"), PyBytes::new(py, record.payload()))?;
     Ok(result)
 }
 
@@ -873,13 +967,13 @@ fn v8_auxiliary_entries_list<'py>(
     let result = PyList::empty(py);
     for entry in entries {
         let value = PyDict::new(py);
-        value.set_item("index", entry.index)?;
-        value.set_item("offset", entry.offset)?;
-        value.set_item("type_id", entry.type_id)?;
-        value.set_item("entry_id", entry.entry_id)?;
-        value.set_item("size_word", entry.size_word)?;
-        value.set_item("reserved", entry.reserved)?;
-        value.set_item("data", PyBytes::new(py, entry.data()))?;
+        value.set_item(intern!(py, "index"), entry.index)?;
+        value.set_item(intern!(py, "offset"), entry.offset)?;
+        value.set_item(intern!(py, "type_id"), entry.type_id)?;
+        value.set_item(intern!(py, "entry_id"), entry.entry_id)?;
+        value.set_item(intern!(py, "size_word"), entry.size_word)?;
+        value.set_item(intern!(py, "reserved"), entry.reserved)?;
+        value.set_item(intern!(py, "data"), PyBytes::new(py, entry.data()))?;
         result.append(value)?;
     }
     Ok(result)
@@ -924,19 +1018,20 @@ impl<'py> ItemStrings<'py> {
     }
 
     fn instance_dict(&mut self, item: &V8ItemInstance) -> PyResult<Bound<'py, PyDict>> {
-        let result = PyDict::new(self.py);
-        result.set_item("entry_id", item.entry_id)?;
-        result.set_item("schema_element_id", item.schema_element_id)?;
-        result.set_item("class_name", self.text(&item.class_name))?;
-        result.set_item("attributes", self.pairs(&item.attributes)?)?;
-        result.set_item("properties", self.pairs(&item.properties)?)?;
+        let py = self.py;
+        let result = PyDict::new(py);
+        result.set_item(intern!(py, "entry_id"), item.entry_id)?;
+        result.set_item(intern!(py, "schema_element_id"), item.schema_element_id)?;
+        result.set_item(intern!(py, "class_name"), self.text(&item.class_name))?;
+        result.set_item(intern!(py, "attributes"), self.pairs(&item.attributes)?)?;
+        result.set_item(intern!(py, "properties"), self.pairs(&item.properties)?)?;
         Ok(result)
     }
 }
 
 fn set_v8_tag_value(
     target: &Bound<'_, PyDict>,
-    key: &str,
+    key: &Bound<'_, PyString>,
     value: Option<&V8TagValue>,
 ) -> PyResult<()> {
     match value {
@@ -952,43 +1047,64 @@ fn v8_model_metadata_dict<'py>(
     metadata: &V8ModelMetadata,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("index", metadata.index)?;
-    result.set_item("storage_path", &metadata.storage_path)?;
-    result.set_item("storage_index", metadata.storage_index)?;
-    result.set_item("model_number", metadata.model_number)?;
-    result.set_item("model_id", metadata.model_id)?;
-    result.set_item("index_model_id", metadata.index_model_id)?;
-    result.set_item("name", &metadata.name)?;
-    result.set_item("description", &metadata.description)?;
-    result.set_item("dimension", metadata.dimension.value())?;
-    result.set_item("type_and_flags", metadata.type_and_flags)?;
-    result.set_item("model_flags", metadata.model_flags)?;
-    result.set_item("uor_per_master", metadata.uor_per_master)?;
-    result.set_item("scale", metadata.scale)?;
+    result.set_item(intern!(py, "index"), metadata.index)?;
+    result.set_item(intern!(py, "storage_path"), &metadata.storage_path)?;
+    result.set_item(intern!(py, "storage_index"), metadata.storage_index)?;
+    result.set_item(intern!(py, "model_number"), metadata.model_number)?;
+    result.set_item(intern!(py, "model_id"), metadata.model_id)?;
+    result.set_item(intern!(py, "index_model_id"), metadata.index_model_id)?;
+    result.set_item(intern!(py, "name"), &metadata.name)?;
+    result.set_item(intern!(py, "description"), &metadata.description)?;
+    result.set_item(intern!(py, "dimension"), metadata.dimension.value())?;
+    result.set_item(intern!(py, "type_and_flags"), metadata.type_and_flags)?;
+    result.set_item(intern!(py, "model_flags"), metadata.model_flags)?;
+    result.set_item(intern!(py, "uor_per_master"), metadata.uor_per_master)?;
+    result.set_item(intern!(py, "scale"), metadata.scale)?;
     result.set_item(
-        "global_origin_uor",
+        intern!(py, "global_origin_uor"),
         v8_point3_row(metadata.global_origin_uor),
     )?;
-    result.set_item("extents_uor", v8_range_i64_row(metadata.extents_uor))?;
-    result.set_item("extents_master", v8_range_row(metadata.extents_master))?;
-    result.set_item("master_unit", &metadata.master_unit)?;
-    result.set_item("sub_unit", &metadata.sub_unit)?;
-    result.set_item("linkages", v8_linkages_list(py, &metadata.linkages)?)?;
-    result.set_item("raw_header", PyBytes::new(py, metadata.raw_header.as_ref()))?;
+    result.set_item(
+        intern!(py, "extents_uor"),
+        v8_range_i64_row(metadata.extents_uor),
+    )?;
+    result.set_item(
+        intern!(py, "extents_master"),
+        v8_range_row(metadata.extents_master),
+    )?;
+    result.set_item(intern!(py, "master_unit"), &metadata.master_unit)?;
+    result.set_item(intern!(py, "sub_unit"), &metadata.sub_unit)?;
+    result.set_item(
+        intern!(py, "linkages"),
+        v8_linkages_list(py, &metadata.linkages)?,
+    )?;
+    result.set_item(
+        intern!(py, "raw_header"),
+        PyBytes::new(py, metadata.raw_header.as_ref()),
+    )?;
     Ok(result)
 }
 
 fn v8_element_dict<'py>(py: Python<'py>, element: &V8Element) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("index", element.index)?;
-    result.set_item("raw_object_index", element.raw.index)?;
-    result.set_item("common", v8_common_header_dict(py, &element.common)?)?;
-    result.set_item("data", v8_element_data_dict(py, &element.data)?)?;
-    result.set_item("parent_index", element.parent_index)?;
-    result.set_item("child_indices", &element.child_indices)?;
-    result.set_item("linkages", v8_linkages_list(py, &element.linkages)?)?;
+    result.set_item(intern!(py, "index"), element.index)?;
+    result.set_item(intern!(py, "raw_object_index"), element.raw.index)?;
     result.set_item(
-        "auxiliary_indices",
+        intern!(py, "common"),
+        v8_common_header_dict(py, &element.common)?,
+    )?;
+    result.set_item(
+        intern!(py, "data"),
+        v8_element_data_dict(py, &element.data)?,
+    )?;
+    result.set_item(intern!(py, "parent_index"), element.parent_index)?;
+    result.set_item(intern!(py, "child_indices"), &element.child_indices)?;
+    result.set_item(
+        intern!(py, "linkages"),
+        v8_linkages_list(py, &element.linkages)?,
+    )?;
+    result.set_item(
+        intern!(py, "auxiliary_indices"),
         element
             .auxiliary_records
             .iter()
@@ -1003,21 +1119,27 @@ fn v8_common_header_dict<'py>(
     common: &V8CommonHeader,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("level", common.level)?;
-    result.set_item("element_id", common.element_id)?;
-    result.set_item("model_id", common.model_id)?;
-    result.set_item("graphic_group", common.graphic_group)?;
-    result.set_item("properties", common.properties)?;
-    result.set_item("geometry_flags", common.geometry_flags)?;
-    result.set_item("line_style", common.line_style)?;
-    result.set_item("line_weight", common.line_weight)?;
-    result.set_item("color_index", common.color_index)?;
-    result.set_item("stored_dimension", common.stored_dimension.value())?;
-    result.set_item("dimension", common.dimension.value())?;
-    result.set_item("range_uor", v8_range_i64_row(common.range_uor))?;
-    result.set_item("range_master", v8_range_row(common.range_master))?;
-    result.set_item("attribute_offset", common.attribute_offset)?;
-    result.set_item("attribute_length", common.attribute_length)?;
+    result.set_item(intern!(py, "level"), common.level)?;
+    result.set_item(intern!(py, "element_id"), common.element_id)?;
+    result.set_item(intern!(py, "model_id"), common.model_id)?;
+    result.set_item(intern!(py, "graphic_group"), common.graphic_group)?;
+    result.set_item(intern!(py, "properties"), common.properties)?;
+    result.set_item(intern!(py, "geometry_flags"), common.geometry_flags)?;
+    result.set_item(intern!(py, "line_style"), common.line_style)?;
+    result.set_item(intern!(py, "line_weight"), common.line_weight)?;
+    result.set_item(intern!(py, "color_index"), common.color_index)?;
+    result.set_item(
+        intern!(py, "stored_dimension"),
+        common.stored_dimension.value(),
+    )?;
+    result.set_item(intern!(py, "dimension"), common.dimension.value())?;
+    result.set_item(intern!(py, "range_uor"), v8_range_i64_row(common.range_uor))?;
+    result.set_item(
+        intern!(py, "range_master"),
+        v8_range_row(common.range_master),
+    )?;
+    result.set_item(intern!(py, "attribute_offset"), common.attribute_offset)?;
+    result.set_item(intern!(py, "attribute_length"), common.attribute_length)?;
     Ok(result)
 }
 
@@ -1026,24 +1148,27 @@ fn v8_element_data_dict<'py>(
     data: &V8ElementData,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("kind", data.kind_name())?;
+    result.set_item(intern!(py, "kind"), PyString::intern(py, data.kind_name()))?;
     match data {
         V8ElementData::Line { start, end } => {
-            result.set_item("vertices", v8_packed_points(py, &[*start, *end])?)?;
+            result.set_item(
+                intern!(py, "vertices"),
+                v8_packed_points(py, &[*start, *end])?,
+            )?;
         }
         V8ElementData::LineString { vertices }
         | V8ElementData::Shape { vertices }
         | V8ElementData::Curve { vertices }
         | V8ElementData::BSplinePole { vertices } => {
-            result.set_item("vertices", v8_packed_points(py, vertices)?)?;
+            result.set_item(intern!(py, "vertices"), v8_packed_points(py, vertices)?)?;
         }
         V8ElementData::PointString {
             vertices,
             orientations,
         } => {
-            result.set_item("vertices", v8_packed_points(py, vertices)?)?;
+            result.set_item(intern!(py, "vertices"), v8_packed_points(py, vertices)?)?;
             result.set_item(
-                "orientations",
+                intern!(py, "orientations"),
                 packed_f64(
                     py,
                     orientations.len() * ORIENTATION_VALUES,
@@ -1070,21 +1195,27 @@ fn v8_element_data_dict<'py>(
             text_bytes,
             text,
         } => {
-            result.set_item("font_id", *font_id)?;
-            result.set_item("justification", *justification)?;
-            result.set_item("width_multiplier_raw", *width_multiplier_raw)?;
-            result.set_item("height_multiplier_raw", *height_multiplier_raw)?;
-            result.set_item("width_uor", *width_uor)?;
-            result.set_item("height_uor", *height_uor)?;
-            result.set_item("width_master", *width_master)?;
-            result.set_item("height_master", *height_master)?;
-            result.set_item("rotation_radians", *rotation_radians)?;
-            result.set_item("orientation", orientation)?;
-            result.set_item("origin", v8_point_row(*origin))?;
-            result.set_item("editable_fields", *editable_fields)?;
-            result.set_item("encoding", encoding.as_str())?;
-            result.set_item("text_bytes", PyBytes::new(py, text_bytes.as_ref()))?;
-            result.set_item("text", text)?;
+            result.set_item(intern!(py, "font_id"), *font_id)?;
+            result.set_item(intern!(py, "justification"), *justification)?;
+            result.set_item(intern!(py, "width_multiplier_raw"), *width_multiplier_raw)?;
+            result.set_item(intern!(py, "height_multiplier_raw"), *height_multiplier_raw)?;
+            result.set_item(intern!(py, "width_uor"), *width_uor)?;
+            result.set_item(intern!(py, "height_uor"), *height_uor)?;
+            result.set_item(intern!(py, "width_master"), *width_master)?;
+            result.set_item(intern!(py, "height_master"), *height_master)?;
+            result.set_item(intern!(py, "rotation_radians"), *rotation_radians)?;
+            result.set_item(intern!(py, "orientation"), orientation)?;
+            result.set_item(intern!(py, "origin"), v8_point_row(*origin))?;
+            result.set_item(intern!(py, "editable_fields"), *editable_fields)?;
+            result.set_item(
+                intern!(py, "encoding"),
+                PyString::intern(py, encoding.as_str()),
+            )?;
+            result.set_item(
+                intern!(py, "text_bytes"),
+                PyBytes::new(py, text_bytes.as_ref()),
+            )?;
+            result.set_item(intern!(py, "text"), text)?;
         }
         V8ElementData::Ellipse {
             primary_axis_uor,
@@ -1095,13 +1226,13 @@ fn v8_element_data_dict<'py>(
             orientation,
             center,
         } => {
-            result.set_item("primary_axis_uor", *primary_axis_uor)?;
-            result.set_item("secondary_axis_uor", *secondary_axis_uor)?;
-            result.set_item("primary_axis_master", *primary_axis_master)?;
-            result.set_item("secondary_axis_master", *secondary_axis_master)?;
-            result.set_item("rotation_radians", *rotation_radians)?;
-            result.set_item("orientation", orientation)?;
-            result.set_item("center", v8_point_row(*center))?;
+            result.set_item(intern!(py, "primary_axis_uor"), *primary_axis_uor)?;
+            result.set_item(intern!(py, "secondary_axis_uor"), *secondary_axis_uor)?;
+            result.set_item(intern!(py, "primary_axis_master"), *primary_axis_master)?;
+            result.set_item(intern!(py, "secondary_axis_master"), *secondary_axis_master)?;
+            result.set_item(intern!(py, "rotation_radians"), *rotation_radians)?;
+            result.set_item(intern!(py, "orientation"), orientation)?;
+            result.set_item(intern!(py, "center"), v8_point_row(*center))?;
         }
         V8ElementData::Arc {
             start_angle_radians,
@@ -1114,29 +1245,29 @@ fn v8_element_data_dict<'py>(
             orientation,
             center,
         } => {
-            result.set_item("start_angle_radians", *start_angle_radians)?;
-            result.set_item("sweep_angle_radians", *sweep_angle_radians)?;
-            result.set_item("primary_axis_uor", *primary_axis_uor)?;
-            result.set_item("secondary_axis_uor", *secondary_axis_uor)?;
-            result.set_item("primary_axis_master", *primary_axis_master)?;
-            result.set_item("secondary_axis_master", *secondary_axis_master)?;
-            result.set_item("rotation_radians", *rotation_radians)?;
-            result.set_item("orientation", orientation)?;
-            result.set_item("center", v8_point_row(*center))?;
+            result.set_item(intern!(py, "start_angle_radians"), *start_angle_radians)?;
+            result.set_item(intern!(py, "sweep_angle_radians"), *sweep_angle_radians)?;
+            result.set_item(intern!(py, "primary_axis_uor"), *primary_axis_uor)?;
+            result.set_item(intern!(py, "secondary_axis_uor"), *secondary_axis_uor)?;
+            result.set_item(intern!(py, "primary_axis_master"), *primary_axis_master)?;
+            result.set_item(intern!(py, "secondary_axis_master"), *secondary_axis_master)?;
+            result.set_item(intern!(py, "rotation_radians"), *rotation_radians)?;
+            result.set_item(intern!(py, "orientation"), orientation)?;
+            result.set_item(intern!(py, "center"), v8_point_row(*center))?;
         }
         V8ElementData::TextNode {
             child_count,
             node_number,
             origin,
         } => {
-            result.set_item("child_count", *child_count)?;
-            result.set_item("node_number", *node_number)?;
-            result.set_item("origin", v8_point_row(*origin))?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "node_number"), *node_number)?;
+            result.set_item(intern!(py, "origin"), v8_point_row(*origin))?;
         }
         V8ElementData::ComplexChain { child_count }
         | V8ElementData::ComplexShape { child_count }
         | V8ElementData::UnknownComplex { child_count } => {
-            result.set_item("child_count", *child_count)?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
         }
         V8ElementData::Cell {
             child_count,
@@ -1144,41 +1275,41 @@ fn v8_element_data_dict<'py>(
             origin,
             transform,
         } => {
-            result.set_item("child_count", *child_count)?;
-            result.set_item("boundary_count", *boundary_count)?;
-            result.set_item("origin", v8_point_row(*origin))?;
-            result.set_item("transform", transform)?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "boundary_count"), *boundary_count)?;
+            result.set_item(intern!(py, "origin"), v8_point_row(*origin))?;
+            result.set_item(intern!(py, "transform"), transform)?;
         }
         V8ElementData::SharedCellInstance {
             name,
             origin,
             transform,
         } => {
-            result.set_item("name", name)?;
-            result.set_item("origin", v8_point_row(*origin))?;
-            result.set_item("transform", transform)?;
+            result.set_item(intern!(py, "name"), name)?;
+            result.set_item(intern!(py, "origin"), v8_point_row(*origin))?;
+            result.set_item(intern!(py, "transform"), transform)?;
         }
         V8ElementData::SharedCellDefinition {
             child_count,
             name,
             transform,
         } => {
-            result.set_item("child_count", *child_count)?;
-            result.set_item("name", name)?;
-            result.set_item("transform", transform)?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "name"), name)?;
+            result.set_item(intern!(py, "transform"), transform)?;
         }
         V8ElementData::BSplineCurve {
             child_count,
             properties_raw,
             declared_poles,
         } => {
-            result.set_item("child_count", *child_count)?;
-            result.set_item("properties_raw", *properties_raw)?;
-            result.set_item("declared_poles", *declared_poles)?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "properties_raw"), *properties_raw)?;
+            result.set_item(intern!(py, "declared_poles"), *declared_poles)?;
         }
         V8ElementData::Dimension { anchor } => match anchor {
-            Some(point) => result.set_item("anchor", v8_point_row(*point))?,
-            None => result.set_item("anchor", py.None())?,
+            Some(point) => result.set_item(intern!(py, "anchor"), v8_point_row(*point))?,
+            None => result.set_item(intern!(py, "anchor"), py.None())?,
         },
         V8ElementData::Tag {
             tag_id,
@@ -1189,15 +1320,18 @@ fn v8_element_data_dict<'py>(
             host_element_id,
             origin,
         } => {
-            result.set_item("tag_id", *tag_id)?;
-            result.set_item("value_type", *value_type)?;
-            result.set_item("value_bytes", PyBytes::new(py, value_bytes.as_ref()))?;
-            set_v8_tag_value(&result, "value", value.as_ref())?;
-            result.set_item("tag_set_element_id", *tag_set_element_id)?;
-            result.set_item("host_element_id", *host_element_id)?;
+            result.set_item(intern!(py, "tag_id"), *tag_id)?;
+            result.set_item(intern!(py, "value_type"), *value_type)?;
+            result.set_item(
+                intern!(py, "value_bytes"),
+                PyBytes::new(py, value_bytes.as_ref()),
+            )?;
+            set_v8_tag_value(&result, intern!(py, "value"), value.as_ref())?;
+            result.set_item(intern!(py, "tag_set_element_id"), *tag_set_element_id)?;
+            result.set_item(intern!(py, "host_element_id"), *host_element_id)?;
             match origin {
-                Some(point) => result.set_item("origin", v8_point_row(*point))?,
-                None => result.set_item("origin", py.None())?,
+                Some(point) => result.set_item(intern!(py, "origin"), v8_point_row(*point))?,
+                None => result.set_item(intern!(py, "origin"), py.None())?,
             }
         }
         V8ElementData::Mesh {
@@ -1206,24 +1340,27 @@ fn v8_element_data_dict<'py>(
             points,
             faces,
         } => {
-            result.set_item("child_count", *child_count)?;
-            result.set_item("style", *style)?;
-            result.set_item("vertices", v8_packed_points(py, points)?)?;
-            result.set_item("faces", v8_packed_mesh_faces(py, faces)?)?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "style"), *style)?;
+            result.set_item(intern!(py, "vertices"), v8_packed_points(py, points)?)?;
+            result.set_item(intern!(py, "faces"), v8_packed_mesh_faces(py, faces)?)?;
         }
         V8ElementData::MatrixHeader {
             child_count,
             columns,
         } => {
-            result.set_item("child_count", *child_count)?;
-            result.set_item("columns", *columns)?;
+            result.set_item(intern!(py, "child_count"), *child_count)?;
+            result.set_item(intern!(py, "columns"), *columns)?;
         }
         V8ElementData::MatrixIntegerData { values } => {
-            result.set_item("values", (PACKED_I32_FORMAT, packed_i32(py, values)?))?;
+            result.set_item(
+                intern!(py, "values"),
+                (PACKED_I32_FORMAT, packed_i32(py, values)?),
+            )?;
         }
         V8ElementData::MatrixDoubleData { values } => {
             let data = packed_f64(py, values.len(), values.iter().copied())?;
-            result.set_item("values", (PACKED_F64_FORMAT, data))?;
+            result.set_item(intern!(py, "values"), (PACKED_F64_FORMAT, data))?;
         }
         V8ElementData::Unknown => {}
     }
@@ -1234,17 +1371,23 @@ fn v8_linkages_list<'py>(py: Python<'py>, linkages: &[V8Linkage]) -> PyResult<Bo
     let result = PyList::empty(py);
     for linkage in linkages {
         let value = PyDict::new(py);
-        value.set_item("offset", linkage.offset)?;
-        value.set_item("words_to_follow", linkage.words_to_follow)?;
-        value.set_item("kind_code", linkage.kind_code)?;
-        value.set_item("property_id", linkage.property_id)?;
+        value.set_item(intern!(py, "offset"), linkage.offset)?;
+        value.set_item(intern!(py, "words_to_follow"), linkage.words_to_follow)?;
+        value.set_item(intern!(py, "kind_code"), linkage.kind_code)?;
+        value.set_item(intern!(py, "property_id"), linkage.property_id)?;
         match &linkage.property_bytes {
-            Some(bytes) => value.set_item("property_bytes", PyBytes::new(py, bytes.as_ref()))?,
-            None => value.set_item("property_bytes", py.None())?,
+            Some(bytes) => value.set_item(
+                intern!(py, "property_bytes"),
+                PyBytes::new(py, bytes.as_ref()),
+            )?,
+            None => value.set_item(intern!(py, "property_bytes"), py.None())?,
         }
-        value.set_item("property_text", &linkage.property_text)?;
-        value.set_item("complete", linkage.complete)?;
-        value.set_item("raw_bytes", PyBytes::new(py, linkage.raw_bytes.as_ref()))?;
+        value.set_item(intern!(py, "property_text"), &linkage.property_text)?;
+        value.set_item(intern!(py, "complete"), linkage.complete)?;
+        value.set_item(
+            intern!(py, "raw_bytes"),
+            PyBytes::new(py, linkage.raw_bytes.as_ref()),
+        )?;
         result.append(value)?;
     }
     Ok(result)

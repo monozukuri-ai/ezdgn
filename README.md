@@ -205,6 +205,32 @@ V8 text exposes its stored `width_multiplier_raw` and `height_multiplier_raw`
 alongside corrected `width_uor`, `height_uor`, `width_master`, and
 `height_master` distances.
 
+Geometry read from a file is held packed, so a mesh with millions of points
+costs its coordinate bytes instead of several Python objects per point.
+`element.data.vertices` is a `V8PointArray`, the `faces` of a mesh are a
+`V8MeshFaceArray`, and matrix `values` and point-string `orientations` are a
+`V8ValueArray`. Each behaves as the tuple it stands for: it has a length, can
+be indexed, sliced and iterated, and compares and hashes equal to a tuple of
+the same `V8Point`, `V8MeshFace` or number items, which are built when they
+are read. It is not a `tuple` instance, so convert it with `tuple()` or
+`list()` where one is required, for example before `json.dumps`. A
+`V8ElementData` built by hand can still use plain tuples. For bulk work, read
+the little-endian buffers directly:
+
+```python
+import numpy
+
+mesh = document.models[0].query("MESH")[0].data
+xyz = numpy.frombuffer(mesh.vertices.master_bytes, "<f8").reshape(-1, 3)
+indices = numpy.frombuffer(mesh.faces.point_indices_bytes, "<u4")
+offsets = numpy.frombuffer(mesh.faces.offsets_bytes, "<u4")  # face i: offsets[i]:offsets[i + 1]
+visible = numpy.frombuffer(mesh.faces.visible_edges_bytes, "u1")
+```
+
+`vertices.uor_bytes` holds the same points in UOR, and `V8ValueArray` exposes
+`data_bytes` with its `format` (`"d"` for `float64`, `"i"` for `int32`) and
+`width`. `ezdgn` itself does not depend on NumPy.
+
 The raw scanner is available independently of semantic decoding:
 
 ```python

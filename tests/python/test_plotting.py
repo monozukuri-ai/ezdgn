@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,8 +12,10 @@ matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt  # noqa: E402
 from matplotlib.collections import LineCollection, PolyCollection  # noqa: E402
+from matplotlib.path import Path as MplPath  # noqa: E402
 
 import ezdgn  # noqa: E402
+import ezdgn.plotting  # noqa: E402
 
 DATA = Path(__file__).parents[1] / "data" / "dgn"
 SMALLTEST = DATA / "v7" / "smalltest.dgn"
@@ -20,24 +23,128 @@ SEED_2D = DATA / "v7" / "seed_2d.dgn"
 V8 = DATA / "v8" / "test_dgnv8.dgn"
 
 
+MESH_EDGES = [
+    ((0, 0), (2, 0)),
+    ((2, 0), (2, 2)),
+    ((0, 0), (0, 2)),
+    ((0, 2), (2, 0)),
+]
+
+
+def path_edges(path: MplPath, scale: float = 1) -> list[tuple[tuple[float, ...], ...]]:
+    """The MOVETO/LINETO pairs of a mesh edge path as ``(start, end)`` points."""
+
+    assert list(path.codes) == [MplPath.MOVETO, MplPath.LINETO] * (len(path.codes) // 2)
+    points = [tuple(value / scale for value in vertex) for vertex in path.vertices]
+    return list(zip(points[0::2], points[1::2]))
+
+
+def moved_mesh(element: ezdgn.V8Element, offset: int, **common: int) -> ezdgn.V8Element:
+    vertices = tuple(
+        ezdgn.V8Point(
+            uor=tuple(value + offset * 1000 for value in point.uor),
+            master=tuple(value + offset for value in point.master),
+        )
+        for point in element.data.vertices
+    )
+    return replace(
+        element,
+        common=replace(element.common, **common),
+        data=replace(element.data, vertices=vertices),
+    )
+
+
+def with_elements(
+    document: ezdgn.V8Document, *elements: ezdgn.V8Element
+) -> ezdgn.V8Document:
+    return replace(document, models=(replace(document.models[0], elements=elements),))
+
+
 @pytest.mark.parametrize("coordinate_space,scale", [("master", 1), ("uor", 1000)])
 def test_mesh_plot_hides_edges_and_draws_shared_edges_once(
     mesh_document: ezdgn.V8Document, coordinate_space: str, scale: int
 ) -> None:
     figure, axes = ezdgn.plot(mesh_document, coordinate_space=coordinate_space)
-    segments = [
-        tuple(tuple(value / scale for value in point) for point in segment)
-        for collection in axes.collections
-        if isinstance(collection, LineCollection)
-        for segment in collection.get_segments()
-    ]
-    assert len(segments) == 4
-    assert set(segments) == {
-        ((0, 0), (2, 0)),
-        ((2, 0), (2, 2)),
-        ((0, 0), (0, 2)),
-        ((0, 2), (2, 0)),
-    }
+
+    assert not axes.collections
+    (patch,) = axes.patches
+    assert path_edges(patch.get_path(), scale) == MESH_EDGES
+    assert patch.get_facecolor()[3] == 0
+    low, high = axes.dataLim.get_points()
+    assert tuple(low / scale) == (0, 0)
+    assert tuple(high / scale) == (2, 2)
+    plt.close(figure)
+
+
+def test_mesh_edge_path_is_one_path_of_visible_edges(
+    mesh_document: ezdgn.V8Document,
+) -> None:
+    data = mesh_document.models[0].elements[0].data
+
+    assert path_edges(ezdgn.plotting.mesh_edge_path(data)) == MESH_EDGES
+    in_uor = ezdgn.plotting.mesh_edge_path(data, coordinate_space="uor")
+    assert path_edges(in_uor, 1000) == MESH_EDGES
+
+    hidden = replace(
+        data,
+        faces=tuple(
+            replace(face, visible_edges=(False,) * len(face.visible_edges))
+            for face in data.faces
+        ),
+    )
+    assert len(ezdgn.plotting.mesh_edge_path(hidden).vertices) == 0
+    collapsed = replace(data, faces=(ezdgn.V8MeshFace((1, 1, 1), (True, True, True)),))
+    assert len(ezdgn.plotting.mesh_edge_path(collapsed).vertices) == 0
+    assert len(ezdgn.plotting.mesh_edge_path(replace(data, faces=())).vertices) == 0
+    with pytest.raises(ValueError, match="coordinate_space"):
+        ezdgn.plotting.mesh_edge_path(data, coordinate_space="screen")  # type: ignore[arg-type]
+
+
+def test_meshes_of_one_style_share_a_compound_path(
+    mesh_document: ezdgn.V8Document,
+) -> None:
+    mesh = mesh_document.models[0].elements[0]
+    document = with_elements(
+        mesh_document,
+        mesh,
+        moved_mesh(mesh, 10),
+        moved_mesh(mesh, 20, color_index=mesh.common.color_index + 1),
+        replace(mesh, data=replace(mesh.data, faces=())),
+    )
+
+    figure, axes = ezdgn.plot(document)
+
+    assert not axes.collections
+    assert tuple(axes.dataLim.minpos) == (2, 2)
+    assert sorted(len(path_edges(patch.get_path())) for patch in axes.patches) == [4, 8]
+    shared, other = sorted(axes.patches, key=lambda patch: -len(patch.get_path().codes))
+    assert path_edges(shared.get_path())[:4] == MESH_EDGES
+    assert path_edges(shared.get_path())[4] == ((10, 10), (12, 10))
+    assert path_edges(other.get_path())[0] == ((20, 20), (22, 20))
+    assert shared.get_edgecolor() != other.get_edgecolor()
+    assert tuple(axes.dataLim.get_points()[1]) == (22, 22)
+    plt.close(figure)
+
+
+def test_mesh_paths_are_bounded_in_size(
+    mesh_document: ezdgn.V8Document, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mesh = mesh_document.models[0].elements[0]
+    document = with_elements(
+        mesh_document, mesh, moved_mesh(mesh, 10), moved_mesh(mesh, 20)
+    )
+
+    monkeypatch.setattr(ezdgn.plotting, "_MESH_PATH_EDGES", 8)
+    figure, axes = ezdgn.plot(document)
+    assert [len(path_edges(patch.get_path())) for patch in axes.patches] == [8, 4]
+    plt.close(figure)
+
+    monkeypatch.setattr(ezdgn.plotting, "_MESH_PATH_EDGES", 3)
+    figure, axes = ezdgn.plot(document)
+    paths = [path_edges(patch.get_path()) for patch in axes.patches]
+    assert [len(edges) for edges in paths] == [3, 1] * 3
+    assert paths[0] + paths[1] == MESH_EDGES
+    assert tuple(axes.dataLim.get_points()[1]) == (22, 22)
     plt.close(figure)
 
 

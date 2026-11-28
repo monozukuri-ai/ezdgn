@@ -110,6 +110,28 @@ impl Default for V8MeshFaces {
 }
 
 impl V8MeshFaces {
+    /// Build face loops from contiguous arrays. Offsets must span both
+    /// equally sized arrays, starting at zero, in nondecreasing order.
+    #[must_use]
+    pub fn from_arrays(
+        offsets: Vec<u32>,
+        point_indices: Vec<u32>,
+        visible_edges: Vec<bool>,
+    ) -> Option<Self> {
+        if offsets.first() != Some(&0)
+            || usize::try_from(*offsets.last()?).ok()? != point_indices.len()
+            || point_indices.len() != visible_edges.len()
+            || offsets.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return None;
+        }
+        Some(Self {
+            offsets,
+            point_indices,
+            visible_edges,
+        })
+    }
+
     fn with_capacity(face_count: usize, index_count: usize) -> Self {
         let mut offsets = Vec::with_capacity(face_count + 1);
         offsets.push(0);
@@ -1840,6 +1862,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn callers_can_build_mesh_faces_from_their_own_arrays() {
+        let points = vec![1, 0, 2];
+        let flags = vec![true, true, false];
+        let faces = V8MeshFaces::from_arrays(vec![0, 3], points.clone(), flags.clone()).unwrap();
+        let face = faces.get(0).unwrap();
+        assert_eq!(face.point_indices, points);
+        assert_eq!(face.visible_edges, flags);
+        for offsets in [vec![], vec![1, 3], vec![0, 4, 3], vec![0, 2]] {
+            assert!(V8MeshFaces::from_arrays(offsets, points.clone(), flags.clone()).is_none());
+        }
+        assert!(V8MeshFaces::from_arrays(vec![0, 3], points, vec![]).is_none());
     }
 
     #[test]
